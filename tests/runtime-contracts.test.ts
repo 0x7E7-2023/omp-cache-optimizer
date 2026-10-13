@@ -280,6 +280,7 @@ describe("OpenAI-compatible request contracts", () => {
     ] as any;
     assert.equal(internals.formatSkillsForPrompt(skills), piSkills.formatSkillsForPrompt(skills));
     assert.equal(internals.formatSkillsForPrompt(skills, "bash"), piSkills.formatSkillsForPrompt(skills, "bash"));
+    assert.equal(internals.formatSkillsForPrompt(skills, "indirect"), piSkills.formatSkillsForPrompt(skills, "indirect"));
   });
 
   describe("skill compression on Pi's real system prompt", () => {
@@ -298,7 +299,8 @@ describe("OpenAI-compatible request contracts", () => {
       const mod = await createJiti(join(process.cwd(), "tests", "system-prompt-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js")>(
         join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "system-prompt.js"),
       );
-      return (selectedTools: string[]) => mod.buildSystemPrompt({ cwd: "/work", selectedTools, skills, contextFiles: [] } as any);
+      return (selectedTools: string[], hiddenTools: string[] = []) =>
+        mod.buildSystemPrompt({ cwd: "/work", selectedTools, hiddenTools, skills, contextFiles: [] } as any);
     };
 
     test("fires on the prompt Pi actually assembles, keeping every name and description", async () => {
@@ -358,6 +360,11 @@ describe("OpenAI-compatible request contracts", () => {
       const bashOut = internals.compressSkillsInSystemPrompt(bashOnly, { skills, selectedTools: ["bash"] } as any);
       assert.ok(!bashOut.includes("<available_skills>"), "bash-only prompt is compressed");
       assert.ok(bashOut.includes("Use bash to load a skill's file when the task matches its description."), "Pi's bash wording is kept");
+      // Hidden readers (reachable only through another tool, e.g. a code-mode wrapper) make Pi name no tool.
+      const hidden = build(["codemode", "read", "bash"], ["read", "bash"]);
+      const hiddenOut = internals.compressSkillsInSystemPrompt(hidden, { skills, selectedTools: ["codemode", "read", "bash"], hiddenTools: ["read", "bash"] } as any);
+      assert.ok(!hiddenOut.includes("<available_skills>"), "hidden-reader prompt is compressed");
+      assert.ok(hiddenOut.includes("Load a skill's file when the task matches its description."), "Pi's tool-less wording is kept");
       const previous = process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION;
       process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION = "1";
       try {
