@@ -90,6 +90,7 @@ describe("footer status separation and command completion", () => {
       const sessionStart = handlers.get("session_start");
       assert.ok(sessionStart);
       await sessionStart({ reason: "startup" }, context);
+      await freshModule.__internals_for_tests.waitForStatsRestore();
 
       assert.equal(statuses.at(-1)?.key, "pi-cache-stats");
       assert.match(statuses.at(-1)?.value ?? "", /^· OpenAI cache /);

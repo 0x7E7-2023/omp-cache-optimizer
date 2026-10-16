@@ -345,8 +345,74 @@ type CachedShardRead = {
   ino: number | bigint;
   size: number;
   mtimeMs: number;
+  /** Valid shard whose embedded instanceId matches its filename. */
   shard: PersistedStatsShardV7 | undefined;
+  /** Schema-valid parse regardless of filename match (used by retention). */
+  parsed: PersistedStatsShardV7 | undefined;
 };
+
+/**
+ * Upper bound on concurrent filesystem operations during shard scans. Startup
+ * on Windows (antivirus-scanned AppData) was dominated by thousands of
+ * serialized lstat/readFile awaits; a small pool hides per-call latency
+ * without opening an unbounded number of descriptors.
+ */
+export const SHARD_IO_CONCURRENCY = 16;
+
+/** Run `worker` over `items` with at most `limit` in flight; results keep input order. */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const run = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await worker(items[index] as T, index);
+    }
+  };
+  const pool = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: pool }, run));
+  return results;
+}
+
+type ShardFileRead = {
+  info: import("node:fs").Stats;
+  /** Valid shard with matching filename instanceId. */
+  shard: PersistedStatsShardV7 | undefined;
+  /** Schema-valid parse regardless of filename match. */
+  parsed: PersistedStatsShardV7 | undefined;
+};
+
+/**
+ * Stat a shard file and return its parsed contents, re-reading only when the
+ * inode/size/mtime changed. Returns undefined for non-regular files. Throws on
+ * read/parse failure (after dropping any cache entry) so callers can apply
+ * their own policy.
+ */
+async function readShardFileCached(path: string, name: string): Promise<ShardFileRead | undefined> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) {
+      shardReadCache.delete(path);
+      return undefined;
+    }
+    const cached = shardReadCache.get(path);
+    if (cached && cached.ino === info.ino && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
+      return { info, shard: cached.shard, parsed: cached.parsed };
+    }
+    const filenameInstanceId = name.slice(0, -".json".length);
+    const parsed = parsePersistedStatsShardV7(JSON.parse(await readFile(path, "utf8")));
+    const shard = parsed && parsed.instanceId === filenameInstanceId ? parsed : undefined;
+    shardReadCache.set(path, { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, shard, parsed });
+    return { info, shard, parsed };
+  } catch (error) {
+    shardReadCache.delete(path);
+    throw error;
+  }
+}
 
 /**
  * Parsed-shard cache keyed by path and validated by inode, size, and mtime.
@@ -371,37 +437,22 @@ export async function readValidStatsShardsV7(directory: string = SHARD_FILES_DIR
     if (getErrorCode(error) === "ENOENT") return [];
     throw error;
   }
-  const shards: PersistedStatsShardV7[] = [];
   const seenPaths = new Set<string>();
-  for (const name of names) {
-    if (!/^[0-9a-f-]+\.json$/i.test(name)) continue;
-    const path = join(directory, name);
-    seenPaths.add(path);
+  const candidates = names.filter((name) => /^[0-9a-f-]+\.json$/i.test(name));
+  for (const name of candidates) seenPaths.add(join(directory, name));
+  const reads = await mapWithConcurrency(candidates, SHARD_IO_CONCURRENCY, async (name) => {
     try {
-      const info = await lstat(path);
-      if (!info.isFile() || info.isSymbolicLink()) {
-        shardReadCache.delete(path);
-        continue;
-      }
-      const cached = shardReadCache.get(path);
-      let parsed: PersistedStatsShardV7 | undefined;
-      if (cached && cached.ino === info.ino && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
-        parsed = cached.shard;
-      } else {
-        const filenameInstanceId = name.slice(0, -".json".length);
-        const candidate = parsePersistedStatsShardV7(JSON.parse(await readFile(path, "utf8")));
-        parsed = candidate && candidate.instanceId === filenameInstanceId ? candidate : undefined;
-        shardReadCache.set(path, { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, shard: parsed });
-      }
-      // Callers may mutate the aggregate they build; hand out copies so the
-      // cache stays authoritative.
-      if (parsed) shards.push(cloneShard(parsed));
+      return (await readShardFileCached(join(directory, name), name))?.shard;
     } catch {
       // Ignore malformed or transiently unavailable shards. Atomic writers will
       // publish a complete replacement on the next successful update.
-      shardReadCache.delete(path);
+      return undefined;
     }
-  }
+  });
+  // Callers may mutate the aggregate they build; hand out copies so the cache
+  // stays authoritative. Preserve directory order for deterministic ties.
+  const shards: PersistedStatsShardV7[] = [];
+  for (const shard of reads) if (shard) shards.push(cloneShard(shard));
   for (const path of Array.from(shardReadCache.keys())) {
     if (!seenPaths.has(path) && path.startsWith(directory)) shardReadCache.delete(path);
   }
@@ -491,67 +542,76 @@ export async function cleanupStatsShardsV7(now = Date.now(), directory: string =
     return getErrorCode(error) === "ENOENT" ? 0 : Promise.reject(error);
   }
   const today = currentLocalDay();
-  let removed = 0;
-  for (const name of names) {
-    const isShard = /^[0-9a-f-]+\.json$/i.test(name);
-    const isTemp = name.endsWith(".tmp");
-    if (!isShard && !isTemp) continue;
+  const candidates = names.filter((name) => /^[0-9a-f-]+\.json$/i.test(name) || name.endsWith(".tmp"));
+  const outcomes = await mapWithConcurrency(candidates, SHARD_IO_CONCURRENCY, async (name): Promise<number> => {
+    const isTemp = !/^[0-9a-f-]+\.json$/i.test(name);
     const path = join(directory, name);
     try {
-      const info = await lstat(path);
-      if (!info.isFile() || info.isSymbolicLink()) continue;
       if (isTemp) {
-        if (now - info.mtimeMs < SHARD_TEMP_RETENTION_MS) continue;
+        const info = await lstat(path);
+        if (!info.isFile() || info.isSymbolicLink()) return 0;
+        if (now - info.mtimeMs < SHARD_TEMP_RETENTION_MS) return 0;
       } else {
-        const text = await readFile(path, "utf8");
-        let parsed: PersistedStatsShardV7 | undefined;
+        let read: ShardFileRead | undefined;
+        let mtimeMs: number;
         try {
-          parsed = parsePersistedStatsShardV7(JSON.parse(text));
-        } catch {
+          read = await readShardFileCached(path, name);
+          if (!read) return 0;
+          mtimeMs = read.info.mtimeMs;
+        } catch (error) {
           // A corrupt JSON shard has no usable lifecycle metadata. Apply the
           // same mtime retention as schema-invalid shards instead of keeping
           // it forever; read failures still leave the file untouched.
+          if (!(error instanceof SyntaxError)) return 0;
+          const info = await lstat(path);
+          if (!info.isFile() || info.isSymbolicLink()) return 0;
+          mtimeMs = info.mtimeMs;
         }
-        if (parsed?.day === today) continue;
-        const updatedAt = parsed?.lifecycle.updatedAt ?? info.mtimeMs;
-        if (now - updatedAt < SHARD_RETENTION_MS) continue;
-        if (parsed?.lifecycle.state === "active" && isProcessAlive(parsed.process.pid)) continue;
+        const parsed = read?.parsed;
+        if (parsed?.day === today) return 0;
+        const updatedAt = parsed?.lifecycle.updatedAt ?? mtimeMs;
+        if (now - updatedAt < SHARD_RETENTION_MS) return 0;
+        if (parsed?.lifecycle.state === "active" && isProcessAlive(parsed.process.pid)) return 0;
       }
       await unlink(path);
-      removed += 1;
+      shardReadCache.delete(path);
+      return 1;
     } catch {
       // Best-effort maintenance must never block the extension.
+      return 0;
     }
-  }
-  return removed;
+  });
+  return outcomes.reduce((sum, value) => sum + value, 0);
 }
 
-export async function maybeCleanupStatsShardsV7(now = Date.now()): Promise<void> {
+/** Run due retention maintenance; resolves to the number of files removed (0 when skipped). */
+export async function maybeCleanupStatsShardsV7(now = Date.now()): Promise<number> {
   await mkdir(SHARD_MAINTENANCE_DIR, { recursive: true });
   try {
     const marker = await stat(SHARD_CLEANUP_MARKER_PATH);
-    if (now - marker.mtimeMs < SHARD_CLEANUP_INTERVAL_MS) return;
+    if (now - marker.mtimeMs < SHARD_CLEANUP_INTERVAL_MS) return 0;
   } catch {}
 
   try {
     await mkdir(SHARD_CLEANUP_LOCK_PATH);
   } catch (error) {
-    if (getErrorCode(error) !== "EEXIST") return;
+    if (getErrorCode(error) !== "EEXIST") return 0;
     try {
       const lock = await stat(SHARD_CLEANUP_LOCK_PATH);
-      if (now - lock.mtimeMs <= SHARD_CLEANUP_LOCK_STALE_MS) return;
+      if (now - lock.mtimeMs <= SHARD_CLEANUP_LOCK_STALE_MS) return 0;
       await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
       await mkdir(SHARD_CLEANUP_LOCK_PATH);
     } catch {
-      return;
+      return 0;
     }
   }
 
   try {
-    await cleanupStatsShardsV7(now);
+    const removed = await cleanupStatsShardsV7(now);
     const tempPath = `${SHARD_CLEANUP_MARKER_PATH}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(tempPath, `${now}\n`, "utf8");
     await rename(tempPath, SHARD_CLEANUP_MARKER_PATH);
+    return removed;
   } finally {
     await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
   }

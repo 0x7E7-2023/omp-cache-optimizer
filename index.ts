@@ -13,7 +13,7 @@ import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, ato
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
 import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
-import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, maybeCleanupStatsShardsV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
+import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, maybeCleanupStatsShardsV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
 import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
@@ -103,7 +103,13 @@ function notifyCacheCompatIfNeeded(
 // Internal helpers exported only so the task verification script
 // (.trellis/tasks/.../verify.ts) can exercise them. They are not part of the
 // extension's public API; pi only invokes the default export below.
+// Most recent background stats restore started by any extension instance in
+// this module. Tests await it after session_start; runtime code uses the
+// per-instance promise instead.
+let latestStatsRestoreForTests: Promise<void> = Promise.resolve();
+
 export const __internals_for_tests = {
+  waitForStatsRestore: (): Promise<void> => latestStatsRestoreForTests,
   getLastSkillCompressionOutcome,
   decidePromptCacheRetention,
   userRequestedLongCacheRetention,
@@ -317,6 +323,7 @@ export const __internals_for_tests = {
   aggregateStatsShardsV7,
   loadStatsShardAggregateV7,
   cleanupStatsShardsV7,
+  mapWithConcurrency,
   removeLegacyStatsFiles,
   readGlobalStatsEpoch,
   readModelStatsEpoch,
@@ -410,6 +417,20 @@ export default function (pi: ExtensionAPI) {
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let shardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let shardWatcher: ReturnType<typeof watch> | undefined;
+  // Historical stats are restored in the background so a large shard
+  // directory never holds up Pi's session_start (issue #28). Handlers that
+  // read or persist aggregated stats await this first.
+  let statsRestorePromise: Promise<void> = Promise.resolve();
+  let statsRestoreGeneration = 0;
+  async function waitForStatsRestore(): Promise<void> {
+    // A session_start may chain a newer restore while we wait; keep waiting
+    // until the chain is stable so callers never act on a half-restored view.
+    let current: Promise<void>;
+    do {
+      current = statsRestorePromise;
+      await current;
+    } while (current !== statsRestorePromise);
+  }
   const enqueuePersist = createSerializedAsyncRunner();
   let instanceId = randomUUID();
   const instanceStartedAt = Date.now();
@@ -664,7 +685,8 @@ export default function (pi: ExtensionAPI) {
     if (shardRefreshTimer !== null) clearTimeout(shardRefreshTimer);
     shardRefreshTimer = setTimeout(() => {
       shardRefreshTimer = null;
-      void refreshShardAggregate()
+      void waitForStatsRestore()
+        .then(() => refreshShardAggregate())
         .then(() => publishStatus(ctx as ExtensionContext, model ?? ctx?.model))
         .catch(() => undefined);
     }, SHARD_REFRESH_DEBOUNCE_MS);
@@ -771,7 +793,12 @@ export default function (pi: ExtensionAPI) {
     if (persistTimer !== null) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       persistTimer = null;
-      void persistCacheStats(ctx).then(() => refreshShardAggregate()).catch(() => undefined);
+      // A persist scheduled while a background restore runs (e.g. a routed
+      // model change without usage) must not race the restore's own write.
+      void waitForStatsRestore()
+        .then(() => persistCacheStats(ctx))
+        .then(() => refreshShardAggregate())
+        .catch(() => undefined);
     }, PERSIST_DEBOUNCE_MS);
     persistTimer.unref?.();
   }
@@ -818,7 +845,12 @@ export default function (pi: ExtensionAPI) {
     finally { rolloverPromise = undefined; }
   }
 
-  async function restoreCacheStats(reason: string, ctx: ExtensionContext): Promise<void> {
+  /**
+   * Synchronous part of a session restore: reset in-memory state immediately
+   * at session_start, so usage recorded before the background disk restore
+   * finishes is never wiped by a reset that runs later.
+   */
+  function resetStatsForSessionStart(reason: string, ctx: ExtensionContext): void {
     syncSessionHash(ctx);
     lastStatusText = undefined;
     cacheStatsProcessByModel = {};
@@ -826,19 +858,48 @@ export default function (pi: ExtensionAPI) {
     modelEpochByKey.clear();
     modelApiByKey.clear();
     modelNameByKey.clear();
-    currentGlobalEpoch = await readGlobalStatsEpoch();
     if (reason === "reload") {
       clearRecentSamples();
     }
+  }
+
+  async function restoreCacheStats(ctx: ExtensionContext): Promise<void> {
+    // Session identity was synced by resetStatsForSessionStart. Usage may
+    // already have been recorded (message_end does not wait to record), and
+    // message_end syncs the epoch before recording. If the disk epoch differs
+    // now, a reset happened after that usage: adopt it and drop the stale
+    // process bucket instead of re-labelling old counters with the new epoch.
+    const latestGlobalEpoch = await readGlobalStatsEpoch();
+    if (latestGlobalEpoch !== currentGlobalEpoch) {
+      currentGlobalEpoch = latestGlobalEpoch;
+      cacheStatsProcessByModel = {};
+      modelEpochByKey.clear();
+      modelApiByKey.clear();
+      modelNameByKey.clear();
+    }
     await removeLegacyStatsFiles();
     await mkdir(SHARD_FILES_DIR, { recursive: true });
+    await rollOverStatsIfNeeded(ctx);
+    // Run due retention maintenance before the single startup scan, so the
+    // aggregate never retains counters from files maintenance just removed and
+    // no second directory pass is needed. Cleanup also warms the parsed-shard
+    // cache, so the scan below only re-stats files.
+    try {
+      await maybeCleanupStatsShardsV7();
+    } catch (error) {
+      console.warn(`${LOG_PREFIX}: stats shard maintenance failed`, error);
+    }
+    // One scan adopts other processes' epochs and restores this session's
+    // routed-model metadata before this instance publishes its own shard.
+    // In-memory process counters were cleared above, so no pre-persist
+    // re-scan is needed; this instance's own shard is always replaced by its
+    // in-memory copy during aggregation, so no post-persist scan either.
     await refreshShardAggregate();
-    await flushPersistCacheStats(ctx);
-    await maybeCleanupStatsShardsV7();
-    // Maintenance may remove expired shard files after the initial refresh.
-    // Re-scan before publishing so startup/footer command state cannot retain
-    // counters from files that no longer exist.
-    await refreshShardAggregate();
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    await persistCacheStats(ctx);
   }
 
   async function publishStatus(ctx: ExtensionContext, model: PiModel | undefined = ctx.model): Promise<void> {
@@ -968,7 +1029,26 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     if (runtimeOptimizerEnabled) requestLongCacheRetention();
-    await restoreCacheStats(event.reason, ctx);
+    // Do not block Pi's startup on historical stats (issue #28). The
+    // restore runs in the background (chained after any earlier restore so
+    // two never interleave) and the footer is published when it finishes.
+    // A newer session_start supersedes an older restore, which then must not
+    // publish a stale footer. Handlers that read or persist stats await
+    // waitForStatsRestore() first.
+    const generation = ++statsRestoreGeneration;
+    resetStatsForSessionStart(event.reason, ctx);
+    const previousRestore = statsRestorePromise;
+    statsRestorePromise = previousRestore
+      // A restore superseded before it started is skipped entirely: the newer
+      // one redoes all of its work, and its ctx may already be stale.
+      .then(() => (generation === statsRestoreGeneration ? restoreCacheStats(ctx) : undefined))
+      .then(async () => {
+        if (generation === statsRestoreGeneration) await publishStatus(ctx);
+      })
+      .catch((error) => {
+        console.warn(`${LOG_PREFIX}: failed to restore cache stats`, error);
+      });
+    latestStatsRestoreForTests = statsRestorePromise;
     if (ctx.mode === "tui" && !shardWatcher) {
       try {
         shardWatcher = watch(SHARD_FILES_DIR, () => scheduleShardRefresh(ctx));
@@ -977,13 +1057,13 @@ export default function (pi: ExtensionAPI) {
         // Lifecycle and explicit command refreshes remain authoritative.
       }
     }
-    await publishStatus(ctx);
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     // Pi 0.99+ codemode scripts run nested tool calls in parallel; the calling
     // tool's own end event follows them, so one refresh covers the batch.
     if (isNonEmptyString((event as { parentToolCallId?: unknown } | undefined)?.parentToolCallId)) return;
+    await waitForStatsRestore();
     await refreshShardAggregate();
     await publishStatus(ctx);
   });
@@ -1003,12 +1083,14 @@ export default function (pi: ExtensionAPI) {
     // a record consumed out of order) so they cannot be correlated with the
     // next run's messages.
     providerRequestStates.length = 0;
+    await waitForStatsRestore();
     await refreshShardAggregate();
     await publishStatus(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
+      await waitForStatsRestore();
       await flushPersistCacheStats(ctx, "closed");
     } finally {
       if (shardRefreshTimer !== null) clearTimeout(shardRefreshTimer);
@@ -1025,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("model_select", async (event, ctx) => {
     if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(event.model, ctx) ?? event.model, ctx, warnedModels);
+    await waitForStatsRestore();
     await refreshShardAggregate();
     await publishStatus(ctx, event.model);
   });
@@ -1568,6 +1651,7 @@ export default function (pi: ExtensionAPI) {
       addUsageToCacheStats(getStatsForModel(undefined, adapter), usage);
     }
 
+    await waitForStatsRestore();
     schedulePersistCacheStats(ctx);
     await refreshShardAggregate();
     // A late response from an older selection must not replace the active
@@ -1627,6 +1711,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("cache-optimizer", {
     description: "Configure and diagnose Pi cache behavior",
     getArgumentCompletions: getCacheOptimizerArgumentCompletions,
-    handler: handleCacheOptimizerCommand,
+    handler: async (args: string, cmdCtx: Parameters<typeof handleCacheOptimizerCommand>[1]) => {
+      // Commands read and reset aggregated stats; let a background restore
+      // finish first so they never act on a half-restored view.
+      await waitForStatsRestore();
+      return handleCacheOptimizerCommand(args, cmdCtx);
+    },
   });
 }

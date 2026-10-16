@@ -80,6 +80,7 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await hook("session_shutdown"); } };
   await hook("session_start", { reason: "startup" });
+  await loaded.__internals_for_tests.waitForStatsRestore();
   const persistedModels = async () => {
     await close();
     const shards = await loaded.__internals_for_tests.readValidStatsShardsV7();

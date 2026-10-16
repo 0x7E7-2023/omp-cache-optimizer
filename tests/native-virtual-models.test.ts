@@ -481,6 +481,7 @@ describe("native virtual model hooks", () => {
     const routedCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses, notifications });
 
     await hooks.get("session_start")!({ reason: "startup" }, startCtx);
+    await extension.__internals_for_tests.waitForStatsRestore();
     await hooks.get("message_end")!({ message }, routedCtx);
     const routedStatus = statuses.at(-1);
     assert.match(routedStatus ?? "", /^· Kimi cache 1\/1·/);
@@ -501,6 +502,7 @@ describe("native virtual model hooks", () => {
     const reloadStatuses: Array<string | undefined> = [];
     const reloadCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses: reloadStatuses });
     await reloaded.hooks.get("session_start")!({ reason: "reload" }, reloadCtx);
+    await extension.__internals_for_tests.waitForStatsRestore();
     assert.match(reloadStatuses.at(-1) ?? "", /^· Kimi cache 1\/1·/);
     await reloaded.hooks.get("session_shutdown")!({}, reloadCtx);
   });
