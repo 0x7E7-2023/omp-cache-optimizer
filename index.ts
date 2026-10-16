@@ -13,7 +13,8 @@ import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, ato
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
 import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
-import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, maybeCleanupStatsShardsV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
+import { SHARD_ARCHIVE_PATH, compactStatsShardsV7, maybeRunStatsMaintenance, readStatsArchive } from "./src/stats-archive.ts";
+import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
 import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
@@ -323,6 +324,14 @@ export const __internals_for_tests = {
   aggregateStatsShardsV7,
   loadStatsShardAggregateV7,
   cleanupStatsShardsV7,
+  compactStatsShardsV7,
+  maybeRunStatsMaintenance,
+  readStatsArchive,
+  acquireStatsMaintenanceLock,
+  holdsStatsMaintenanceLock,
+  releaseStatsMaintenanceLock,
+  SHARD_ARCHIVE_PATH,
+  SHARD_RETENTION_MS,
   mapWithConcurrency,
   removeLegacyStatsFiles,
   readGlobalStatsEpoch,
@@ -599,10 +608,21 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function refreshShardAggregate(): Promise<ShardAggregate> {
-    const persistedShards = await readValidStatsShardsV7();
+    // Order matters: compaction publishes the archive before deleting the
+    // shards it absorbed, so reading the directory first and the archive
+    // second always sees each absorbed shard in at least one of them. Reading
+    // them concurrently could pair an old archive with a post-delete listing
+    // and drop those counters (and the last routed model) for this refresh.
+    const rawShards = await readValidStatsShardsV7();
+    const archive = await readStatsArchive();
+    // Shards folded into the archive are counted there. Ignore their raw file
+    // (a crash may leave it behind) and this process's in-memory retired copy.
+    for (const id of archive.absorbedIds) retiredShards.delete(id);
+    const persistedShards = rawShards.filter((shard) => !archive.absorbedIds.has(shard.instanceId));
     for (const shard of persistedShards) retiredShards.delete(shard.instanceId);
     const shards = persistedShards.filter((shard) => shard.instanceId !== instanceId);
     shards.push(...retiredShards.values());
+    shards.push(...archive.shards);
     if (currentSessionHashSet) shards.push(buildCurrentStatsShard());
     // Keep lifetime session footer data separate from daily totals/commands.
     // null explicitly means all retained days; undefined invokes the default day.
@@ -885,7 +905,7 @@ export default function (pi: ExtensionAPI) {
     // no second directory pass is needed. Cleanup also warms the parsed-shard
     // cache, so the scan below only re-stats files.
     try {
-      await maybeCleanupStatsShardsV7();
+      await maybeRunStatsMaintenance();
     } catch (error) {
       console.warn(`${LOG_PREFIX}: stats shard maintenance failed`, error);
     }

@@ -234,12 +234,39 @@ export async function readEpochFile(path: string, fallback: string): Promise<str
   }
 }
 
+/**
+ * Like readEpochFile, but only a missing file maps to the fallback. Any other
+ * read or parse failure throws, so destructive maintenance (archive
+ * compaction drops counters whose epoch differs) never mistakes a transient
+ * Windows EPERM/EBUSY or a damaged epoch file for "no reset ever happened".
+ */
+export async function readEpochFileStrict(path: string, fallback: string): Promise<string> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (getErrorCode(error) === "ENOENT") return fallback;
+    throw error;
+  }
+  const epoch = parseEpochRecord(JSON.parse(text));
+  if (!epoch) throw new Error(`invalid stats epoch file ${path}`);
+  return epoch;
+}
+
 export async function readGlobalStatsEpoch(): Promise<string> {
   return readEpochFile(SHARD_GLOBAL_EPOCH_PATH, initialEpoch("global"));
 }
 
 export async function readModelStatsEpoch(modelKeyValue: string): Promise<string> {
   return readEpochFile(modelEpochPath(modelKeyValue), initialEpoch(`model:${modelKeyValue}`));
+}
+
+export async function readGlobalStatsEpochStrict(): Promise<string> {
+  return readEpochFileStrict(SHARD_GLOBAL_EPOCH_PATH, initialEpoch("global"));
+}
+
+export async function readModelStatsEpochStrict(modelKeyValue: string): Promise<string> {
+  return readEpochFileStrict(modelEpochPath(modelKeyValue), initialEpoch(`model:${modelKeyValue}`));
 }
 
 export async function writeStatsEpoch(path: string, epoch: string): Promise<void> {
@@ -584,35 +611,111 @@ export async function cleanupStatsShardsV7(now = Date.now(), directory: string =
   return outcomes.reduce((sum, value) => sum + value, 0);
 }
 
+const SHARD_CLEANUP_LOCK_OWNER_FILE = "owner";
+
+/**
+ * Take the cross-process maintenance lock (a directory, so creation is atomic
+ * on every platform). A lock older than SHARD_CLEANUP_LOCK_STALE_MS is
+ * treated as abandoned by a crashed process and replaced. Resolves to an
+ * owner token (truthy) on success, undefined otherwise. The token lets a
+ * holder whose lock was taken over avoid releasing the new owner's lock.
+ */
+export async function acquireStatsMaintenanceLock(now = Date.now()): Promise<string | undefined> {
+  await mkdir(SHARD_MAINTENANCE_DIR, { recursive: true });
+  const token = `${process.pid}-${randomUUID()}`;
+  const claim = async (): Promise<string> => {
+    // Best effort: an older version (or a failed write) leaves no owner file,
+    // which only disables the ownership check, never the lock itself.
+    await writeFile(join(SHARD_CLEANUP_LOCK_PATH, SHARD_CLEANUP_LOCK_OWNER_FILE), token, "utf8").catch(() => undefined);
+    return token;
+  };
+  try {
+    await mkdir(SHARD_CLEANUP_LOCK_PATH);
+    return await claim();
+  } catch (error) {
+    if (getErrorCode(error) !== "EEXIST") return undefined;
+    try {
+      const lock = await stat(SHARD_CLEANUP_LOCK_PATH);
+      if (now - lock.mtimeMs <= SHARD_CLEANUP_LOCK_STALE_MS) return undefined;
+      await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
+      await mkdir(SHARD_CLEANUP_LOCK_PATH);
+      return await claim();
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** False only when the lock directory now records a different owner (or is gone). */
+export async function holdsStatsMaintenanceLock(token: string | undefined): Promise<boolean> {
+  if (!token) return true;
+  try {
+    const owner = await readFile(join(SHARD_CLEANUP_LOCK_PATH, SHARD_CLEANUP_LOCK_OWNER_FILE), "utf8");
+    return owner === token;
+  } catch (error) {
+    // Lock directory gone: someone treated us as stale. Owner file missing
+    // inside an existing lock: written by a version without tokens; assume ours.
+    if (getErrorCode(error) !== "ENOENT") return true;
+    try {
+      await stat(SHARD_CLEANUP_LOCK_PATH);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+export async function releaseStatsMaintenanceLock(token?: string): Promise<void> {
+  // Do not delete a lock another process took over after ours went stale.
+  if (token && !(await holdsStatsMaintenanceLock(token))) return;
+  await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
+}
+
+/** True when the marker file is missing or older than `intervalMs`. */
+export async function isMaintenanceMarkerDue(path: string, now = Date.now(), intervalMs = SHARD_CLEANUP_INTERVAL_MS): Promise<boolean> {
+  try {
+    const marker = await stat(path);
+    return now - marker.mtimeMs >= intervalMs;
+  } catch {
+    return true;
+  }
+}
+
+export async function writeMaintenanceMarker(path: string, now = Date.now()): Promise<void> {
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, `${now}\n`, "utf8");
+  await renameWithRetry(tempPath, path);
+}
+
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+/**
+ * rename() that retries briefly on the transient errors Windows raises while
+ * another process (or an antivirus scanner) holds the target open.
+ */
+export async function renameWithRetry(from: string, to: string, attempts = 5): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= attempts - 1 || !RENAME_RETRY_CODES.has(getErrorCode(error) ?? "")) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
+    }
+  }
+}
+
 /** Run due retention maintenance; resolves to the number of files removed (0 when skipped). */
 export async function maybeCleanupStatsShardsV7(now = Date.now()): Promise<number> {
   await mkdir(SHARD_MAINTENANCE_DIR, { recursive: true });
-  try {
-    const marker = await stat(SHARD_CLEANUP_MARKER_PATH);
-    if (now - marker.mtimeMs < SHARD_CLEANUP_INTERVAL_MS) return 0;
-  } catch {}
-
-  try {
-    await mkdir(SHARD_CLEANUP_LOCK_PATH);
-  } catch (error) {
-    if (getErrorCode(error) !== "EEXIST") return 0;
-    try {
-      const lock = await stat(SHARD_CLEANUP_LOCK_PATH);
-      if (now - lock.mtimeMs <= SHARD_CLEANUP_LOCK_STALE_MS) return 0;
-      await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
-      await mkdir(SHARD_CLEANUP_LOCK_PATH);
-    } catch {
-      return 0;
-    }
-  }
-
+  if (!(await isMaintenanceMarkerDue(SHARD_CLEANUP_MARKER_PATH, now))) return 0;
+  const lockToken = await acquireStatsMaintenanceLock(now);
+  if (!lockToken) return 0;
   try {
     const removed = await cleanupStatsShardsV7(now);
-    const tempPath = `${SHARD_CLEANUP_MARKER_PATH}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(tempPath, `${now}\n`, "utf8");
-    await rename(tempPath, SHARD_CLEANUP_MARKER_PATH);
+    await writeMaintenanceMarker(SHARD_CLEANUP_MARKER_PATH, now);
     return removed;
   } finally {
-    await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
+    await releaseStatsMaintenanceLock(lockToken);
   }
 }

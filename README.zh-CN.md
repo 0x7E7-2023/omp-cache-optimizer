@@ -137,6 +137,8 @@ bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
 
 当前版本把统计保存在 Pi agent 目录的 `pi-cache-optimizer-stats.d/shards/` 下。每个已加载的 extension instance 独占一个当天的活跃 UUID shard，并通过临时文件 + 原子 rename 写入；本地日期切换时关闭旧 shard、创建新的 UUID，保留 session 历史，因此父/子/并行 Pi 进程不会互相覆盖。旧 v6 单文件统计在升级时直接删除，本地 footer 计数从零开始；不会影响上游 provider 的实际缓存。
 
+从 2.9.0 起，维护任务会把已关闭的往日 shard，以及进程已退出超过 24 小时的活跃 shard，合并进 `pi-cache-optimizer-stats.d/archive/archive.json` 这一份快照，再删除原文件。维护最多每 6 小时一次，在共享维护锁下后台运行。这样 shard 目录里基本只剩当天的 shard，启动和刷新的开销不再随 60 天保留期增长。归档计数保留 reset epoch，`reset` 立即生效，并按同样的 60 天窗口过期。归档会记录已吸收的 shard，所以合并中途崩溃也不会重复计数。旧版本不会读取归档：如果降级或与旧版本同时运行，旧版的 `session` footer 只显示尚未归档的历史；当天的 `total` 和 `process` 计数不受影响。
+
 即使等待响应时切换到同一 provider 的另一个模型，响应统计仍归属于实际请求的 catalog/request-local 模型。旧 transport 的响应别名只根据请求快照处理，不使用新选择的模型；footer 继续显示当前选择的 direct 模型。损坏 JSON/schema 的旧 shard 按文件修改时间在两个月后清理；较新的损坏文件、有效的当天 shard、仍存活的旧 instance 和 symlink 目标均受保护。
 
 Footer 默认使用 `session`，避免另一个并行 Pi 终端使用相同 provider/model 时污染当前窗口。可以通过命令或环境变量切换显示范围：
