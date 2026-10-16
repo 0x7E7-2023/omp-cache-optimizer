@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { LOG_PREFIX, asRecord, getErrorCode, getNonNegativeNumber, isNonEmptyString, isProcessAlive } from "./common.ts";
 import { STATE_DIR } from "./paths.ts";
@@ -486,10 +486,48 @@ export async function readValidStatsShardsV7(directory: string = SHARD_FILES_DIR
   return shards;
 }
 
-export async function aggregateStatsShardsV7(
-  shards: PersistedStatsShardV7[],
-  day: string | null = currentLocalDay(),
-): Promise<ShardAggregate> {
+/**
+ * Pre-reduced counters from many shards (the stats archive), already filtered
+ * to the current global and model epochs. Merging one into an aggregator
+ * gives the same result as feeding it the shards it was reduced from, at that
+ * position of the shard sequence. Only valid for the all-days (`day === null`)
+ * aggregate. Entries are listed in the order their first shard contributed,
+ * so key order in the result matches too. Treat as read-only.
+ */
+export type ShardContribution = {
+  sessions: ReadonlyArray<{
+    sessionHash: string;
+    /** Contributing shards of this session (each counts once in instancesBySession). */
+    instances: number;
+    models: ReadonlyArray<{ key: string; stats: CacheStats; instances: number }>;
+  }>;
+  models: ReadonlyArray<{
+    key: string;
+    stats: CacheStats;
+    instances: number;
+    sessions: readonly string[];
+  }>;
+  /**
+   * Per model, the first shard with the newest lifecycle.updatedAt that
+   * carried it, in the order an aggregation would first record each one.
+   */
+  refs: ReadonlyArray<{ key: string; updatedAt: number; ref: PersistedRoutedModelRef }>;
+  /** Per session, the first entry with the newest updatedAt. */
+  routed: ReadonlyArray<{ sessionHash: string; updatedAt: number; model: PersistedRoutedModelRef }>;
+};
+
+export type ShardAggregator = {
+  readonly day: string | null;
+  readonly globalEpoch: string;
+  /** The model epoch this aggregation filters `key` with (read once per aggregation). */
+  modelEpoch(key: string): Promise<string>;
+  add(shard: PersistedStatsShardV7): Promise<void>;
+  addContribution(contribution: ShardContribution): void;
+  finish(): ShardAggregate;
+};
+
+/** Incremental form of aggregateStatsShardsV7: add shards (and pre-reduced contributions) in order, then finish. */
+export async function createShardAggregatorV7(day: string | null = currentLocalDay()): Promise<ShardAggregator> {
   const globalEpoch = await readGlobalStatsEpoch();
   const modelEpochs = new Map<string, string>();
   const result: ShardAggregate = {
@@ -505,46 +543,99 @@ export async function aggregateStatsShardsV7(
   const routedUpdatedAt = new Map<string, number>();
   const modelRefUpdatedAt = new Map<string, number>();
   const modelSessions = new Map<string, Set<string>>();
+  const modelEpoch = async (key: string): Promise<string> => {
+    let epoch = modelEpochs.get(key);
+    if (!epoch) {
+      epoch = await readModelStatsEpoch(key);
+      modelEpochs.set(key, epoch);
+    }
+    return epoch;
+  };
 
-  for (const shard of shards) {
-    if ((day !== null && shard.day !== day) || shard.globalEpoch !== globalEpoch) continue;
-    let contributed = false;
-    if (shard.lastRoutedModel && (routedUpdatedAt.get(shard.sessionHash) ?? -1) < shard.lifecycle.updatedAt) {
-      routedUpdatedAt.set(shard.sessionHash, shard.lifecycle.updatedAt);
-      result.lastRoutedModelBySession[shard.sessionHash] = shard.lastRoutedModel;
-    }
-    for (const [key, entry] of Object.entries(shard.models)) {
-      let epoch = modelEpochs.get(key);
-      if (!epoch) {
-        epoch = await readModelStatsEpoch(key);
-        modelEpochs.set(key, epoch);
+  return {
+    day,
+    globalEpoch,
+    modelEpoch,
+    async add(shard) {
+      if ((day !== null && shard.day !== day) || shard.globalEpoch !== globalEpoch) return;
+      let contributed = false;
+      if (shard.lastRoutedModel && (routedUpdatedAt.get(shard.sessionHash) ?? -1) < shard.lifecycle.updatedAt) {
+        routedUpdatedAt.set(shard.sessionHash, shard.lifecycle.updatedAt);
+        result.lastRoutedModelBySession[shard.sessionHash] = shard.lastRoutedModel;
       }
-      if (entry.modelEpoch !== epoch || (day !== null && entry.stats.day !== day)) continue;
-      contributed = true;
-      const sessionModels = result.bySession[shard.sessionHash] ??= {};
-      sessionModels[key] = mergeStatsAcrossDays(sessionModels[key], entry.stats, day);
-      result.totalsByModel[key] = mergeStatsAcrossDays(result.totalsByModel[key], entry.stats, day);
-      result.instancesByModel[key] = (result.instancesByModel[key] ?? 0) + 1;
-      if ((modelRefUpdatedAt.get(key) ?? -1) < shard.lifecycle.updatedAt) {
-        modelRefUpdatedAt.set(key, shard.lifecycle.updatedAt);
-        result.modelRefsByKey[key] = {
-          provider: entry.provider,
-          id: entry.modelId,
-          name: entry.modelName ?? entry.modelId,
-        };
+      for (const [key, entry] of Object.entries(shard.models)) {
+        const epoch = modelEpochs.get(key) ?? await modelEpoch(key);
+        if (entry.modelEpoch !== epoch || (day !== null && entry.stats.day !== day)) continue;
+        contributed = true;
+        const sessionModels = result.bySession[shard.sessionHash] ??= {};
+        sessionModels[key] = mergeStatsAcrossDays(sessionModels[key], entry.stats, day);
+        result.totalsByModel[key] = mergeStatsAcrossDays(result.totalsByModel[key], entry.stats, day);
+        result.instancesByModel[key] = (result.instancesByModel[key] ?? 0) + 1;
+        if ((modelRefUpdatedAt.get(key) ?? -1) < shard.lifecycle.updatedAt) {
+          modelRefUpdatedAt.set(key, shard.lifecycle.updatedAt);
+          result.modelRefsByKey[key] = {
+            provider: entry.provider,
+            id: entry.modelId,
+            name: entry.modelName ?? entry.modelId,
+          };
+        }
+        const sessionInstances = result.instancesBySessionModel[shard.sessionHash] ??= {};
+        sessionInstances[key] = (sessionInstances[key] ?? 0) + 1;
+        const sessions = modelSessions.get(key) ?? new Set<string>();
+        sessions.add(shard.sessionHash);
+        modelSessions.set(key, sessions);
       }
-      const sessionInstances = result.instancesBySessionModel[shard.sessionHash] ??= {};
-      sessionInstances[key] = (sessionInstances[key] ?? 0) + 1;
-      const sessions = modelSessions.get(key) ?? new Set<string>();
-      sessions.add(shard.sessionHash);
-      modelSessions.set(key, sessions);
-    }
-    if (contributed) {
-      result.instancesBySession[shard.sessionHash] = (result.instancesBySession[shard.sessionHash] ?? 0) + 1;
-    }
-  }
-  for (const [key, sessions] of modelSessions) result.sessionsByModel[key] = sessions.size;
-  return result;
+      if (contributed) {
+        result.instancesBySession[shard.sessionHash] = (result.instancesBySession[shard.sessionHash] ?? 0) + 1;
+      }
+    },
+    addContribution(contribution) {
+      if (day !== null) throw new Error("shard contributions only apply to the all-days aggregate");
+      for (const entry of contribution.routed) {
+        if ((routedUpdatedAt.get(entry.sessionHash) ?? -1) < entry.updatedAt) {
+          routedUpdatedAt.set(entry.sessionHash, entry.updatedAt);
+          result.lastRoutedModelBySession[entry.sessionHash] = { ...entry.model };
+        }
+      }
+      for (const model of contribution.models) {
+        // mergeStatsAcrossDays clones on first insert, so the shared
+        // contribution is never handed out (callers mutate the aggregate).
+        result.totalsByModel[model.key] = mergeStatsAcrossDays(result.totalsByModel[model.key], model.stats, null);
+        result.instancesByModel[model.key] = (result.instancesByModel[model.key] ?? 0) + model.instances;
+        const sessions = modelSessions.get(model.key) ?? new Set<string>();
+        for (const sessionHash of model.sessions) sessions.add(sessionHash);
+        modelSessions.set(model.key, sessions);
+      }
+      for (const entry of contribution.refs) {
+        if ((modelRefUpdatedAt.get(entry.key) ?? -1) < entry.updatedAt) {
+          modelRefUpdatedAt.set(entry.key, entry.updatedAt);
+          result.modelRefsByKey[entry.key] = { ...entry.ref };
+        }
+      }
+      for (const session of contribution.sessions) {
+        const sessionModels = result.bySession[session.sessionHash] ??= {};
+        const sessionInstances = result.instancesBySessionModel[session.sessionHash] ??= {};
+        for (const model of session.models) {
+          sessionModels[model.key] = mergeStatsAcrossDays(sessionModels[model.key], model.stats, null);
+          sessionInstances[model.key] = (sessionInstances[model.key] ?? 0) + model.instances;
+        }
+        result.instancesBySession[session.sessionHash] = (result.instancesBySession[session.sessionHash] ?? 0) + session.instances;
+      }
+    },
+    finish() {
+      for (const [key, sessions] of modelSessions) result.sessionsByModel[key] = sessions.size;
+      return result;
+    },
+  };
+}
+
+export async function aggregateStatsShardsV7(
+  shards: PersistedStatsShardV7[],
+  day: string | null = currentLocalDay(),
+): Promise<ShardAggregate> {
+  const aggregator = await createShardAggregatorV7(day);
+  for (const shard of shards) await aggregator.add(shard);
+  return aggregator.finish();
 }
 
 export async function loadStatsShardAggregateV7(directory: string = SHARD_FILES_DIR): Promise<ShardAggregate> {
@@ -614,6 +705,14 @@ export async function cleanupStatsShardsV7(now = Date.now(), directory: string =
 const SHARD_CLEANUP_LOCK_OWNER_FILE = "owner";
 
 /**
+ * Tokens whose owner file this process actually wrote. For those, a lock
+ * directory without an owner file can only mean the directory was replaced
+ * (a 2.8.x stale-lock takeover writes none, and a 2.9 takeover is caught
+ * between its mkdir and its owner write), so ownership is lost.
+ */
+const writtenLockTokens = new Set<string>();
+
+/**
  * Take the cross-process maintenance lock (a directory, so creation is atomic
  * on every platform). A lock older than SHARD_CLEANUP_LOCK_STALE_MS is
  * treated as abandoned by a crashed process and replaced. Resolves to an
@@ -626,7 +725,10 @@ export async function acquireStatsMaintenanceLock(now = Date.now()): Promise<str
   const claim = async (): Promise<string> => {
     // Best effort: an older version (or a failed write) leaves no owner file,
     // which only disables the ownership check, never the lock itself.
-    await writeFile(join(SHARD_CLEANUP_LOCK_PATH, SHARD_CLEANUP_LOCK_OWNER_FILE), token, "utf8").catch(() => undefined);
+    try {
+      await writeFile(join(SHARD_CLEANUP_LOCK_PATH, SHARD_CLEANUP_LOCK_OWNER_FILE), token, "utf8");
+      writtenLockTokens.add(token);
+    } catch {}
     return token;
   };
   try {
@@ -636,7 +738,11 @@ export async function acquireStatsMaintenanceLock(now = Date.now()): Promise<str
     if (getErrorCode(error) !== "EEXIST") return undefined;
     try {
       const lock = await stat(SHARD_CLEANUP_LOCK_PATH);
-      if (now - lock.mtimeMs <= SHARD_CLEANUP_LOCK_STALE_MS) return undefined;
+      // A lock dated more than the stale window in the future was left by a
+      // crash while the clock ran ahead; without this it would block
+      // maintenance until the wall clock caught up (possibly for months).
+      const age = now - lock.mtimeMs;
+      if (age <= SHARD_CLEANUP_LOCK_STALE_MS && age >= -SHARD_CLEANUP_LOCK_STALE_MS) return undefined;
       await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
       await mkdir(SHARD_CLEANUP_LOCK_PATH);
       return await claim();
@@ -646,19 +752,23 @@ export async function acquireStatsMaintenanceLock(now = Date.now()): Promise<str
   }
 }
 
-/** False only when the lock directory now records a different owner (or is gone). */
-export async function holdsStatsMaintenanceLock(token: string | undefined): Promise<boolean> {
+/**
+ * False when the lock directory records a different owner, is gone, or lost
+ * the owner file this holder wrote. An unreadable owner file fails closed
+ * (destructive publishes are skipped and retried) unless `failOpen` is set.
+ */
+export async function holdsStatsMaintenanceLock(token: string | undefined, { failOpen = false }: { failOpen?: boolean } = {}): Promise<boolean> {
   if (!token) return true;
   try {
     const owner = await readFile(join(SHARD_CLEANUP_LOCK_PATH, SHARD_CLEANUP_LOCK_OWNER_FILE), "utf8");
     return owner === token;
   } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") return failOpen;
     // Lock directory gone: someone treated us as stale. Owner file missing
-    // inside an existing lock: written by a version without tokens; assume ours.
-    if (getErrorCode(error) !== "ENOENT") return true;
+    // inside an existing lock: ours only if we never managed to write one.
     try {
       await stat(SHARD_CLEANUP_LOCK_PATH);
-      return true;
+      return !writtenLockTokens.has(token);
     } catch {
       return false;
     }
@@ -666,16 +776,41 @@ export async function holdsStatsMaintenanceLock(token: string | undefined): Prom
 }
 
 export async function releaseStatsMaintenanceLock(token?: string): Promise<void> {
-  // Do not delete a lock another process took over after ours went stale.
-  if (token && !(await holdsStatsMaintenanceLock(token))) return;
-  await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
+  try {
+    // Do not delete a lock another process took over after ours went stale.
+    if (token && !(await holdsStatsMaintenanceLock(token, { failOpen: true }))) return;
+    await rm(SHARD_CLEANUP_LOCK_PATH, { recursive: true, force: true });
+  } finally {
+    if (token) writtenLockTokens.delete(token);
+  }
+}
+
+/**
+ * Heartbeat: refresh the lock directory's mtime so a long maintenance pass is
+ * not mistaken for a crashed holder and taken over. A no-op (false) unless
+ * `token` still owns the lock. It cannot help while the process is suspended
+ * (laptop sleep); archive publishing is a compare-and-swap for that case.
+ */
+export async function touchStatsMaintenanceLock(token: string | undefined): Promise<boolean> {
+  if (!token) return false;
+  try {
+    if (!(await holdsStatsMaintenanceLock(token))) return false;
+    const now = new Date();
+    await utimes(SHARD_CLEANUP_LOCK_PATH, now, now);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** True when the marker file is missing or older than `intervalMs`. */
 export async function isMaintenanceMarkerDue(path: string, now = Date.now(), intervalMs = SHARD_CLEANUP_INTERVAL_MS): Promise<boolean> {
   try {
     const marker = await stat(path);
-    return now - marker.mtimeMs >= intervalMs;
+    const age = now - marker.mtimeMs;
+    // A marker from the future (the clock was set back) must not suspend
+    // maintenance until the wall clock reaches it again.
+    return age >= intervalMs || age < -intervalMs;
   } catch {
     return true;
   }

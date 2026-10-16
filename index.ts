@@ -13,8 +13,8 @@ import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, ato
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
 import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
-import { SHARD_ARCHIVE_PATH, compactStatsShardsV7, maybeRunStatsMaintenance, readStatsArchive } from "./src/stats-archive.ts";
-import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
+import { SHARD_ARCHIVE_PATH, aggregateStatsWithArchiveV7, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveView, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
+import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
 import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
@@ -327,6 +327,14 @@ export const __internals_for_tests = {
   compactStatsShardsV7,
   maybeRunStatsMaintenance,
   readStatsArchive,
+  readStatsArchiveView,
+  aggregateStatsWithArchiveV7,
+  encodeStatsArchiveV2,
+  parseStatsArchiveV2,
+  listStatsArchiveGenerations,
+  statsArchiveGenerationPath,
+  StatsArchiveView,
+  touchStatsMaintenanceLock,
   acquireStatsMaintenanceLock,
   holdsStatsMaintenanceLock,
   releaseStatsMaintenanceLock,
@@ -614,7 +622,7 @@ export default function (pi: ExtensionAPI) {
     // them concurrently could pair an old archive with a post-delete listing
     // and drop those counters (and the last routed model) for this refresh.
     const rawShards = await readValidStatsShardsV7();
-    const archive = await readStatsArchive();
+    const archive = await readStatsArchiveView();
     // Shards folded into the archive are counted there. Ignore their raw file
     // (a crash may leave it behind) and this process's in-memory retired copy.
     for (const id of archive.absorbedIds) retiredShards.delete(id);
@@ -622,12 +630,20 @@ export default function (pi: ExtensionAPI) {
     for (const shard of persistedShards) retiredShards.delete(shard.instanceId);
     const shards = persistedShards.filter((shard) => shard.instanceId !== instanceId);
     shards.push(...retiredShards.values());
-    shards.push(...archive.shards);
-    if (currentSessionHashSet) shards.push(buildCurrentStatsShard());
+    const trailing = currentSessionHashSet ? [buildCurrentStatsShard()] : [];
     // Keep lifetime session footer data separate from daily totals/commands.
-    // null explicitly means all retained days; undefined invokes the default day.
-    const aggregate = await aggregateStatsShardsV7(shards);
-    const sessionAggregate = await aggregateStatsShardsV7(shards, null);
+    // Both equal aggregating [...shards, ...archive.shards, ...trailing]
+    // (issue #28 review H): the current day only sees archive entries of that
+    // day (normally none: the archive holds past days), and the all-days view
+    // merges the archive's pre-reduced per-(session, model) entries instead
+    // of re-aggregating every archived bucket. The all-days view is only read
+    // for the current session (cacheStatsByModel lookups and the last routed
+    // model), so it is built for that session alone; rebuilding every
+    // archived session's entries cost more than the rest of the refresh.
+    const aggregate = await aggregateStatsWithArchiveV7(shards, archive, trailing, currentLocalDay());
+    const sessionAggregate = await aggregateStatsWithArchiveV7(
+      shards, archive, trailing, null, new Set(currentSessionHashSet ? [currentSessionHash] : []),
+    );
 
     // A reset from another process can advance epochs while this instance is
     // idle. Adopt those epochs during every aggregate refresh, not only when a

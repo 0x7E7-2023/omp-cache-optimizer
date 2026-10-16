@@ -208,9 +208,9 @@ describe("issue #28 phase 2: archive snapshot", () => {
       assert.ok(retry.removed > 0, "the leftover originals are deleted");
       assert.deepEqual((await views(I, await combinedShards(I))).bySession, before.bySession);
       // Absorbed ids whose files are gone are pruned, so the list cannot grow forever.
-      const archive = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
+      const archive = (await I.readStatsArchive()).archive;
       await I.compactStatsShardsV7(now);
-      const pruned = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
+      const pruned = (await I.readStatsArchive()).archive;
       assert.ok(Object.keys(archive.absorbed).length > 0);
       assert.equal(Object.keys(pruned.absorbed).length, 0);
     });
@@ -234,7 +234,7 @@ describe("issue #28 phase 2: archive snapshot", () => {
       const now = Date.now();
       await writeRandomFixture(I, 11, now);
       await I.compactStatsShardsV7(now);
-      const archived = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
+      const archived = (await I.readStatsArchive()).archive;
       assert.ok(archived.buckets.length > 0);
 
       // Model-scoped reset: only that model disappears.
@@ -250,7 +250,7 @@ describe("issue #28 phase 2: archive snapshot", () => {
       view = await views(I, await combinedShards(I));
       assert.deepEqual(view.bySession, {});
       await I.compactStatsShardsV7(now);
-      const emptied = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
+      const emptied = (await I.readStatsArchive()).archive;
       assert.deepEqual(emptied.buckets, []);
       assert.deepEqual(emptied.routed, []);
     });
@@ -265,11 +265,11 @@ describe("issue #28 phase 2: archive snapshot", () => {
       const at = now - 10 * DAY;
       await writeShard(I, { sessionHash: "s", day: localDay(new Date(at)), updatedAt: at, globalEpoch, models: { [KEYS[0]]: { modelEpoch, requests: 2, hits: 1, cached: 10, input: 100 } }, routed: KEYS[0] });
       await I.compactStatsShardsV7(now);
-      assert.equal(JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8")).buckets.length, 1);
+      assert.equal((await I.readStatsArchive()).archive.buckets.length, 1);
       const later = now + I.SHARD_RETENTION_MS;
       const result = await I.compactStatsShardsV7(later);
       assert.equal(result.dropped, 2);
-      const archive = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
+      const archive = (await I.readStatsArchive()).archive;
       assert.deepEqual(archive.buckets, []);
       assert.deepEqual(archive.routed, []);
     });
@@ -375,7 +375,7 @@ describe("issue #28 phase 2: archive snapshot", () => {
       assert.equal(raced.skippedConcurrent, true);
       assert.equal(raced.removed, 0);
       assert.equal((await readdir(I.SHARD_FILES_DIR)).length, written, "nothing deleted");
-      assert.deepEqual(JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8")), foreign, "the other archive is not overwritten");
+      assert.deepEqual((await I.readStatsArchive()).archive, foreign, "the other archive is not overwritten");
 
       // A reset landed during the pass.
       const reset = await I.compactStatsShardsV7(now, I.SHARD_FILES_DIR, I.SHARD_ARCHIVE_PATH, {
@@ -445,19 +445,20 @@ describe("issue #28 phase 2: archive snapshot", () => {
       assert.equal(good.corrupt, false);
       assert.ok(good.shards.length > 0);
       // Another process republishes the archive; this process cannot read it yet.
-      const text = await readFile(I.SHARD_ARCHIVE_PATH, "utf8");
-      const tmp = `${I.SHARD_ARCHIVE_PATH}.test.tmp`;
+      const latest = I.statsArchiveGenerationPath(I.SHARD_ARCHIVE_PATH, (await I.listStatsArchiveGenerations()).at(-1));
+      const text = await readFile(latest, "utf8");
+      const tmp = `${latest}.test.tmp`;
       await writeFile(tmp, text.replace(/\n$/, "\n\n"));
-      await rm(I.SHARD_ARCHIVE_PATH);
-      await copyFile(tmp, I.SHARD_ARCHIVE_PATH);
+      await rm(latest);
+      await copyFile(tmp, latest);
       await rm(tmp);
-      await chmod(I.SHARD_ARCHIVE_PATH, 0o000);
+      await chmod(latest, 0o000);
       try {
         const during = await I.readStatsArchive();
         assert.equal(during.corrupt, false, "the last good archive is served");
         assert.equal(during.shards.length, good.shards.length);
       } finally {
-        await chmod(I.SHARD_ARCHIVE_PATH, 0o600);
+        await chmod(latest, 0o600);
       }
       const after = await I.readStatsArchive();
       assert.equal(after.corrupt, false);

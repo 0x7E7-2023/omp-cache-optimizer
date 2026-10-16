@@ -137,7 +137,9 @@ bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
 
 当前版本把统计保存在 Pi agent 目录的 `pi-cache-optimizer-stats.d/shards/` 下。每个已加载的 extension instance 独占一个当天的活跃 UUID shard，并通过临时文件 + 原子 rename 写入；本地日期切换时关闭旧 shard、创建新的 UUID，保留 session 历史，因此父/子/并行 Pi 进程不会互相覆盖。旧 v6 单文件统计在升级时直接删除，本地 footer 计数从零开始；不会影响上游 provider 的实际缓存。
 
-从 2.9.0 起，维护任务会把已关闭的往日 shard，以及进程已退出超过 24 小时的活跃 shard，合并进 `pi-cache-optimizer-stats.d/archive/archive.json` 这一份快照，再删除原文件。维护最多每 6 小时一次，在共享维护锁下后台运行。这样 shard 目录里基本只剩当天的 shard，启动和刷新的开销不再随 60 天保留期增长。归档计数保留 reset epoch，`reset` 立即生效，并按同样的 60 天窗口过期。归档会记录已吸收的 shard，所以合并中途崩溃也不会重复计数。旧版本不会读取归档：如果降级或与旧版本同时运行，旧版的 `session` footer 只显示尚未归档的历史；当天的 `total` 和 `process` 计数不受影响。
+从 2.9.0 起，维护任务会把已关闭的往日 shard，以及进程已退出超过 24 小时的活跃 shard，合并进 `pi-cache-optimizer-stats.d/archive/` 下的一份归档快照，再删除原文件。维护最多每 6 小时一次，在共享维护锁下后台运行。这样 shard 目录里基本只剩当天的 shard，启动和刷新的开销不再随 60 天保留期增长。归档计数保留 reset epoch，`reset` 立即生效，并按同样的 60 天窗口过期。归档会记录已吸收的 shard，所以合并中途崩溃也不会重复计数。旧版本不会读取归档：如果降级或与旧版本同时运行，旧版的 `session` footer 只显示尚未归档的历史；当天的 `total` 和 `process` 计数不受影响。
+
+2.9.0 之后的版本把每份快照保存为不可变的紧凑代号文件 `archive/archive.<generation>.json`，大小约为 2.9.0 单个 `archive.json` 的五分之一。压缩读到第 N 代后，只有在期间没有别人发布过的情况下才能发布第 N+1 代（用独占的硬链接实现，在 Windows 和 POSIX 上都是原子的），而且只有自己发布的代号仍是最新时才删除原始 shard；压缩运行期间还会刷新维护锁的时间戳。因此，一个停顿超过锁过期时间的进程（比如笔记本休眠）醒来后，再也不会覆盖更新的归档、造成计数丢失。读取端使用最新的代号，上一代保留到下一次发布。2.9.0 的 `archive.json` 仍然会被读取，下一次压缩会迁移它，并用一个同名目录取而代之。仍在运行的 2.9.0 进程随后会把归档视为不可读：它不再压缩或删除任何文件，它的 `session` footer 只显示尚未归档的历史，与上面所说一致。如果迁移之后 2.9.0 又写出了 `archive.json`（只有在这个目录被删除时才可能），为了杜绝重复计数，这个文件永远不会被计入，而是改名为 `archive.legacy-<time>.json` 留存，那个进程归档进去的 shard 将不会出现在 footer 里。在不支持硬链接的文件系统（FAT/exFAT）上，压缩会输出警告，原始 shard 保持原样。
 
 即使等待响应时切换到同一 provider 的另一个模型，响应统计仍归属于实际请求的 catalog/request-local 模型。旧 transport 的响应别名只根据请求快照处理，不使用新选择的模型；footer 继续显示当前选择的 direct 模型。损坏 JSON/schema 的旧 shard 按文件修改时间在两个月后清理；较新的损坏文件、有效的当天 shard、仍存活的旧 instance 和 symlink 目标均受保护。
 
