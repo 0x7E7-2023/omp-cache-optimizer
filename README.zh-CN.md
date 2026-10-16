@@ -63,7 +63,7 @@ pi remove npm:pi-deepseek-cache-optimizer && pi install npm:pi-cache-optimizer
 
 Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安装的 Pi package（包括本扩展），请运行 `pi update --extensions`（只更新 packages）或 `pi update --all`（Pi 与 packages 一起更新）。
 
-本扩展要求 Pi 0.82+，并已使用 Pi 1.1.0 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。原生虚拟模型支持与 codemode 嵌套工具调用合并只在会产生它们的 Pi 0.99+ 上生效，较早版本保持原有行为。本地开发基线需要 Node.js 22.19.0 或更高版本，与 Pi 1.0.3 的 engine 要求一致。
+本扩展要求 Pi 0.82+，并已使用 Pi 1.3.0 验证。TypeScript 校验直接使用官方 Pi package 类型，同时只使用这些版本共有的 extension hooks、`getAgentDir()` 和 prompt options；不依赖 Pi 0.83+ 专有 API（例如 `ctx.scopedModels` 或 bundled TypeBox 1.3 aliases）。原生虚拟模型支持与 codemode 嵌套工具调用合并只在会产生它们的 Pi 0.99+ 上生效，较早版本保持原有行为。本地开发基线需要 Node.js 22.19.0 或更高版本，与 Pi 1.0.3 的 engine 要求一致。
 
 ## 命令
 
@@ -82,9 +82,10 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | `/cache-optimizer fix` | 为当前模型自动修复安全的 compat 问题。展示预览 + 风险提示，需要用户确认；原生 compat 修复写 `models.json`，已观测到的 `prompt_cache_key` 问题写扩展配置。 |
 | `/cache-optimizer fix prompt-cache` | 为当前模型写入 `promptCache` 缓存时长，让 Pi 原生保温生效。带预览、备份、receipt 和回滚。需要确认。 |
 | `/cache-optimizer fix prompt-cache-key` | 明确把当前 OpenAI-compatible provider/model 配置为从最终请求体移除 `prompt_cache_key` 与 `promptCacheKey`。需要确认。 |
+| `/cache-optimizer fix kimi-base-url` | 为使用 OpenAI Chat Completions 的模型（Pi 1.3.0+ `kimi-coding`）在官方 Kimi Code base URL（`api.kimi.com` / `api.kimi.ai`，路径 `/coding`）后补 `/v1`。带预览、备份、receipt 和回滚。需要确认。 |
 | `/cache-optimizer rollback` | 查看最近一次匹配的已确认修复；经 UI 确认后安全恢复扩展配置或 `models.json` 修复。 |
 
-`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer fix <Tab>` 补全 `prompt-cache-key`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
+`/cache-optimizer` 使用 Pi 原生 Tab 补全：输入 `/cache-optimizer <Tab>` 查看支持的子命令，输入 `/cache-optimizer stats <Tab>` 补全 `all` 或 `contributors`，输入 `/cache-optimizer fix <Tab>` 补全 `prompt-cache`、`prompt-cache-key` 或 `kimi-base-url`，输入 `/cache-optimizer c<Tab>` 补全 `config`，输入 `/cache-optimizer config <Tab>` 补全 `footer-mode`，输入 `/cache-optimizer config footer-mode <Tab>` 补全 `total`、`session` 或 `process`。建议会按当前前缀过滤；无效前缀返回空结果，由 Pi 正常回退处理。
 
 交互式 `/cache-optimizer` 菜单包含 `Footer mode`，可以选择 `total`、`session` 或 `process`。`enable` / `disable` 是当前进程内开关。若要持久关闭某些能力，请使用下面的环境变量。
 
@@ -209,7 +210,7 @@ Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 
 
 Pi 自带缓存保温：在缓存条目过期前，用一个 token 的输出上限原样重放上一次请求（全局设置 `cacheWarming`：`off`、`streaming`（默认）或 `idle`；在 `/settings` → Cache warming 中修改，或在 `~/.pi/agent/settings.json` 中设置 `"cacheWarming"`）。本扩展不自行运行保活定时器：第二个保温器会重复计费，而且无法精确重放 Pi 的请求。
 
-Pi 只会为满足以下条件的模型保温：为当前保留档位声明了缓存时长、有输入/缓存价格、请求可重放（Anthropic 基于 budget 的 thinking 不可重放）。`models.json` 里的自定义代理模型常常缺前两项，保温根本不会启动。对价格全为 0 的模型，Pi 会以 “cache economics unavailable” 停止保温；本扩展仅在这种情况下通过 `cache_warming_decision` 返回 `warm`，因为一次刷新只是一次缓存读取加一个输出 token。有真实价格的模型仍按 Pi 自己的判断，Pi 的模式、缓存时长、可重放性和时间上限也照常生效。每次刷新都是一次真实请求，若渠道价格写 0 但实际计费，会产生费用。刷新间隔里 Pi 的 `/session` 仍会显示 “cache economics unavailable”；若其他扩展也处理 `cache_warming_decision`，以 Pi 最后执行的那个为准。可用 `/cache-optimizer config zero-price-warming off` 或 `PI_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMING=1` 关闭。`/cache-optimizer doctor` 现在会显示保温模式、档位和缺失项，并给出片段，例如 `anthropic-messages` 模型的 `"promptCache": {"short":300,"long":3600}`。自定义模型写在该模型条目中，内置模型写在 provider 的 `modelOverrides` 下；也可以运行 `/cache-optimizer fix prompt-cache` 一键写入：先预览、需确认、保留带时间戳的备份和注释，并记录 receipt，`/cache-optimizer rollback` 只会删除这次加入的 `promptCache` 对象（若文件之后没有改动则整文件恢复）。`anthropic-messages` 模型写入 `{"short":300,"long":3600}`（Anthropic 文档的 5 分钟/1 小时，与 Pi 内置 Claude 模型一致），其他 API 写入 `{"short":300}`；若当前使用长档位而该 API 没有文档化的长时长，则拒绝写入而不是猜测。已有 `promptCache` 时不会合并或覆盖，models.json 中不存在的 provider 条目也不会被创建。
+Pi 只会为满足以下条件的模型保温：为当前保留档位声明了缓存时长、有输入/缓存价格、请求可重放（Anthropic 基于 budget 的 thinking 不可重放）。`models.json` 里的自定义代理模型常常缺前两项，保温根本不会启动。对价格全为 0 的模型，Pi 会以 “cache economics unavailable” 停止保温；本扩展仅在这种情况下通过 `cache_warming_decision` 返回 `warm`，因为一次刷新只是一次缓存读取加一个输出 token。有真实价格的模型仍按 Pi 自己的判断，Pi 的模式、缓存时长、可重放性和时间上限也照常生效。每次刷新都是一次真实请求，若渠道价格写 0 但实际计费，会产生费用。刷新间隔里 Pi 的 `/session` 仍会显示 “cache economics unavailable”；若其他扩展也处理 `cache_warming_decision`，以 Pi 最后执行的那个为准。有两种 0 不算免费：OpenRouter 路由模型（ID 以 `openrouter/` 开头，如 `openrouter/auto`），其 -1 占位价格在 Pi 1.2.0+ 显示为 0，但实际按路由到的模型计费；以及 Pi 1.2.0 `cost.tiers` 中有正价格的模型。可用 `/cache-optimizer config zero-price-warming off` 或 `PI_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMING=1` 关闭。`/cache-optimizer doctor` 现在会显示保温模式、档位和缺失项，并给出片段，例如 `anthropic-messages` 模型的 `"promptCache": {"short":300,"long":3600}`。自定义模型写在该模型条目中，内置模型写在 provider 的 `modelOverrides` 下；也可以运行 `/cache-optimizer fix prompt-cache` 一键写入：先预览、需确认、保留带时间戳的备份和注释，并记录 receipt，`/cache-optimizer rollback` 只会删除这次加入的 `promptCache` 对象（若文件之后没有改动则整文件恢复）。`anthropic-messages` 模型写入 `{"short":300,"long":3600}`（Anthropic 文档的 5 分钟/1 小时，与 Pi 内置 Claude 模型一致），其他 API 写入 `{"short":300}`；若当前使用长档位而该 API 没有文档化的长时长，则拒绝写入而不是猜测。已有 `promptCache` 时不会合并或覆盖，models.json 中不存在的 provider 条目也不会被创建。
 
 streaming 保温在真实请求后 60 分钟停止，idle 保温在 30 分钟后停止。本扩展使用 1 小时保留时，刷新会在第 54 分钟才触发，所以 `idle` 没有额外作用；1 小时的缓存本身已覆盖一小时内的中断。除非你使用 5 分钟缓存且经常在半小时内回来，否则保持默认的 `streaming` 即可。
 
@@ -283,6 +284,8 @@ Kimi Coding K3 自定义渠道如果包含混合模型，建议使用模型级 c
 ```
 
 Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 Vercel AI Gateway catalog 中加入 Kimi K3。Moonshot/OpenRouter 变体使用 OpenAI-compatible transport，继续走普通 Kimi footer / proxy 路径；上面的 adaptive compat 只适用于 `anthropic-messages` Kimi Coding 渠道。
+
+**Pi 1.3.0+：** 内置 `kimi-coding` 改用 OpenAI Chat Completions（`openai-completions`），地址为 `https://api.kimi.com/coding/v1`（海外：`https://api.kimi.ai/coding/v1`），compat 由 Pi 自带（`thinkingFormat: "openai"`、`reasoning_content` 回传）。因此上面的 K3 adaptive compat 只适用于旧版 Pi，或仍声明 `anthropic-messages` 的自定义渠道。官方 Kimi Code 地址是源站而不是代理，doctor/compat/fix 不再对它提示缺 `sendSessionAffinityHeaders`；经第三方中转访问 Kimi 时仍照常检查。Anthropic 时代留下的 `baseUrl` 覆盖（`https://api.kimi.com/coding`，缺 `/v1`）会让所有 Chat Completions 请求失败：doctor 会报告，`/cache-optimizer fix kimi-base-url`（或直接 `fix`）会补上 `/v1`，带预览、备份、receipt 和回滚。只处理官方域名、路径恰为 `/coding`、且模型实际使用 `openai-completions` 的情况；代理、其他路径和 Anthropic 协议条目只提示，不会修改。provider 级 `baseUrl` 若同时被其他 API 的自定义或内置模型继承（例如 Pi < 1.3.0 的 `anthropic-messages` 内置模型），则拒绝修改；请改在该模型条目上设置 `baseUrl`。
 
 `/cache-optimizer doctor` 和 `/cache-optimizer compat` 会检测缺失的 flag 并显示可复制的 JSON。
 

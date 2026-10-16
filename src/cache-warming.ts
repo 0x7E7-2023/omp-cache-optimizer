@@ -70,11 +70,46 @@ function hasPricing(model: PiModel): boolean {
   return ["input", "cacheRead", "cacheWrite"].some((key) => typeof cost[key] === "number" && (cost[key] as number) > 0);
 }
 
-/** Every price Pi uses for warming economics is zero or missing. */
-function isZeroPriced(model: PiModel): boolean {
+const PRICE_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
+function hasPositivePrice(record: Record<string, unknown> | undefined): boolean {
+  if (!record) return false;
+  return PRICE_KEYS.some((key) => typeof record[key] === "number" && (record[key] as number) > 0);
+}
+
+/**
+ * OpenRouter router models (`openrouter/auto`, `openrouter/free`-style ids)
+ * forward to whichever model the router picks. OpenRouter lists them with a -1
+ * placeholder price, which Pi 1.2.0+ normalises to 0, so a zero cost block
+ * means "unknown", not "free". Matched on the id prefix so the same router
+ * reached through another provider entry is covered too.
+ */
+export function isOpenRouterRouterModel(model: PiModel): boolean {
+  return typeof model.id === "string" && model.id.toLowerCase().startsWith("openrouter/");
+}
+
+function costTiers(cost: Record<string, unknown>): unknown[] {
+  return Array.isArray(cost.tiers) ? cost.tiers : [];
+}
+
+/** Prompt-length tiers carry prices but the base cost block does not. */
+function hasOnlyTierPrices(model: PiModel): boolean {
+  const cost = asRecord((model as unknown as Record<string, unknown>).cost);
+  if (!cost || hasPositivePrice(cost)) return false;
+  return costTiers(cost).some((tier) => hasPositivePrice(asRecord(tier)));
+}
+
+/**
+ * Every price Pi uses for warming economics is zero or missing, including the
+ * prompt-length cost tiers Pi 1.2.0 added, and the zero is not a placeholder
+ * for an unknown router price.
+ */
+export function isZeroPriced(model: PiModel): boolean {
+  if (isOpenRouterRouterModel(model)) return false;
   const cost = asRecord((model as unknown as Record<string, unknown>).cost);
   if (!cost) return true;
-  return ["input", "output", "cacheRead", "cacheWrite"].every((key) => !(typeof cost[key] === "number" && (cost[key] as number) > 0));
+  if (hasPositivePrice(cost)) return false;
+  return !costTiers(cost).some((tier) => hasPositivePrice(asRecord(tier)));
 }
 
 function isReplayableForWarming(model: PiModel): boolean {
@@ -141,6 +176,12 @@ export function buildCacheWarmingDiagnosis(model: PiModel, input: CacheWarmingDi
   if (!hasPricing(model)) {
     if (input.zeroPriceWarming && isZeroPriced(model)) {
       lines.push("- The model has no input/cache prices. Pi would skip warming; this extension overrides that (config zero-price-warming on).");
+    } else if (isOpenRouterRouterModel(model)) {
+      issues.push("pricing_unknown");
+      lines.push("- ⚠️ OpenRouter router models list a placeholder price that Pi shows as 0, but the routed model is billed at its own price. Pi cannot estimate savings and skips warming; zero-price warming does not apply.");
+    } else if (hasOnlyTierPrices(model)) {
+      issues.push("pricing_missing");
+      lines.push("- ⚠️ The model has prompt-length price tiers but no base input/cache prices, so Pi cannot estimate savings and skips warming. Add base prices to the cost block.");
     } else {
       issues.push("pricing_missing");
       lines.push("- ⚠️ The model has no input/cache prices, so Pi cannot estimate savings and skips warming. Add a cost block, or turn on /cache-optimizer config zero-price-warming.");

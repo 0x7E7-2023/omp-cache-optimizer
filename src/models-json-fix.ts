@@ -8,6 +8,7 @@ import { findLastExactModelDefinition, resolveEffectiveCompatFromConfig } from "
 import { type FixReceiptCompatChange, type FixReceiptPlacement, type ModelsJsonFixReceiptV1, type PromptCacheLifetimes, RECEIPT_COMPAT_KEYS, type ReceiptScalar, type ReceiptScalarState, isReceiptTimestamp, isValidPromptCacheLifetimes, samePromptCacheLifetimes, isSafeReceiptText, isSha256 } from "./fix-types.ts";
 import { type JsonPropertyEdit, type ModelNodeLocation, deepEqualIgnoringKeys, deriveInnerIndent, findExistingCompatKeysInJsonc, findJsonObjectKey, findMatchingBracket, isJsonWhitespace, lineIndentOf, locateJsonPropertyValueSpan, locateModelOverrideInJsonc, locateProviderCompatInJsonc, parseJsonc, readJsonStringLiteral, skipJsonValue, skipJsonWhitespace, stripJsoncComments } from "./jsonc.ts";
 import { isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./model-detect.ts";
+import { isKimiCodeV1BaseUrlChange } from "./kimi-code.ts";
 import { FIX_RECEIPT_PATH, MODELS_JSON_PATH } from "./paths.ts";
 
 export type ExplicitCompatSource = "modelOverride" | "model" | "provider";
@@ -1528,10 +1529,10 @@ export function createRollbackBackupPath(modelsPath: string = MODELS_JSON_PATH):
 
 export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | undefined {
   const record = asRecord(value);
-  if (!record || (record.version !== 1 && record.version !== 2) || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
+  if (!record || (record.version !== 1 && record.version !== 2 && record.version !== 3) || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
   const allowedKeys = new Set([
     "version", "kind", "transactionId", "provider", "modelId", "placement",
-    "targetExistedBefore", "changedKeys", "promptCacheAdded", "beforeHash", "afterHash", "backupFile",
+    "targetExistedBefore", "changedKeys", "promptCacheAdded", "baseUrlChange", "beforeHash", "afterHash", "backupFile",
     "createdAt", "appliedAt", "status", "rolledBackAt",
   ]);
   if (Object.keys(record).some((key) => !allowedKeys.has(key))) return undefined;
@@ -1549,8 +1550,19 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
   const isV2 = record.version === 2;
   if (isV2 !== (record.promptCacheAdded !== undefined)) return undefined;
   if (isV2 && (!isValidPromptCacheLifetimes(record.promptCacheAdded) || record.placement === "provider")) return undefined;
+  // baseUrlChange is the version 3 marker: a single official Kimi Code
+  // `/coding` → `/coding/v1` rewrite at an existing provider or model target.
+  const isV3 = record.version === 3;
+  if (isV3 !== (record.baseUrlChange !== undefined)) return undefined;
+  const rawBaseUrlChange = asRecord(record.baseUrlChange);
+  if (isV3) {
+    if (!rawBaseUrlChange || Object.keys(rawBaseUrlChange).some((key) => key !== "before" && key !== "after")) return undefined;
+    if (!isKimiCodeV1BaseUrlChange(rawBaseUrlChange.before, rawBaseUrlChange.after)) return undefined;
+    if (record.placement === "modelOverride" || record.targetExistedBefore !== true) return undefined;
+  }
   const changedKeys = asRecord(record.changedKeys);
-  if (!changedKeys || (Object.keys(changedKeys).length === 0 && !isV2)) return undefined;
+  if (!changedKeys || (Object.keys(changedKeys).length === 0 && record.version === 1)) return undefined;
+  if (isV3 && Object.keys(changedKeys).length > 0) return undefined;
 
   const parsedChanges: Record<string, FixReceiptCompatChange> = {};
   for (const [key, rawChange] of Object.entries(changedKeys)) {
@@ -1569,8 +1581,11 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
   if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
 
   const promptCacheAdded = isV2 ? record.promptCacheAdded as PromptCacheLifetimes : undefined;
+  const baseUrlChange = isV3 && rawBaseUrlChange
+    ? { before: rawBaseUrlChange.before as string, after: rawBaseUrlChange.after as string }
+    : undefined;
   return {
-    version: isV2 ? 2 : 1,
+    version: isV3 ? 3 : isV2 ? 2 : 1,
     kind: "pi-cache-optimizer-fix-receipt",
     transactionId: record.transactionId.trim(),
     provider: record.provider.trim(),
@@ -1579,6 +1594,7 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
     targetExistedBefore: record.targetExistedBefore,
     changedKeys: parsedChanges,
     ...(promptCacheAdded ? { promptCacheAdded: { ...(promptCacheAdded.short !== undefined ? { short: promptCacheAdded.short } : {}), ...(promptCacheAdded.long !== undefined ? { long: promptCacheAdded.long } : {}) } } : {}),
+    ...(baseUrlChange ? { baseUrlChange } : {}),
     beforeHash,
     afterHash,
     backupFile: record.backupFile,
@@ -1854,6 +1870,100 @@ export function createPromptCacheFixReceipt(
   });
 }
 
+export type BaseUrlFixPlacement = "provider" | "model";
+
+/**
+ * Locate the object that holds a direct `baseUrl`: the provider object, or
+ * the single custom `models[]` entry with this id. Duplicate provider keys or
+ * duplicate model ids are refused.
+ */
+export function locateBaseUrlTarget(
+  text: string,
+  provider: string,
+  modelId: string,
+  placement: BaseUrlFixPlacement,
+): { objectBrace: number; objectEnd: number } | undefined {
+  if (placement === "provider") {
+    const location = locateProviderCompatInJsonc(text, provider);
+    return location ? { objectBrace: location.providerObjectBrace, objectEnd: location.providerObjectEnd } : undefined;
+  }
+  const location = locateModelInJsonc(text, provider, modelId);
+  if (!location || location.providerKeyCount !== 1 || location.modelObjectBrace < 0) return undefined;
+  if (location.allModelIds.filter((id) => id === modelId).length !== 1) return undefined;
+  return { objectBrace: location.modelObjectBrace, objectEnd: location.modelObjectEnd };
+}
+
+/**
+ * Read the direct `baseUrl` of a target: its string value, `undefined` when
+ * absent, or "invalid" when duplicated, not a string, or unreadable.
+ */
+export function readBaseUrlState(
+  text: string,
+  target: { objectBrace: number; objectEnd: number } | undefined,
+): string | undefined | "invalid" {
+  if (!target) return "invalid";
+  const clean = stripJsoncComments(text);
+  const property = findJsonObjectKey(clean, target.objectBrace, "baseUrl");
+  if (!property || property.keyStart >= target.objectEnd) return undefined;
+  if (property.count !== 1) return "invalid";
+  const valueStart = skipJsonWhitespace(clean, property.valueStart);
+  if (clean[valueStart] !== "\"") return "invalid";
+  const literal = readJsonStringLiteral(clean, valueStart);
+  if (!literal || literal.end > target.objectEnd) return "invalid";
+  return literal.value;
+}
+
+/** Replace the direct `baseUrl` string of a target, or explain why it cannot. */
+export function replaceBaseUrlValue(
+  text: string,
+  target: { objectBrace: number; objectEnd: number },
+  value: string,
+): string | undefined {
+  const property = locateJsonPropertyValueSpan(text, target.objectBrace, target.objectEnd, "baseUrl");
+  if (!property) return undefined;
+  const clean = stripJsoncComments(text);
+  if (clean[property.valueStart] !== "\"") return undefined;
+  return text.slice(0, property.valueStart) + JSON.stringify(value) + text.slice(property.valueEnd);
+}
+
+/**
+ * Receipt for `/cache-optimizer fix kimi-base-url`: a version 3 receipt with
+ * no compat changes and the single baseUrl string the fix rewrote.
+ */
+export function createBaseUrlFixReceipt(
+  originalText: string,
+  modifiedText: string,
+  provider: string,
+  modelId: string,
+  placement: BaseUrlFixPlacement,
+  before: string,
+  after: string,
+  backupPath: string,
+  now: number = Date.now(),
+): ModelsJsonFixReceiptV1 | undefined {
+  const backupFile = basename(backupPath);
+  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile)) return undefined;
+  if (!isKimiCodeV1BaseUrlChange(before, after)) return undefined;
+  if (readBaseUrlState(originalText, locateBaseUrlTarget(originalText, provider, modelId, placement)) !== before) return undefined;
+  if (readBaseUrlState(modifiedText, locateBaseUrlTarget(modifiedText, provider, modelId, placement)) !== after) return undefined;
+  return parseModelsJsonFixReceipt({
+    version: 3,
+    kind: "pi-cache-optimizer-fix-receipt",
+    transactionId: randomUUID(),
+    provider,
+    modelId,
+    placement,
+    targetExistedBefore: true,
+    changedKeys: {},
+    baseUrlChange: { before, after },
+    beforeHash: hashText(originalText),
+    afterHash: hashText(modifiedText),
+    backupFile,
+    createdAt: now,
+    appliedAt: now,
+  });
+}
+
 export function createModelsJsonFixReceipt(
   originalText: string,
   modifiedText: string,
@@ -1906,6 +2016,19 @@ export function composeModelsJsonReceiptRollback(
 ): { modifiedText: string; changed: boolean } | { error: string } {
   if (!receipt.targetExistedBefore) {
     return { error: "the fix created a new target entry and the file changed; refusing to remove user changes automatically" };
+  }
+
+  if (receipt.baseUrlChange) {
+    if (receipt.placement === "modelOverride") return { error: "the receipt's baseUrl target is not supported" };
+    const baseUrlTarget = locateBaseUrlTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
+    const current = readBaseUrlState(currentText, baseUrlTarget);
+    if (current === "invalid" || !baseUrlTarget) return { error: "receipt-owned baseUrl is no longer safely locatable" };
+    if (current !== receipt.baseUrlChange.after) {
+      return { error: "receipt-owned baseUrl was changed after the fix; refusing to overwrite it" };
+    }
+    const modifiedText = replaceBaseUrlValue(currentText, baseUrlTarget, receipt.baseUrlChange.before);
+    if (modifiedText === undefined) return { error: "receipt-owned baseUrl is no longer safely locatable" };
+    return { modifiedText, changed: modifiedText !== currentText };
   }
 
   const target = locateReceiptCompatTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
@@ -1968,6 +2091,12 @@ export function validateModelsJsonRollback(
   // An exact hash check proves the complete pre-fix document, including a
   // newly created target entry (which intentionally did not exist before).
   if (expectedHash !== undefined) return null;
+
+  if (receipt.baseUrlChange) {
+    if (receipt.placement === "modelOverride") return "rollback result has an unsupported baseUrl target";
+    const state = readBaseUrlState(writtenText, locateBaseUrlTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement));
+    return state === receipt.baseUrlChange.before ? null : "rollback result did not restore baseUrl";
+  }
 
   const target = locateReceiptCompatTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement);
   if (!target?.targetExists) return "rollback result lost the original target entry";

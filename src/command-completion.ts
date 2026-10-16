@@ -37,7 +37,7 @@ export const FEATURE_COMMAND_MAP: Record<string, PersistedCacheOptimizerFeature>
 
 export const CACHE_OPTIMIZER_STATS_ARGUMENTS = ["all", "contributors"] as const;
 
-export const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache", "prompt-cache-key"] as const;
+export const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache", "prompt-cache-key", "kimi-base-url"] as const;
 
 export function filterCommandCompletionItems(
   values: readonly string[],

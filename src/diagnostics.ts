@@ -2,7 +2,7 @@ import { type CacheProviderAdapter } from "./adapters.ts";
 import { type PiModel, type UnknownRecord, asRecord, isNonEmptyString, lower } from "./common.ts";
 import { type CompatAdvicePlacement, appendCredentialSafeProviderGuidance, appendDeepSeekCompatAdviceLines, appendOpenAIProxyCompatAdviceLines, buildDeepSeekCompatSuggestion, buildSafeOpenAIProxyCompatSuggestion, describeMissingCacheCompatForModel, getModelsJsonDisplayPath, isAdaptiveThinkingCompatApplicable, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { type FixSuggestion } from "./fix-types.ts";
-import { getCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isPiBuiltInLlamaCppModel, modelKey } from "./model-identity.ts";
+import { getCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOfficialKimiCodeEndpoint, isOpenAICompatibleProxyApi, isPiBuiltInLlamaCppModel, isThirdPartyOpenAIProxyEndpoint, modelKey } from "./model-identity.ts";
 import { type CacheUsageSample, formatRecentTrendSummary } from "./stats-report.ts";
 import { type CacheStats, emptyCacheStats } from "./stats-store.ts";
 import { snapshotBaseUrlForDiagnostics } from "./request-state.ts";
@@ -38,7 +38,7 @@ export function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): str
   const optional: string[] = [];
 
   if (!isOpenAICompatibleProxyApi(model.api)) return optional;
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) return optional;
+  if (!isThirdPartyOpenAIProxyEndpoint(model)) return optional;
   if (isPiBuiltInLlamaCppModel(model)) return optional;
 
   if (compat.supportsLongCacheRetention !== true) {
@@ -143,7 +143,7 @@ export function isDeepSeekCompatCheckApplicable(model: PiModel): boolean {
 }
 
 export function isCompatCheckApplicable(model: PiModel): boolean {
-  return isOpenAICompatibleProxyApi(model.api) && isKnownThirdPartyOpenAIEndpoint(model) && !isPiBuiltInLlamaCppModel(model);
+  return isOpenAICompatibleProxyApi(model.api) && isThirdPartyOpenAIProxyEndpoint(model) && !isPiBuiltInLlamaCppModel(model);
 }
 
 export function isPromptCacheRetention400Applicable(model: PiModel): boolean {
@@ -223,7 +223,7 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
 
   // Unknown/default endpoints and official OpenAI are not diagnosable as
   // third-party router channels. Request-header bridging also fails closed.
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) {
+  if (!isThirdPartyOpenAIProxyEndpoint(model)) {
     return notes;
   }
 
@@ -404,6 +404,13 @@ export function getCompatCheckNotApplicableLines(model: PiModel): string[] {
     ];
   }
 
+  if (isOpenAICompatibleApi(api) && isOfficialKimiCodeEndpoint(model)) {
+    return [
+      "ℹ️ Compat check not applicable for this model.",
+      "   Official Kimi Code endpoint: Pi ships this provider's compat itself, and proxy session-affinity flags do not apply to a first-party origin.",
+    ];
+  }
+
   return ["ℹ️ Compat check not applicable for this model."];
 }
 
@@ -499,7 +506,9 @@ export function buildDoctorDiagnosis(model: PiModel, options: { promptCacheReten
       lines.push("   (session_id, x-client-request-id, x-session-affinity) and return 403. If you");
       lines.push("   see 403 errors, run /cache-optimizer fix to set sendSessionAffinityHeaders: false.");
     }
-  } else if (isOpenAISdkHeader403Applicable(model)) {
+  } else if (isOpenAISdkHeader403Applicable(model) && (options.openAISdkHeader403 || !isOfficialKimiCodeEndpoint(model))) {
+    // Official Kimi Code gets the 403 hint only after a 403 was observed; the
+    // passive "after disabling sendSessionAffinityHeaders" advice is proxy-only.
     lines.push("");
     if (options.openAISdkHeader403) {
       lines.push("⚠️  A 403 response was observed while sendSessionAffinityHeaders is not enabled.");

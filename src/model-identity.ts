@@ -2,6 +2,7 @@ import { type ModelIdentity, type PiModel, type UnknownRecord, asRecord, isNonEm
 import { type CacheCompat, NESTED_COMPAT_KEYS, resolveEffectiveCompatFromConfig } from "./compat-config.ts";
 import { parseJsonc } from "./jsonc.ts";
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, hasAnyTokenContaining, isKimiCodingAdaptiveModel, modelOrAssistantMessageHas } from "./model-detect.ts";
+import { parseOfficialKimiCodeBaseUrl } from "./kimi-code.ts";
 import { MODELS_JSON_PATH } from "./paths.ts";
 import { readFileSync, statSync } from "node:fs";
 
@@ -361,6 +362,21 @@ export function isOfficialOpenAIBaseUrl(model: PiModel): boolean {
 
 export function isKnownThirdPartyOpenAIEndpoint(model: PiModel): boolean {
   return isNonEmptyString(model.baseUrl) && !isOfficialOpenAIBaseUrl(model);
+}
+
+/** The model talks to Moonshot's official Kimi Code endpoint directly. */
+export function isOfficialKimiCodeEndpoint(model: PiModel | undefined): boolean {
+  return parseOfficialKimiCodeBaseUrl(model?.baseUrl) !== undefined;
+}
+
+/**
+ * A non-official OpenAI-compatible endpoint that may sit in front of several
+ * backends (relay, aggregator, gateway), where session-affinity headers help
+ * keep one session on one cache. Official first-party endpoints that Pi
+ * configures itself (Kimi Code) are origins, not proxies.
+ */
+export function isThirdPartyOpenAIProxyEndpoint(model: PiModel): boolean {
+  return isKnownThirdPartyOpenAIEndpoint(model) && !isOfficialKimiCodeEndpoint(model);
 }
 
 export function invalidateModelsConfigCache(): void {

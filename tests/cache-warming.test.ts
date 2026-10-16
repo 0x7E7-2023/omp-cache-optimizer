@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { buildCacheWarmingDiagnosis, cacheWarmingRefreshDelayMs, decideZeroPriceWarming, readCacheWarmingMode, suggestedPromptCacheLifetimes } from "../src/cache-warming.ts";
+import { buildCacheWarmingDiagnosis, cacheWarmingRefreshDelayMs, decideZeroPriceWarming, isOpenRouterRouterModel, isZeroPriced, readCacheWarmingMode, suggestedPromptCacheLifetimes } from "../src/cache-warming.ts";
 
 type PiModel = NonNullable<ExtensionContext["model"]>;
 
@@ -107,5 +107,31 @@ describe("zero-price warming override", () => {
     assert.ok(on.lines.some((line) => line.includes("overrides")));
     const off = buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: false });
     assert.deepEqual(off.issues, ["pricing_missing"]);
+  });
+
+  test("OpenRouter router models are not free just because Pi shows 0 (Pi 1.2.0 normalises -1 to 0)", () => {
+    const router = model({ provider: "openrouter", id: "openrouter/auto", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1", cost: zero, promptCache: { short: 300 } });
+    assert.equal(isOpenRouterRouterModel(router), true);
+    assert.equal(isZeroPriced(router), false);
+    assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, router), undefined);
+    const diagnosis = buildCacheWarmingDiagnosis(router, { mode: "streaming", tier: "short", zeroPriceWarming: true });
+    assert.deepEqual(diagnosis.issues, ["pricing_unknown"]);
+    assert.ok(diagnosis.lines.some((line) => line.includes("OpenRouter router")));
+    // A routed id reached through another provider entry is still a router.
+    assert.equal(isZeroPriced(model({ provider: "proxy", id: "openrouter/free", cost: zero })), false);
+    // Ordinary free OpenRouter models stay zero-priced.
+    assert.equal(isZeroPriced(model({ provider: "openrouter", id: "meta-llama/llama-4:free", cost: zero })), true);
+  });
+
+  test("a positive price in any cost tier means the model is not zero-priced", () => {
+    const tiered = { ...zero, tiers: [{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, inputTokensAbove: 0 }, { input: 6, output: 22.5, cacheRead: 0.6, cacheWrite: 7.5, inputTokensAbove: 200_000 }] };
+    const m = model({ cost: tiered, promptCache: { short: 300, long: 3600 } });
+    assert.equal(isZeroPriced(m), false);
+    assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, m), undefined);
+    const diagnosis = buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: true });
+    assert.deepEqual(diagnosis.issues, ["pricing_missing"]);
+    assert.ok(diagnosis.lines.some((line) => line.includes("price tiers")));
+    const allZeroTiers = model({ cost: { ...zero, tiers: [{ ...zero, inputTokensAbove: 200_000 }] } });
+    assert.equal(isZeroPriced(allZeroTiers), true);
   });
 });

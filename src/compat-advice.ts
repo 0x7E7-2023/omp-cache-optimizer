@@ -1,6 +1,6 @@
 import { type PiModel, isNonEmptyString, lower } from "./common.ts";
 import { isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./model-detect.ts";
-import { getCompat, isDeepSeekLikeModel, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isOpenAICompatibleProxyApi, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, isRoutedFallbackModel } from "./model-identity.ts";
+import { getCompat, isDeepSeekLikeModel, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isOpenAICompatibleProxyApi, isThirdPartyOpenAIProxyEndpoint, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, isRoutedFallbackModel } from "./model-identity.ts";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 
@@ -86,7 +86,7 @@ export function describeMissingOpenAICompatibleProxyCompat(model: PiModel): stri
   const missing: string[] = [];
 
   if (!isOpenAICompatibleProxyApi(model.api)) return missing;
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) return missing;
+  if (!isThirdPartyOpenAIProxyEndpoint(model)) return missing;
   if (isPiBuiltInLlamaCppModel(model)) return missing;
 
   if (compat.sendSessionAffinityHeaders === undefined) {

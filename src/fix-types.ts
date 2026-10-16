@@ -35,11 +35,12 @@ export function samePromptCacheLifetimes(left: unknown, right: unknown): boolean
 /**
  * Version 1 receipts record scalar compat changes only. Version 2 receipts
  * also record a `promptCache` object the fix added (it never overwrites one),
- * so rollback can remove exactly that property. Older extension versions
- * reject version 2 receipts instead of misreading them.
+ * so rollback can remove exactly that property. Version 3 receipts record a
+ * single `baseUrl` string rewrite (`/cache-optimizer fix kimi-base-url`).
+ * Older extension versions reject newer receipts instead of misreading them.
  */
 export type ModelsJsonFixReceiptV1 = {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   kind: "pi-cache-optimizer-fix-receipt";
   transactionId: string;
   provider: string;
@@ -49,6 +50,11 @@ export type ModelsJsonFixReceiptV1 = {
   changedKeys: Record<string, FixReceiptCompatChange>;
   /** Version 2 only: the promptCache object added at the target (absent before). */
   promptCacheAdded?: PromptCacheLifetimes;
+  /**
+   * Version 3 only: the `baseUrl` string the fix rewrote at the provider or
+   * custom model target (official Kimi Code `/coding` → `/coding/v1`).
+   */
+  baseUrlChange?: { before: string; after: string };
   beforeHash: string;
   afterHash: string;
   backupFile: string;
