@@ -272,8 +272,15 @@ export async function readModelStatsEpochStrict(modelKeyValue: string): Promise<
 export async function writeStatsEpoch(path: string, epoch: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-  await writeFile(tempPath, JSON.stringify({ version: 1, epoch, createdAt: Date.now() }, null, 2) + "\n", "utf8");
-  await rename(tempPath, path);
+  try {
+    await writeFile(tempPath, JSON.stringify({ version: 1, epoch, createdAt: Date.now() }, null, 2) + "\n", "utf8");
+    // Compaction reads every epoch file strictly, so on Windows a reset can
+    // meet a reader (or a scanner) holding the target: retry like the shards.
+    await renameWithRetry(tempPath, path);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function advanceGlobalStatsEpoch(): Promise<string> {
@@ -360,7 +367,7 @@ export async function writeStatsShardV7(path: string, shard: PersistedStatsShard
   const tempPath = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   try {
     await writeFile(tempPath, JSON.stringify(shard, null, 2) + "\n", "utf8");
-    await rename(tempPath, path);
+    await renameWithRetry(tempPath, path);
   } catch (error) {
     // Do not leave an orphaned temp file behind until the next cleanup pass.
     await unlink(tempPath).catch(() => undefined);
@@ -368,10 +375,38 @@ export async function writeStatsShardV7(path: string, shard: PersistedStatsShard
   }
 }
 
-type CachedShardRead = {
-  ino: number | bigint;
-  size: number;
-  mtimeMs: number;
+/**
+ * What a parse cache compares to decide a file is unchanged. Besides inode,
+ * size and mtime it includes ctime and birthtime: on Windows the inode is a
+ * 64-bit file id that loses precision as a double, FAT/exFAT and some
+ * network drives report 0, and FAT mtimes have a 2 s resolution, so a
+ * same-size rewrite (a new file renamed into place) could otherwise look
+ * unchanged. A renamed-in file always has a new ctime/birthtime.
+ */
+export type StatsFileIdentity = { ino: number | bigint; size: number; mtimeMs: number; ctimeMs: number; birthtimeMs: number };
+
+export function statsFileIdentityOf(info: import("node:fs").Stats): StatsFileIdentity {
+  return { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, birthtimeMs: info.birthtimeMs };
+}
+
+export function sameStatsFileIdentity(cached: StatsFileIdentity, info: import("node:fs").Stats): boolean {
+  return cached.ino === info.ino && cached.size === info.size && cached.mtimeMs === info.mtimeMs &&
+    cached.ctimeMs === info.ctimeMs && cached.birthtimeMs === info.birthtimeMs;
+}
+
+/** Test hooks for filesystem faults; production never sets them. */
+export type StatsFsTestHooks = {
+  /** Runs before every rename attempt in renameWithRetry; throw to simulate a Windows sharing violation. */
+  beforeRename?: (from: string, to: string) => void | Promise<void>;
+  /** Rewrites the stats a shard read sees (e.g. ino 0 and a coarse mtime). */
+  shardStat?: (path: string, info: import("node:fs").Stats) => import("node:fs").Stats;
+};
+let statsFsTestHooks: StatsFsTestHooks = {};
+export function setStatsFsTestHooks(hooks: StatsFsTestHooks | undefined): void {
+  statsFsTestHooks = hooks ?? {};
+}
+
+type CachedShardRead = StatsFileIdentity & {
   /** Valid shard whose embedded instanceId matches its filename. */
   shard: PersistedStatsShardV7 | undefined;
   /** Schema-valid parse regardless of filename match (used by retention). */
@@ -421,19 +456,20 @@ type ShardFileRead = {
  */
 async function readShardFileCached(path: string, name: string): Promise<ShardFileRead | undefined> {
   try {
-    const info = await lstat(path);
+    let info = await lstat(path);
+    if (statsFsTestHooks.shardStat) info = statsFsTestHooks.shardStat(path, info);
     if (!info.isFile() || info.isSymbolicLink()) {
       shardReadCache.delete(path);
       return undefined;
     }
     const cached = shardReadCache.get(path);
-    if (cached && cached.ino === info.ino && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
+    if (cached && sameStatsFileIdentity(cached, info)) {
       return { info, shard: cached.shard, parsed: cached.parsed };
     }
     const filenameInstanceId = name.slice(0, -".json".length);
     const parsed = parsePersistedStatsShardV7(JSON.parse(await readFile(path, "utf8")));
     const shard = parsed && parsed.instanceId === filenameInstanceId ? parsed : undefined;
-    shardReadCache.set(path, { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, shard, parsed });
+    shardReadCache.set(path, { ...statsFileIdentityOf(info), shard, parsed });
     return { info, shard, parsed };
   } catch (error) {
     shardReadCache.delete(path);
@@ -442,7 +478,7 @@ async function readShardFileCached(path: string, name: string): Promise<ShardFil
 }
 
 /**
- * Parsed-shard cache keyed by path and validated by inode, size, and mtime.
+ * Parsed-shard cache keyed by path and validated by the file identity.
  * Writers always publish through temp-file + rename, so an updated shard gets
  * a new inode; unchanged shards are not re-read or re-parsed on every refresh.
  */
@@ -816,26 +852,46 @@ export async function isMaintenanceMarkerDue(path: string, now = Date.now(), int
   }
 }
 
-export async function writeMaintenanceMarker(path: string, now = Date.now()): Promise<void> {
+/**
+ * Write a maintenance marker. `markedAt` (default `now`) becomes its mtime,
+ * which isMaintenanceMarkerDue measures: a marker dated earlier makes the
+ * next run due sooner (a failed pass retries after a short backoff).
+ */
+export async function writeMaintenanceMarker(path: string, now = Date.now(), markedAt = now): Promise<void> {
   const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(tempPath, `${now}\n`, "utf8");
-  await renameWithRetry(tempPath, path);
+  try {
+    await writeFile(tempPath, `${now}\n`, "utf8");
+    if (markedAt !== now) await utimes(tempPath, new Date(markedAt), new Date(markedAt));
+    await renameWithRetry(tempPath, path);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
+/** Default total time renameWithRetry keeps retrying (a Defender scan easily holds a file for over a second). */
+export const RENAME_RETRY_BUDGET_MS = 2_000;
+const RENAME_RETRY_MAX_DELAY_MS = 250;
+
 /**
- * rename() that retries briefly on the transient errors Windows raises while
- * another process (or an antivirus scanner) holds the target open.
+ * rename() that retries on the transient errors Windows raises while another
+ * process (or an antivirus scanner) holds the source or target open: backoff
+ * from 20 ms up to 250 ms per attempt, for `budgetMs` in total.
  */
-export async function renameWithRetry(from: string, to: string, attempts = 5): Promise<void> {
+export async function renameWithRetry(from: string, to: string, budgetMs = RENAME_RETRY_BUDGET_MS): Promise<void> {
+  const deadline = Date.now() + budgetMs;
   for (let attempt = 0; ; attempt++) {
     try {
+      await statsFsTestHooks.beforeRename?.(from, to);
       await rename(from, to);
       return;
     } catch (error) {
-      if (attempt >= attempts - 1 || !RENAME_RETRY_CODES.has(getErrorCode(error) ?? "")) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || !RENAME_RETRY_CODES.has(getErrorCode(error) ?? "")) throw error;
+      const delay = Math.min(20 * 2 ** attempt, RENAME_RETRY_MAX_DELAY_MS, remaining);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 }

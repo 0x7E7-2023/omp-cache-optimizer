@@ -13,8 +13,8 @@ import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, ato
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
 import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
-import { SHARD_ARCHIVE_PATH, aggregateStatsWithArchiveV7, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveView, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
-import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
+import { ARCHIVE_ABANDONED_ACTIVE_MS, SHARD_ARCHIVE_PATH, isArchivableShard, type StatsSnapshot, aggregateStatsWithArchiveV7, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveDetailed, readStatsArchiveView, readStatsSnapshot, setStatsArchiveTestHooks, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
+import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, isMaintenanceMarkerDue, renameWithRetry, setStatsFsTestHooks, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
 import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
@@ -328,6 +328,13 @@ export const __internals_for_tests = {
   maybeRunStatsMaintenance,
   readStatsArchive,
   readStatsArchiveView,
+  readStatsArchiveDetailed,
+  readStatsSnapshot,
+  setStatsArchiveTestHooks,
+  setStatsFsTestHooks,
+  renameWithRetry,
+  isArchivableShard,
+  isMaintenanceMarkerDue,
   aggregateStatsWithArchiveV7,
   encodeStatsArchiveV2,
   parseStatsArchiveV2,
@@ -615,14 +622,82 @@ export default function (pi: ExtensionAPI) {
     recentSamplesByModelKey.clear();
   }
 
+  /**
+   * Shards this instance persisted under its current id that compaction
+   * could have absorbed: the latest one, plus each one that was followed by
+   * a gap of at least ARCHIVE_ABANDONED_ACTIVE_MS (compaction only takes an
+   * active shard nobody wrote for that long). Used when this live process's
+   * own shard was absorbed anyway (see adoptAbsorbedOwnShard).
+   */
+  let persistedOwnShards: PersistedStatsShardV7[] = [];
+  function recordPersistedOwnShard(shard: PersistedStatsShardV7): void {
+    if (shard.instanceId !== instanceId) return;
+    const last = persistedOwnShards.at(-1);
+    if (last && shard.lifecycle.updatedAt - last.lifecycle.updatedAt < ARCHIVE_ABANDONED_ACTIVE_MS) persistedOwnShards.pop();
+    persistedOwnShards.push(shard);
+  }
+
+  /**
+   * Compaction absorbed this live instance's active shard: its process looked
+   * dead (a PID namespace the compactor cannot see: containers, WSL, a shared
+   * NFS agent dir) and it had been idle for a day. The archive now counts the
+   * version it read, which this instance must neither count again (as its
+   * in-memory shard) nor keep writing to (a write to an absorbed id is
+   * ignored and then deleted, losing the usage since). Continue under a new
+   * id holding only what the archive does not have: the in-memory counters
+   * minus the absorbed version, which is the newest persisted one dated at
+   * least ARCHIVE_ABANDONED_ACTIVE_MS before the absorption.
+   */
+  function adoptAbsorbedOwnShard(absorbedAt: number): void {
+    const candidates = persistedOwnShards.filter((shard) => shard.lifecycle.updatedAt <= absorbedAt - ARCHIVE_ABANDONED_ACTIVE_MS);
+    // Not identifiable (clock skew between the processes): assume the
+    // archive holds everything, so nothing is ever counted twice.
+    const absorbed = candidates.at(-1) ?? buildCurrentStatsShard();
+    const remaining: Record<string, CacheStats> = {};
+    for (const [key, stats] of Object.entries(cacheStatsProcessByModel)) {
+      const entry = absorbed.globalEpoch === currentGlobalEpoch ? absorbed.models[key] : undefined;
+      const sameEpoch = entry && entry.modelEpoch === (modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`));
+      const delta = cloneCacheStats(stats);
+      if (sameEpoch) {
+        delta.totalRequests = Math.max(0, stats.totalRequests - entry.stats.totalRequests);
+        delta.hitRequests = Math.max(0, stats.hitRequests - entry.stats.hitRequests);
+        delta.cachedInputTokens = Math.max(0, stats.cachedInputTokens - entry.stats.cachedInputTokens);
+        delta.cacheWriteInputTokens = Math.max(0, stats.cacheWriteInputTokens - entry.stats.cacheWriteInputTokens);
+        delta.totalInputTokens = Math.max(0, stats.totalInputTokens - entry.stats.totalInputTokens);
+        delta.hitRequests = Math.min(delta.hitRequests, delta.totalRequests);
+      }
+      if (delta.totalRequests > 0 || delta.totalInputTokens > 0 || delta.cachedInputTokens > 0 || delta.cacheWriteInputTokens > 0) {
+        remaining[key] = delta;
+      }
+    }
+    cacheStatsProcessByModel = remaining;
+    instanceId = randomUUID();
+    instanceShardPath = join(SHARD_FILES_DIR, `${instanceId}.json`);
+    shardCreatedAt = Date.now();
+    persistedOwnShards = [];
+    lastStatusText = undefined;
+    // The new id keeps the old shard's day; the next status update rolls it
+    // over as usual. Persist in the background (the aggregate below already
+    // counts the in-memory shard).
+    void persistCacheStats();
+  }
+
+  let lastStatsSnapshot: StatsSnapshot | undefined;
+
   async function refreshShardAggregate(): Promise<ShardAggregate> {
-    // Order matters: compaction publishes the archive before deleting the
-    // shards it absorbed, so reading the directory first and the archive
-    // second always sees each absorbed shard in at least one of them. Reading
-    // them concurrently could pair an old archive with a post-delete listing
-    // and drop those counters (and the last routed model) for this refresh.
-    const rawShards = await readValidStatsShardsV7();
-    const archive = await readStatsArchiveView();
+    // Order matters (readStatsSnapshot): compaction publishes the archive
+    // before deleting the shards it absorbed, so reading the directory first
+    // and the archive second always sees each absorbed shard in at least one
+    // of them. Reading them concurrently could pair an old archive with a
+    // post-delete listing and drop those counters (and the last routed model)
+    // for this refresh. A persistent transient archive read error reuses the
+    // previous consistent snapshot instead of pairing an old archive with a
+    // new listing.
+    const snapshot = await readStatsSnapshot(lastStatsSnapshot);
+    lastStatsSnapshot = snapshot;
+    const { rawShards, archive } = snapshot;
+    const ownAbsorbedAt = archive.archive.absorbed[instanceId];
+    if (ownAbsorbedAt !== undefined) adoptAbsorbedOwnShard(ownAbsorbedAt);
     // Shards folded into the archive are counted there. Ignore their raw file
     // (a crash may leave it behind) and this process's in-memory retired copy.
     for (const id of archive.absorbedIds) retiredShards.delete(id);
@@ -812,6 +887,7 @@ export default function (pi: ExtensionAPI) {
     return enqueuePersist(async () => {
       try {
         await writeStatsShardV7(path, shard);
+        if (path === instanceShardPath) recordPersistedOwnShard(shard);
       } catch (error) {
         console.warn(`${LOG_PREFIX}: failed to persist cache stats shard`, error);
         if (!persistenceWarningShown) {
@@ -869,6 +945,7 @@ export default function (pi: ExtensionAPI) {
       retiredShards.set(instanceId, buildCurrentStatsShard("closed"));
       instanceId = randomUUID();
       instanceShardPath = join(SHARD_FILES_DIR, `${instanceId}.json`);
+      persistedOwnShards = [];
       shardDay = day;
       shardCreatedAt = Date.now();
       cacheStatsProcessByModel = {};

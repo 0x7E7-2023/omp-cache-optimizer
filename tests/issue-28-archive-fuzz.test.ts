@@ -148,6 +148,10 @@ async function runScenario(seed: number, steps: number): Promise<{ compactions: 
   // Start well inside the retention window; scenarios span < 30 simulated days.
   fakeNow = RealDate.now() - 25 * DAY;
   const instances = [await loadInstance(`${seed}-a`), await loadInstance(`${seed}-b`), await loadInstance(`${seed}-c`)];
+  // One instance publishes as on a filesystem without hard links: exclusive
+  // in-place creation, readable only once complete. It must interleave with
+  // the hard-link publishers without double counting or losing anything.
+  instances[2].setStatsArchiveTestHooks({ link: async () => { throw Object.assign(new Error("EPERM: no hard links"), { code: "EPERM" }); } });
   const oracle = instances[0];
   const logical = new Map<string, any>();
   const running: Sim[] = [];

@@ -190,7 +190,12 @@ describe("issue #28 archive F: publishing is a compare-and-swap", () => {
       const ghost = I.statsArchiveGenerationPath(I.SHARD_ARCHIVE_PATH, 6);
       await mkdir(ghost);
       const view = await reader.readStatsArchiveView();
-      assert.equal(view.corrupt, true, "a non-file generation is not trusted");
+      // Not trusted, and since review G not fatal either: readers use the
+      // newest readable generation and the next publish goes above it.
+      assert.equal(view.corrupt, false);
+      assert.equal(view.generation, 5, "a non-file generation is skipped");
+      assert.equal(view.newestGeneration, 6);
+      assert.deepEqual(view.corruptGenerations, [6]);
       await rm(ghost, { recursive: true });
       assert.equal((await reader.readStatsArchiveView()).generation, 5);
     });

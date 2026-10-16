@@ -31,18 +31,32 @@
  * the highest generation; old generations are removed one generation late
  * and readers retry when the file they listed is gone.
  *
+ * Without hard links (FAT/exFAT, some NAS mounts) a generation is created
+ * exclusively in place (O_EXCL, the same compare-and-swap) and only counts
+ * once it parses completely.
+ *
+ * Recovery: every generation is self-consistent (its counters cover exactly
+ * the raw shards it lists as absorbed), so a generation that cannot be read
+ * (damaged on disk, truncated by a crash) is skipped for the previous one,
+ * which never double counts. The next compaction publishes above it and
+ * quarantines it as `archive.<generation>.corrupt-<time>.json`. A generation
+ * in a newer format is never skipped or overwritten.
+ *
  * 2.9.0 compatibility: 2.9.0 kept a single `archive/archive.json`. It is still
  * read while no generation exists and migrated by the next compaction, which
- * then replaces it with a directory of the same name. 2.9.0 treats that as an
- * unreadable archive: it never compacts (so it cannot overwrite or delete
- * anything) and its footer shows only history that is not archived, exactly
- * like the versions before 2.9.0. A file that 2.9.0 still manages to write
- * there afterwards (only if that directory is removed) is never counted: it is
- * set aside as `archive.legacy-<time>.json`, trading the counters it absorbed
- * for a guarantee against double counting.
+ * moves it aside to a placeholder, verifies the moved bytes are the ones it
+ * read, replaces it with a directory of the same name, and then links the
+ * first generation. 2.9.0 treats that directory as an unreadable archive: it
+ * never compacts (so it cannot overwrite or delete anything) and its footer
+ * shows only history that is not archived, exactly like the versions before
+ * 2.9.0. A file that 2.9.0 still manages to write there afterwards (only if
+ * that directory is removed) is never counted: it is set aside as
+ * `archive.legacy-<time>.json`, trading the counters it absorbed for a
+ * guarantee against double counting. An unreadable archive.json is set aside
+ * the same way and the first generation starts over from the raw shards.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { LOG_PREFIX, asRecord, getErrorCode, isNonEmptyString, isProcessAlive } from "./common.ts";
 import {
@@ -75,6 +89,10 @@ import {
   readValidStatsShardsV7,
   releaseStatsMaintenanceLock,
   renameWithRetry,
+  sameStatsFileIdentity,
+  statsFileIdentityOf,
+  type StatsFileIdentity,
+  SHARD_CLEANUP_INTERVAL_MS,
   touchStatsMaintenanceLock,
   writeMaintenanceMarker,
 } from "./stats-store.ts";
@@ -94,6 +112,9 @@ export const SHARD_COMPACTION_MARKER_PATH = join(SHARD_MAINTENANCE_DIR, "last-co
  * transient process-check failure cannot fold a live shard away.
  */
 export const ARCHIVE_ABANDONED_ACTIVE_MS = 24 * 60 * 60 * 1000;
+
+/** How soon maintenance retries a compaction pass that failed with an error. */
+export const COMPACTION_RETRY_AFTER_FAILURE_MS = 10 * 60 * 1000;
 
 /** How often a running maintenance pass refreshes the lock's mtime. */
 export const STATS_MAINTENANCE_HEARTBEAT_MS = 5 * 60 * 1000;
@@ -154,10 +175,18 @@ export type StatsArchiveV2Document = {
   models: number[][];
   buckets: number[][];
   routed: number[][];
+  /**
+   * Completeness marker, always the last property: a generation written in
+   * place (filesystems without hard links) is only valid once it parses,
+   * and a truncated document never does. Older versions ignore it.
+   */
+  complete?: true;
 };
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const GENERATION_FILE_PATTERN = /^archive\.(\d{1,15})\.json$/;
+/** 2.9.0's archive.json while it is being migrated (see compactStatsShardsV7). */
+const MIGRATION_PLACEHOLDER_PATTERN = /^archive\.migrating-[0-9a-f-]+\.json$/;
 
 export function emptyStatsArchive(now = Date.now()): StatsArchiveV1 {
   return { version: 1, kind: "pi-cache-optimizer-archive", updatedAt: now, absorbed: {}, buckets: [], routed: [] };
@@ -289,6 +318,7 @@ export function encodeStatsArchiveV2(archive: StatsArchiveV1, generation: number
     models,
     buckets,
     routed,
+    complete: true,
   };
 }
 
@@ -497,6 +527,19 @@ export class StatsArchiveView implements LoadedStatsArchive {
   private reduced?: ReducedArchive;
   private contributionCache?: { fingerprint: string; contribution: ShardContribution };
 
+  /** Highest generation listed, including unreadable ones above `generation`; the next publish targets newestGeneration + 1. */
+  readonly newestGeneration: number;
+  /** Unreadable generations above the one this snapshot came from (recovered from; quarantined by the next publish). */
+  readonly corruptGenerations: readonly number[];
+  /** The newest generation does not parse yet but is young: it may still be written in place (no-hard-link fallback). */
+  readonly pendingGeneration: boolean;
+  /** 2.9.0's file this snapshot was read from: archive.json, or a migration placeholder after an interrupted migration. */
+  readonly legacySourcePath?: string;
+  /** sha256 of the legacy source file's bytes (also set when it is unreadable, to verify it is unchanged before healing). */
+  readonly legacySourceSha256?: string;
+  /** No generation exists and 2.9.0's archive.json is unreadable: the next publish starts over and sets the file aside. */
+  readonly legacyCorrupt: boolean;
+
   constructor(
     readonly archive: StatsArchiveV1,
     readonly present: boolean,
@@ -504,9 +547,36 @@ export class StatsArchiveView implements LoadedStatsArchive {
     readonly generation: number,
     /** For 2.9.0's archive.json: its sha256; for a generation: the legacy file it was migrated from. */
     readonly legacySha256?: string,
+    recovery: {
+      newestGeneration?: number;
+      corruptGenerations?: readonly number[];
+      pendingGeneration?: boolean;
+      legacySourcePath?: string;
+      legacySourceSha256?: string;
+      legacyCorrupt?: boolean;
+    } = {},
   ) {
     this.absorbedIds = new Set(Object.keys(archive.absorbed));
+    this.newestGeneration = Math.max(generation, recovery.newestGeneration ?? 0);
+    this.corruptGenerations = recovery.corruptGenerations ?? [];
+    this.pendingGeneration = recovery.pendingGeneration ?? false;
+    this.legacySourcePath = recovery.legacySourcePath;
+    this.legacySourceSha256 = recovery.legacySourceSha256;
+    this.legacyCorrupt = recovery.legacyCorrupt ?? false;
   }
+
+  /** The same snapshot, recovered from below unreadable newer generations. */
+  withRecovery(newestGeneration: number, corruptGenerations: readonly number[], pendingGeneration: boolean): StatsArchiveView {
+    const key = JSON.stringify([newestGeneration, corruptGenerations, pendingGeneration]);
+    if (this.recovered?.key === key) return this.recovered.view;
+    const view = new StatsArchiveView(this.archive, this.present, this.corrupt, this.generation, this.legacySha256, {
+      newestGeneration, corruptGenerations, pendingGeneration,
+      legacySourcePath: this.legacySourcePath, legacySourceSha256: this.legacySourceSha256,
+    });
+    this.recovered = { key, view };
+    return view;
+  }
+  private recovered?: { key: string; view: StatsArchiveView };
 
   get shards(): readonly PersistedStatsShardV7[] {
     return this.syntheticShards ??= archiveToSyntheticShards(this.archive);
@@ -710,54 +780,73 @@ export async function aggregateStatsWithArchiveV7(
   return aggregator.finish();
 }
 
-type ArchiveSource =
-  | { kind: "none" }
-  | { kind: "invalid"; path: string }
-  | { kind: "legacy"; path: string; info: import("node:fs").Stats }
-  | { kind: "generation"; path: string; generation: number; info: import("node:fs").Stats };
-
-const SOURCE_ATTEMPTS = 5;
-
-/**
- * The newest snapshot: the highest generation, or 2.9.0's archive.json while
- * no generation exists. Retries when a listed generation disappears (it was
- * superseded and cleaned up meanwhile). Throws on other I/O errors.
- */
-async function locateArchiveSource(archivePath: string): Promise<ArchiveSource> {
-  for (let attempt = 0; attempt < SOURCE_ATTEMPTS; attempt++) {
-    const generations = await listStatsArchiveGenerations(archivePath);
-    const generation = generations.at(-1);
-    if (generation !== undefined) {
-      const path = statsArchiveGenerationPath(archivePath, generation);
-      try {
-        const info = await lstat(path);
-        if (!info.isFile() || info.isSymbolicLink()) return { kind: "invalid", path };
-        return { kind: "generation", path, generation, info };
-      } catch (error) {
-        if (getErrorCode(error) === "ENOENT") continue;
-        throw error;
-      }
-    }
-    try {
-      const info = await lstat(archivePath);
-      if (info.isFile() && !info.isSymbolicLink()) return { kind: "legacy", path: archivePath, info };
-      // The migration tombstone is created only after a generation exists:
-      // the listing raced a cleanup, or the generations were removed by hand.
-      if (info.isDirectory()) continue;
-      return { kind: "invalid", path: archivePath };
-    } catch (error) {
-      if (getErrorCode(error) === "ENOENT") return { kind: "none" };
-      throw error;
-    }
-  }
-  return { kind: "none" };
+/** Test hooks for archive I/O races and faults; production never sets them. */
+export type StatsArchiveTestHooks = {
+  /** Runs after each directory listing a reader makes (to land a concurrent migration or publish in between). */
+  afterList?: (archivePath: string) => void | Promise<void>;
+  /** Runs before a reader's lstat of a generation or legacy file; throw to simulate a fault. */
+  beforeLstat?: (path: string) => void | Promise<void>;
+  /** Runs before a reader's readFile of a generation or legacy file; throw to simulate a fault. */
+  beforeReadFile?: (path: string) => void | Promise<void>;
+  /** Replaces link() when publishing (e.g. throw EPERM like a filesystem without hard links). */
+  link?: (existingPath: string, newPath: string) => Promise<void>;
+  /** Runs right after the no-hard-link fallback created a generation file exclusively, before writing it. */
+  afterExclusiveCreate?: (target: string) => Promise<void>;
+  /** Overrides the maintenance heartbeat interval. */
+  heartbeatMs?: number;
+};
+let testHooks: StatsArchiveTestHooks = {};
+export function setStatsArchiveTestHooks(hooks: StatsArchiveTestHooks | undefined): void {
+  testHooks = hooks ?? {};
 }
 
-type CachedArchive = { path: string; ino: number | bigint; size: number; mtimeMs: number; view: StatsArchiveView };
-const archiveCache = new Map<string, CachedArchive>();
+type ArchiveListing = { generations: number[]; placeholders: string[] };
+
+async function listArchiveDirectory(archivePath: string): Promise<ArchiveListing> {
+  let names: string[];
+  try {
+    names = await readdir(dirname(archivePath));
+  } catch (error) {
+    if (getErrorCode(error) === "ENOENT") return { generations: [], placeholders: [] };
+    throw error;
+  }
+  const generations: number[] = [];
+  const placeholders: string[] = [];
+  for (const name of names) {
+    const match = GENERATION_FILE_PATTERN.exec(name);
+    if (match) generations.push(Number(match[1]));
+    else if (MIGRATION_PLACEHOLDER_PATTERN.test(name)) placeholders.push(join(dirname(archivePath), name));
+  }
+  return { generations: generations.sort((a, b) => a - b), placeholders: placeholders.sort() };
+}
+
+const SOURCE_ATTEMPTS = 6;
+/** Retries (with these delays) of a transient lstat/read failure before a reader gives up on this refresh. */
+const TRANSIENT_RETRY_DELAYS_MS = [15, 60, 150];
+const TRANSIENT_CODES = new Set(["EPERM", "EBUSY", "EACCES", "EAGAIN"]);
+/**
+ * A newest generation that does not parse and is younger than this may still
+ * be being written in place (the no-hard-link fallback): compaction waits
+ * instead of recovering past it. Readers always skip it.
+ */
+export const ARCHIVE_PENDING_GENERATION_MS = 10 * 60 * 1000;
+
+type ParsedArchiveFile =
+  | { kind: "ok"; view: StatsArchiveView }
+  /** Not an archive this version can read (damaged, truncated, wrong generation). */
+  | { kind: "invalid"; sha256: string }
+  /** A well-formed archive in a newer format: never recovered past or overwritten. */
+  | { kind: "unsupported" };
+
+type CachedArchiveFile = StatsFileIdentity & { parsed: ParsedArchiveFile };
+/** Parsed archive files by path (generations are immutable; archive.json is re-validated by identity). */
+const archiveFileCache = new Map<string, CachedArchiveFile>();
+/** The last good snapshot per archive path, served (stale) when a transient error persists. */
+const lastGoodArchive = new Map<string, StatsArchiveView>();
 
 export function clearStatsArchiveCache(): void {
-  archiveCache.clear();
+  archiveFileCache.clear();
+  lastGoodArchive.clear();
 }
 
 const emptyView = (): StatsArchiveView => new StatsArchiveView(emptyStatsArchive(0), false, false, 0);
@@ -767,87 +856,262 @@ function sha256(text: string | Buffer): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function parseArchiveFile(source: Extract<ArchiveSource, { kind: "legacy" | "generation" }>, bytes: Buffer): StatsArchiveView {
+function parseArchiveBytes(kind: "legacy" | "generation", generation: number, path: string, bytes: Buffer): ParsedArchiveFile {
+  const invalid = (): ParsedArchiveFile => ({ kind: "invalid", sha256: sha256(bytes) });
   let value: unknown;
   try {
     value = JSON.parse(bytes.toString("utf8"));
   } catch {
-    return corruptView();
+    return invalid();
   }
-  if (source.kind === "legacy") {
+  const record = asRecord(value);
+  const supported = kind === "legacy" ? 1 : 2;
+  if (record?.kind === "pi-cache-optimizer-archive" && isFiniteNumber(record.version) && record.version > supported) {
+    return { kind: "unsupported" };
+  }
+  if (kind === "legacy") {
     const archive = parseStatsArchive(value);
-    return archive ? new StatsArchiveView(archive, true, false, 0, sha256(bytes)) : corruptView();
+    const sha = sha256(bytes);
+    return archive
+      ? { kind: "ok", view: new StatsArchiveView(archive, true, false, 0, sha, { legacySourcePath: path, legacySourceSha256: sha }) }
+      : invalid();
   }
   const parsed = parseStatsArchiveV2(value);
-  if (!parsed || parsed.generation !== source.generation) return corruptView();
-  return new StatsArchiveView(parsed.archive, true, false, parsed.generation, parsed.legacySha256);
+  if (!parsed || parsed.generation !== generation) return invalid();
+  return { kind: "ok", view: new StatsArchiveView(parsed.archive, true, false, parsed.generation, parsed.legacySha256) };
 }
+
+class ArchiveRestart extends Error {}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type ReadStatsArchiveOptions = {
   /** Throw on a transient I/O failure instead of serving the last good snapshot (compaction). */
   strict?: boolean;
 };
 
+export type StatsArchiveRead = {
+  view: StatsArchiveView;
+  /**
+   * True when a transient I/O failure persisted and `view` is the last good
+   * snapshot (or an empty corrupt one): it may be older than a directory
+   * listing taken just before. See readStatsSnapshot.
+   */
+  stale: boolean;
+};
+
 /**
- * Read the newest archive snapshot, re-parsing only when the file (path,
- * inode, size, mtime) changed. No archive is an empty one; an invalid one is
- * reported as corrupt and treated as empty, so raw shards stay the source of
- * truth. A transient I/O failure (Windows EPERM/EBUSY while another process
- * or a scanner holds the file) is never cached: the last good snapshot is
- * returned when there is one, otherwise an uncached corrupt result, so the
- * next refresh retries.
+ * Read the newest usable archive snapshot.
+ *
+ * - The highest generation wins. A generation that is not a readable
+ *   archive (damaged on disk, truncated by a crash of the in-place fallback,
+ *   not a regular file) is skipped for the next lower one: every published
+ *   generation is self-consistent (its counters cover exactly the raw shards
+ *   it lists as absorbed), so falling back never double counts; it only
+ *   misses what the unreadable one absorbed and already deleted. The next
+ *   compaction publishes above it and quarantines it. A generation in a newer
+ *   format is never skipped: it is reported as corrupt, like before.
+ * - Without generations, 2.9.0's archive.json (or a migration placeholder
+ *   left by an interrupted migration) is read. An unreadable archive.json is
+ *   treated as empty, and the next compaction starts over from it.
+ * - A file that disappears between listing and reading (superseded and
+ *   removed, or migrated) makes the reader list again, as does a missing or
+ *   directory archive.json, which a migration in progress produces.
+ * - Transient errors (Windows EPERM/EBUSY while a scanner holds a file) are
+ *   retried briefly; if they persist, the last good snapshot is served and
+ *   flagged stale (never cached as an empty archive).
  */
-export async function readStatsArchiveView(archivePath: string = SHARD_ARCHIVE_PATH, options: ReadStatsArchiveOptions = {}): Promise<StatsArchiveView> {
-  const transientFailure = (error: unknown): StatsArchiveView => {
-    if (options.strict) throw error;
-    const previous = archiveCache.get(archivePath);
-    return previous && !previous.view.corrupt ? previous.view : corruptView();
-  };
-  for (let attempt = 0; attempt < SOURCE_ATTEMPTS; attempt++) {
-    let source: ArchiveSource;
+export async function readStatsArchiveDetailed(archivePath: string = SHARD_ARCHIVE_PATH, options: ReadStatsArchiveOptions = {}): Promise<StatsArchiveRead> {
+  let transientRetries = 0;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < SOURCE_ATTEMPTS + TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      source = await locateArchiveSource(archivePath);
+      const view = await locateAndReadArchive(archivePath, options, attempt);
+      if (view === undefined) continue;
+      if (!view.corrupt) lastGoodArchive.set(archivePath, view);
+      else lastGoodArchive.delete(archivePath);
+      return { view, stale: false };
     } catch (error) {
-      return transientFailure(error);
-    }
-    if (source.kind === "none") {
-      archiveCache.delete(archivePath);
-      return emptyView();
-    }
-    if (source.kind === "invalid") {
-      archiveCache.delete(archivePath);
-      return corruptView();
-    }
-    const { info } = source;
-    const cached = archiveCache.get(archivePath);
-    // Generations are immutable, so (path, identity) is a safe cache key. 2.9.0
-    // rewrites archive.json in place of the old one, and on filesystems with
-    // ino 0 and coarse mtimes (FAT/SMB on Windows) a rewrite of the same size
-    // keeps the same identity. Compaction migrates from it and then deletes
-    // shards, so it always re-reads that file instead of trusting the cache.
-    const cacheable = !(options.strict && source.kind === "legacy");
-    if (cacheable && cached && cached.path === source.path && cached.ino === info.ino && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
-      return cached.view;
-    }
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(source.path);
-    } catch (error) {
-      // Superseded and cleaned up (or migrated) between listing and reading.
-      if (getErrorCode(error) === "ENOENT") continue;
-      // On Windows a generation that is being deleted while someone holds it
-      // open fails with EPERM instead; a newer one exists by then.
-      if (source.kind === "generation") {
-        const newest = await listStatsArchiveGenerations(archivePath).then((list) => list.at(-1), () => undefined);
-        if (newest !== undefined && newest > source.generation) continue;
+      if (error instanceof ArchiveRestart) continue;
+      lastError = error;
+      if (TRANSIENT_CODES.has(getErrorCode(error) ?? "") && transientRetries < TRANSIENT_RETRY_DELAYS_MS.length) {
+        await sleep(TRANSIENT_RETRY_DELAYS_MS[transientRetries++]!);
+        continue;
       }
-      return transientFailure(error);
+      break;
     }
-    const view = parseArchiveFile(source, bytes);
-    archiveCache.set(archivePath, { path: source.path, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, view });
-    return view;
   }
-  return transientFailure(new Error(`stats archive ${archivePath} kept changing while being read`));
+  lastError ??= new Error(`stats archive ${archivePath} kept changing while being read`);
+  if (options.strict) throw lastError;
+  return { view: lastGoodArchive.get(archivePath) ?? corruptView(), stale: true };
+}
+
+/**
+ * One attempt. Resolves undefined (or throws ArchiveRestart) to list again;
+ * throws other errors for the caller's transient policy.
+ */
+async function locateAndReadArchive(archivePath: string, options: ReadStatsArchiveOptions, attempt: number): Promise<StatsArchiveView | undefined> {
+  const listing = await listArchiveDirectory(archivePath);
+  await testHooks.afterList?.(archivePath);
+  const restartIfNewer = async (generation: number, error: unknown): Promise<never> => {
+    const code = getErrorCode(error);
+    // Superseded and removed (or migrated) between listing and reading.
+    if (code === "ENOENT") throw new ArchiveRestart();
+    // On Windows, opening or stat-ing a generation that is being deleted
+    // while someone holds it open fails with EPERM; a newer one exists then.
+    if (generation > 0) {
+      const newest = await listArchiveDirectory(archivePath).then((l) => l.generations.at(-1), () => undefined);
+      if (newest !== undefined && newest > generation) throw new ArchiveRestart();
+    }
+    throw error;
+  };
+  if (listing.generations.length > 0) {
+    const newest = listing.generations.at(-1)!;
+    const corrupt: number[] = [];
+    let pending = false;
+    for (let index = listing.generations.length - 1; index >= 0; index--) {
+      const generation = listing.generations[index]!;
+      const path = statsArchiveGenerationPath(archivePath, generation);
+      const parsed = await readArchiveFile(path, "generation", generation, options, restartIfNewer);
+      if (parsed === undefined || parsed.parsed.kind === "invalid") {
+        const age = parsed ? Date.now() - parsed.mtimeMs : Infinity;
+        if (generation === newest && Math.abs(age) < ARCHIVE_PENDING_GENERATION_MS) pending = true;
+        corrupt.unshift(generation);
+        continue;
+      }
+      if (parsed.parsed.kind === "unsupported") return corruptView();
+      const view = parsed.parsed.view;
+      return corrupt.length > 0 ? view.withRecovery(newest, corrupt, pending) : view;
+    }
+    // No generation is readable: start over from an empty archive. Raw
+    // shards the unreadable generations absorbed but did not delete yet are
+    // counted raw again (their ids are no longer known to be absorbed).
+    return new StatsArchiveView(emptyStatsArchive(0), false, false, 0, undefined, { newestGeneration: newest, corruptGenerations: corrupt, pendingGeneration: pending });
+  }
+
+  // No generation: 2.9.0's archive.json, or a placeholder of an interrupted migration.
+  let info: import("node:fs").Stats | undefined;
+  try {
+    await testHooks.beforeLstat?.(archivePath);
+    info = await lstat(archivePath);
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") throw error;
+  }
+  if (info?.isFile() && !info.isSymbolicLink()) {
+    const parsed = await readArchiveFile(archivePath, "legacy", 0, options, restartIfNewer);
+    if (!parsed) throw new ArchiveRestart();
+    if (parsed.parsed.kind === "ok") return parsed.parsed.view;
+    if (parsed.parsed.kind === "unsupported") return corruptView();
+    return legacyCorruptView(archivePath, parsed.parsed.sha256);
+  }
+  if (info && !info.isDirectory()) return legacyCorruptView(archivePath, undefined);
+  const placeholder = listing.placeholders.at(-1);
+  if (placeholder) {
+    const parsed = await readArchiveFile(placeholder, "legacy", 0, options, restartIfNewer);
+    if (!parsed) throw new ArchiveRestart();
+    if (parsed.parsed.kind === "ok") return parsed.parsed.view;
+    if (parsed.parsed.kind === "unsupported") return corruptView();
+    return legacyCorruptView(placeholder, parsed.parsed.sha256);
+  }
+  // archive.json is missing or is the migration tombstone, which exists only
+  // once a generation does (or while a migration moves archive.json aside):
+  // the listing raced a migration or a cleanup. List again before concluding
+  // there is no archive.
+  if (attempt < 2) return undefined;
+  return emptyView();
+}
+
+function legacyCorruptView(path: string, sha: string | undefined): StatsArchiveView {
+  return new StatsArchiveView(emptyStatsArchive(0), true, false, 0, undefined, { legacySourcePath: path, legacySourceSha256: sha, legacyCorrupt: true });
+}
+
+/** lstat + cached parse of one archive file; undefined when it is not a regular file. */
+async function readArchiveFile(
+  path: string,
+  kind: "legacy" | "generation",
+  generation: number,
+  options: ReadStatsArchiveOptions,
+  onError: (generation: number, error: unknown) => Promise<never>,
+): Promise<{ parsed: ParsedArchiveFile; mtimeMs: number } | undefined> {
+  let info: import("node:fs").Stats;
+  try {
+    await testHooks.beforeLstat?.(path);
+    info = await lstat(path);
+  } catch (error) {
+    return onError(generation, error);
+  }
+  if (!info.isFile() || info.isSymbolicLink()) return undefined;
+  const cached = archiveFileCache.get(path);
+  // Generations are immutable, so their identity is a safe cache key. 2.9.0
+  // rewrites archive.json in place, and on filesystems with ino 0 and coarse
+  // mtimes (FAT/SMB on Windows) a rewrite of the same size may keep the same
+  // identity. Compaction migrates from it and then deletes shards, so it
+  // always re-reads that file instead of trusting the cache.
+  const cacheable = !(options.strict && kind === "legacy");
+  if (cacheable && cached && sameStatsFileIdentity(cached, info)) return { parsed: cached.parsed, mtimeMs: info.mtimeMs };
+  let bytes: Buffer;
+  try {
+    await testHooks.beforeReadFile?.(path);
+    bytes = await readFile(path);
+  } catch (error) {
+    archiveFileCache.delete(path);
+    return onError(generation, error);
+  }
+  const parsed = parseArchiveBytes(kind, generation, path, bytes);
+  // A young unparseable generation may still be written in place: do not
+  // cache it. An old one stays unreadable until compaction quarantines it
+  // (possibly hours later); cache it like any other file so readers do not
+  // re-read and re-parse it on every refresh. Completing a write would
+  // change its size, so the identity check still notices that.
+  const young = Math.abs(Date.now() - info.mtimeMs) < ARCHIVE_PENDING_GENERATION_MS;
+  if (!(parsed.kind === "invalid" && kind === "generation" && young)) archiveFileCache.set(path, { ...statsFileIdentityOf(info), parsed });
+  else archiveFileCache.delete(path);
+  if (archiveFileCache.size > 16) {
+    for (const key of archiveFileCache.keys()) {
+      if (archiveFileCache.size <= 16) break;
+      if (key !== path) archiveFileCache.delete(key);
+    }
+  }
+  return { parsed, mtimeMs: info.mtimeMs };
+}
+
+/** Read the newest archive snapshot (see readStatsArchiveDetailed). */
+export async function readStatsArchiveView(archivePath: string = SHARD_ARCHIVE_PATH, options: ReadStatsArchiveOptions = {}): Promise<StatsArchiveView> {
+  return (await readStatsArchiveDetailed(archivePath, options)).view;
+}
+
+export type StatsSnapshot = { rawShards: PersistedStatsShardV7[]; archive: StatsArchiveView };
+
+/**
+ * The raw shards and the archive as one consistent snapshot. Order matters:
+ * compaction publishes the archive before deleting the shards it absorbed,
+ * so reading the directory first and the archive second always sees each
+ * absorbed shard in at least one of them. When the archive read hit a
+ * persistent transient error and served the last good snapshot, that
+ * snapshot may predate shards deleted since; pairing it with the fresh
+ * listing would undercount, so the previous snapshot is reused as a whole
+ * (it was consistent when read) when it holds that same archive.
+ */
+export async function readStatsSnapshot(
+  previous?: StatsSnapshot,
+  directory: string = SHARD_FILES_DIR,
+  archivePath: string = SHARD_ARCHIVE_PATH,
+): Promise<StatsSnapshot> {
+  const rawShards = await readValidStatsShardsV7(directory);
+  const { view, stale } = await readStatsArchiveDetailed(archivePath);
+  if (stale && previous && previous.archive === view) {
+    // Only a newer generation can have deleted shards this archive misses.
+    // While it is still the newest one (highest generations never go back:
+    // only lower ones are removed, and an unreadable newest one only once a
+    // higher one exists), the fresh listing pairs with it consistently, so
+    // a persistent error on its file does not freeze everyone else's shards.
+    if (!view.corrupt && view.generation > 0 && view.corruptGenerations.length === 0) {
+      const newest = await listStatsArchiveGenerations(archivePath).then((generations) => generations.at(-1), () => undefined);
+      if (newest === view.generation) return { rawShards, archive: view };
+    }
+    return previous;
+  }
+  return { rawShards, archive: view };
 }
 
 /** Reference-form read (used by tests and tools): the snapshot with synthetic shards available. */
@@ -887,18 +1151,30 @@ async function legacyArchiveIdentity(archivePath: string): Promise<string | unde
 
 /** Test hooks for the publish protocol; production never sets them. */
 export type ArchivePublishHooks = {
-  /** Runs after every publish check passed, right before the new generation becomes visible. */
+  /** Runs after every publish check passed, right before the new generation becomes visible (and before a migration moves archive.json). */
   beforeCommit?: () => Promise<void>;
 };
 
-/**
- * Publish `generation` atomically and exclusively: the snapshot is written
- * and flushed to a private temp file, then hard-linked to its final name.
- * link() fails with EEXIST when that generation already exists, on Windows
- * and POSIX alike, so of all writers that read generation N exactly one can
- * publish N+1. Resolves false when another writer won.
- */
-async function commitStatsArchiveGeneration(archivePath: string, generation: number, text: string, hooks: ArchivePublishHooks): Promise<boolean> {
+/** Flush a directory entry change (link, rename) to stable storage where the platform supports it. */
+async function fsyncDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") return; // directories cannot be opened for fsync there
+  try {
+    const handle = await open(directory, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {}
+}
+
+/** link() failures that mean "this filesystem has no hard links" (FAT/exFAT, some NAS/SMB mounts). */
+const NO_HARDLINK_CODES = new Set(["EPERM", "ENOTSUP", "EINVAL"]);
+
+/** A snapshot written and flushed to a private temp file, ready to be published. */
+type PreparedGeneration = { target: string; tempPath: string; text: string };
+
+async function prepareStatsArchiveGeneration(archivePath: string, generation: number, text: string): Promise<PreparedGeneration> {
   await mkdir(dirname(archivePath), { recursive: true });
   const target = statsArchiveGenerationPath(archivePath, generation);
   const tempPath = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
@@ -910,19 +1186,57 @@ async function commitStatsArchiveGeneration(archivePath: string, generation: num
     } finally {
       await handle.close();
     }
-    await hooks.beforeCommit?.();
-    try {
-      await link(tempPath, target);
-    } catch (error) {
-      if (getErrorCode(error) === "EEXIST") return false;
-      // A filesystem without hard links (FAT/exFAT) cannot publish safely;
-      // the caller reports it and raw shards simply stay where they are.
-      throw error;
-    }
-    return true;
-  } finally {
+  } catch (error) {
     await unlink(tempPath).catch(() => undefined);
+    throw error;
   }
+  return { target, tempPath, text };
+}
+
+/**
+ * Publish a prepared generation atomically and exclusively: hard-link the
+ * flushed temp file to its final name. link() fails with EEXIST when that
+ * generation already exists, on Windows and POSIX alike, so of all writers
+ * that read generation N exactly one can publish N+1. Resolves false when
+ * another writer won.
+ *
+ * Without hard links (link fails with EPERM/ENOTSUP/EINVAL), the generation
+ * is created exclusively in place (O_EXCL, the same compare-and-swap) and
+ * written and flushed there. Until it is complete it does not parse, so
+ * readers skip it for the previous generation, and compaction treats a
+ * young unparseable newest generation as still being written. The writer
+ * deletes raw shards only after it completed, so nothing is counted twice
+ * or lost at any point; a crash mid-write leaves an unreadable generation
+ * that the next pass recovers past.
+ */
+async function commitPreparedGeneration(prepared: PreparedGeneration): Promise<boolean> {
+  try {
+    await (testHooks.link ?? link)(prepared.tempPath, prepared.target);
+  } catch (error) {
+    const code = getErrorCode(error);
+    if (code === "EEXIST") return false;
+    if (!NO_HARDLINK_CODES.has(code ?? "")) throw error;
+    let handle;
+    try {
+      handle = await open(prepared.target, "wx");
+    } catch (openError) {
+      if (getErrorCode(openError) === "EEXIST") return false;
+      throw openError;
+    }
+    try {
+      await testHooks.afterExclusiveCreate?.(prepared.target);
+      await handle.writeFile(prepared.text, "utf8");
+      await handle.sync();
+    } catch (writeError) {
+      await handle.close().catch(() => undefined);
+      // Ours (created exclusively) and incomplete: never leave it published.
+      await unlink(prepared.target).catch(() => undefined);
+      throw writeError;
+    }
+    await handle.close();
+  }
+  await fsyncDirectory(dirname(prepared.target));
+  return true;
 }
 
 /**
@@ -937,21 +1251,63 @@ async function removeSupersededGenerations(archivePath: string, current: number)
   }
 }
 
+/** Move an unreadable generation out of the generation namespace, keeping it for inspection. */
+async function quarantineGeneration(archivePath: string, generation: number): Promise<void> {
+  const path = statsArchiveGenerationPath(archivePath, generation);
+  const kept = path.replace(/\.json$/, `.corrupt-${Date.now()}.json`);
+  try {
+    await renameWithRetry(path, kept);
+    console.warn(`${LOG_PREFIX}: stats archive generation ${generation} was unreadable; recovered from the previous one and kept it as ${kept}`);
+  } catch (error) {
+    if (getErrorCode(error) !== "ENOENT") await unlink(path).catch(() => undefined);
+  }
+}
+
+/** Retry budget for moving 2.9.0's archive.json (a scanner may hold it for seconds). */
+export const LEGACY_ARCHIVE_RENAME_BUDGET_MS = 5_000;
+
 const LEGACY_TOMBSTONE_README =
   "pi-cache-optimizer stores its stats archive in the archive.<generation>.json files next to this directory.\n" +
   "This directory replaces the single archive.json of version 2.9.0 so that 2.9.0 can no longer write it\n" +
   "(it would publish without a compare-and-swap). 2.9.0 reports the archive as unreadable and keeps raw shards.\n" +
   "Do not remove it while any Pi process might still run pi-cache-optimizer 2.9.0.\n";
 
+async function createLegacyTombstone(archivePath: string): Promise<void> {
+  await mkdir(archivePath);
+  await writeFile(join(archivePath, "README.txt"), LEGACY_TOMBSTONE_README, "utf8").catch(() => undefined);
+}
+
+/** Keep a legacy file that is not part of any generation, for inspection. */
+async function setAsideLegacyFile(path: string, reason: string): Promise<void> {
+  let stamp = Date.now();
+  let kept = join(dirname(path), `archive.legacy-${stamp}.json`);
+  while (await lstat(kept).then(() => true, () => false)) kept = join(dirname(path), `archive.legacy-${++stamp}.json`);
+  await renameWithRetry(path, kept, LEGACY_ARCHIVE_RENAME_BUDGET_MS).catch(() => undefined);
+  console.warn(`${LOG_PREFIX}: ${reason}; kept as ${kept}`);
+}
+
 /**
- * After migrating (or whenever generations exist), make sure 2.9.0 cannot
- * write archive.json: move a file there aside and put a directory in its
- * place. A file whose content is the one this archive was migrated from is
- * simply deleted. Anything else was written by 2.9.0 after the migration
- * (only possible if the directory was removed); it is never counted, because
- * merging it could double count, and is kept for inspection.
+ * Whenever generations exist, make sure 2.9.0 cannot write archive.json:
+ * move a file there aside and put a directory in its place, and resolve
+ * migration placeholders. A file whose content is the one the newest
+ * generation was migrated from is simply deleted. Anything else is never
+ * counted, because merging it could double count, and is kept for
+ * inspection: a file 2.9.0 wrote after the migration (only possible if the
+ * directory was removed), or a placeholder of a migration that another
+ * compactor overtook.
  */
 async function ensureLegacyArchiveTombstone(archivePath: string, migratedFromSha256: string | undefined): Promise<void> {
+  const resolve = async (path: string): Promise<void> => {
+    let sha: string | undefined;
+    try {
+      sha = sha256(await readFile(path));
+    } catch {}
+    if (sha !== undefined && sha === migratedFromSha256) await unlink(path).catch(() => undefined);
+    else await setAsideLegacyFile(path, "ignored a stats archive of an older pi-cache-optimizer that is not part of the current archive");
+  };
+  const listing = await listArchiveDirectory(archivePath).catch(() => undefined);
+  for (const placeholder of listing?.placeholders ?? []) await resolve(placeholder);
+
   let info: import("node:fs").Stats | undefined;
   try {
     info = await lstat(archivePath);
@@ -962,26 +1318,67 @@ async function ensureLegacyArchiveTombstone(archivePath: string, migratedFromSha
   if (info) {
     const retired = `${archivePath}.${process.pid}.${randomUUID()}.retired.tmp`;
     try {
-      await renameWithRetry(archivePath, retired);
+      await renameWithRetry(archivePath, retired, LEGACY_ARCHIVE_RENAME_BUDGET_MS);
     } catch {
       return; // retried by the next pass; readers ignore archive.json once a generation exists
     }
-    let sha: string | undefined;
+    await resolve(retired);
+  }
+  await createLegacyTombstone(archivePath).catch(() => undefined);
+}
+
+/**
+ * Migration step, run after every publish check passed and before the first
+ * generation is linked: move 2.9.0's archive.json aside to a placeholder,
+ * put the tombstone directory in its place, and verify that the moved bytes
+ * are exactly the snapshot this pass built on.
+ *
+ * The rename is atomic, so a 2.9.0 process that took the lock over while this
+ * pass was suspended and republished archive.json is caught here (the bytes
+ * differ: the move is undone and the next pass migrates its file), instead
+ * of having its newly absorbed counters set aside after the fact. Once the
+ * directory is in place, 2.9.0 sees an unreadable archive and neither
+ * compacts nor deletes. If this pass dies before linking, readers and the
+ * next compaction migrate from the placeholder.
+ *
+ * Resolves false when the migration must be retried by a later pass.
+ */
+async function moveLegacyArchiveAside(archivePath: string, base: StatsArchiveView): Promise<boolean> {
+  const source = base.legacySourcePath;
+  if (!source) return true;
+  const expected = base.legacySourceSha256;
+  let placeholder = source;
+  if (source === archivePath) {
+    placeholder = join(dirname(archivePath), `archive.migrating-${randomUUID()}.json`);
     try {
-      sha = sha256(await readFile(retired));
-    } catch {}
-    if (sha !== undefined && sha === migratedFromSha256) {
-      await unlink(retired).catch(() => undefined);
-    } else {
-      const orphan = join(dirname(archivePath), `archive.legacy-${Date.now()}.json`);
-      await rename(retired, orphan).catch(() => undefined);
-      console.warn(`${LOG_PREFIX}: ignored a stats archive written by an older pi-cache-optimizer after migration; kept as ${orphan}`);
+      await renameWithRetry(archivePath, placeholder, LEGACY_ARCHIVE_RENAME_BUDGET_MS);
+    } catch {
+      return false;
     }
   }
   try {
-    await mkdir(archivePath);
-    await writeFile(join(archivePath, "README.txt"), LEGACY_TOMBSTONE_README, "utf8");
+    await createLegacyTombstone(archivePath);
+  } catch (error) {
+    if (getErrorCode(error) !== "EEXIST") return false;
+    const info = await lstat(archivePath).catch(() => undefined);
+    // Another 2.9.0 publish landed between the move and the mkdir. Its file
+    // replaces the one moved aside (it read it first, or started over): keep
+    // it as the archive and keep the placeholder only for inspection.
+    if (!info?.isDirectory()) return false;
+  }
+  let sha: string | undefined;
+  try {
+    sha = sha256(await readFile(placeholder));
   } catch {}
+  if (expected === undefined ? !base.legacyCorrupt : sha !== expected) {
+    // 2.9.0 republished between this pass's read and the move: undo, so the
+    // next pass migrates the newer file.
+    await rm(archivePath, { recursive: true, force: true }).catch(() => undefined);
+    await renameWithRetry(placeholder, archivePath, LEGACY_ARCHIVE_RENAME_BUDGET_MS).catch(() => undefined);
+    return false;
+  }
+  await fsyncDirectory(dirname(archivePath));
+  return true;
 }
 
 /** Instance ids of every shard-named file in `directory`, readable or not. */
@@ -996,9 +1393,31 @@ async function listShardInstanceIds(directory: string): Promise<Set<string>> {
   return new Set(names.filter((name) => /^[0-9a-f-]+\.json$/i.test(name)).map((name) => name.slice(0, -".json".length)));
 }
 
+/**
+ * A local day can still be "today" for a Pi process in another time zone
+ * (up to UTC+14 and down to UTC-12) until 12:00 UTC of the next day, i.e.
+ * 36 hours after its UTC midnight. Archived buckets merge shards (instance
+ * counts become bucket counts) and only feed the current-day view of their
+ * own day, so a day is archived only once it is over everywhere: then no
+ * process's current-day view (totals, instance counts) can differ from the
+ * raw shards it replaces.
+ */
+const DAY_OVER_EVERYWHERE_MS = 36 * 60 * 60 * 1000;
+
+function dayIsOverEverywhere(day: string, now: number): boolean {
+  const [year, month, date] = day.split("-").map(Number) as [number, number, number];
+  return now >= Date.UTC(year, month - 1, date) + DAY_OVER_EVERYWHERE_MS;
+}
+
 /** A shard maintenance may fold away: from a past day and no longer written to. */
 export function isArchivableShard(shard: PersistedStatsShardV7, now: number, today: string): boolean {
-  if (shard.day >= today) return false;
+  if (shard.day >= today || !dayIsOverEverywhere(shard.day, now)) return false;
+  // Usage recorded after midnight but before the day rollover carries the
+  // next day in stats.day. The current-day view skips such an entry on
+  // either day, but a merged bucket keeps only the latest stats.day and
+  // could hide its whole bucket from that day's view; such rare shards stay
+  // raw (retention removes them).
+  for (const entry of Object.values(shard.models)) if (entry.stats.day !== shard.day) return false;
   if (now - shard.lifecycle.updatedAt >= SHARD_RETENTION_MS) return false; // retention deletes it instead
   if (shard.lifecycle.state === "closed") return true;
   return now - shard.lifecycle.updatedAt >= ARCHIVE_ABANDONED_ACTIVE_MS && !isProcessAlive(shard.process.pid);
@@ -1066,12 +1485,23 @@ export async function compactStatsShardsV7(
   // compare-and-swap against exactly this generation.
   const base = await readStatsArchiveView(archivePath, { strict: true });
   if (base.corrupt) {
+    // A newer format this version cannot read: never overwrite it.
     result.skippedCorrupt = true;
     return result;
   }
-  // 2.9.0's archive.json: publish it as the first generation even when
-  // nothing else changed, so 2.9.0 can be locked out of writing it.
-  const migrating = base.present && base.generation === 0;
+  if (base.pendingGeneration) {
+    // The newest generation does not parse yet and is young: it may still be
+    // written in place (no-hard-link fallback) by a holder that lost the
+    // lock. Retry later rather than recover past it.
+    result.skippedConcurrent = true;
+    return result;
+  }
+  // 2.9.0's archive.json (readable or not): publish the first generation
+  // even when nothing else changed, so 2.9.0 can be locked out of writing
+  // it. Unreadable generations: publish above them so they are recovered
+  // from and quarantined.
+  const migrating = base.newestGeneration === 0 && base.legacySourcePath !== undefined;
+  const healing = base.corruptGenerations.length > 0;
   const previous = base.archive;
   const today = currentLocalDay();
   // Strict reads: compaction permanently drops counters whose epoch differs,
@@ -1165,7 +1595,7 @@ export async function compactStatsShardsV7(
     result.dropped = 0;
     return result;
   };
-  if (result.absorbed > 0 || result.dropped > 0 || absorbedChanged || migrating) {
+  if (result.absorbed > 0 || result.dropped > 0 || absorbedChanged || migrating || healing) {
     await options.beforePublish?.();
     // Cheap early exits: lost the lock, someone published meanwhile, or a
     // reset landed during the pass (counters written under the new epoch
@@ -1173,8 +1603,8 @@ export async function compactStatsShardsV7(
     // a stale holder safe; these only avoid wasted work.
     let concurrent =
       !(await holdsStatsMaintenanceLock(options.lockToken)) ||
-      ((await listStatsArchiveGenerations(archivePath)).at(-1) ?? 0) !== base.generation ||
-      (base.generation === 0 && (await legacyArchiveIdentity(archivePath)) !== legacyIdentityAtRead) ||
+      ((await listStatsArchiveGenerations(archivePath)).at(-1) ?? 0) !== base.newestGeneration ||
+      (base.newestGeneration === 0 && (await legacyArchiveIdentity(archivePath)) !== legacyIdentityAtRead) ||
       (await readGlobalStatsEpochStrict()) !== globalEpoch;
     for (const [key, epoch] of modelEpochs) {
       if (concurrent) break;
@@ -1189,25 +1619,46 @@ export async function compactStatsShardsV7(
       buckets: Array.from(buckets.values()),
       routed: Array.from(routed.values()),
     };
-    const generation = base.generation + 1;
+    // Above every listed generation, readable or not, so a holder that read
+    // an older one can never publish over an unreadable newer one.
+    const generation = base.newestGeneration + 1;
     const text = JSON.stringify(encodeStatsArchiveV2(next, generation, base.legacySha256)) + "\n";
-    if (!(await commitStatsArchiveGeneration(archivePath, generation, text, options))) return skip();
+    const prepared = await prepareStatsArchiveGeneration(archivePath, generation, text);
+    try {
+      await options.beforeCommit?.();
+      if (migrating && !(await moveLegacyArchiveAside(archivePath, base))) return skip();
+      if (!(await commitPreparedGeneration(prepared))) return skip();
+    } finally {
+      await unlink(prepared.tempPath).catch(() => undefined);
+    }
     // A generation above ours means ours is invisible to readers (only
     // possible after our base was superseded and cleaned up while this pass
     // was suspended): it must not delete what its snapshot covers.
     if (((await listStatsArchiveGenerations(archivePath)).at(-1) ?? 0) !== generation) return skip();
+    // The in-place fallback is not atomic: its generation exists (empty or
+    // partial) from the exclusive create until the write completes. A holder
+    // suspended in between for longer than the stale-lock window has its
+    // lock taken over, and the new holder may treat the old, still
+    // unparseable generation as abandoned and build on the one below it.
+    // If this writer then finished and deleted its absorbed shards before
+    // the new holder listed the shard directory, they would be lost: the
+    // new holder publishes above this generation and quarantines it. The new
+    // holder takes the lock before reading anything, so a writer that still
+    // holds it here cannot have been overtaken; one that lost it deletes
+    // nothing (its absorbed files stay ignored and a later pass removes them).
+    if (!(await holdsStatsMaintenanceLock(options.lockToken))) return skip();
     result.generation = generation;
     try {
-      const info = await lstat(statsArchiveGenerationPath(archivePath, generation));
-      archiveCache.set(archivePath, {
-        path: statsArchiveGenerationPath(archivePath, generation),
-        ino: info.ino, size: info.size, mtimeMs: info.mtimeMs,
-        view: new StatsArchiveView(next, true, false, generation, base.legacySha256),
-      });
+      const path = statsArchiveGenerationPath(archivePath, generation);
+      const info = await lstat(path);
+      const view = new StatsArchiveView(next, true, false, generation, base.legacySha256);
+      archiveFileCache.set(path, { ...statsFileIdentityOf(info), parsed: { kind: "ok", view } });
+      lastGoodArchive.set(archivePath, view);
     } catch {}
+    for (const corrupt of base.corruptGenerations) await quarantineGeneration(archivePath, corrupt);
     await removeSupersededGenerations(archivePath, generation);
   }
-  if (result.generation !== undefined || base.generation > 0) await ensureLegacyArchiveTombstone(archivePath, base.legacySha256);
+  if (result.generation !== undefined || base.newestGeneration > 0) await ensureLegacyArchiveTombstone(archivePath, base.legacySha256);
   await touchStatsMaintenanceLock(options.lockToken);
 
   // Only now that the archive covering them is durable, delete the originals.
@@ -1244,7 +1695,7 @@ export async function maybeRunStatsMaintenance(now = Date.now()): Promise<StatsM
   // Heartbeat so a long pass (a huge archive on a slow, scanned disk) is not
   // taken over as stale. It stops while the process is suspended; the
   // archive compare-and-swap covers that case.
-  const heartbeat = setInterval(() => void touchStatsMaintenanceLock(lockToken), STATS_MAINTENANCE_HEARTBEAT_MS);
+  const heartbeat = setInterval(() => void touchStatsMaintenanceLock(lockToken), testHooks.heartbeatMs ?? STATS_MAINTENANCE_HEARTBEAT_MS);
   heartbeat.unref?.();
   try {
     if (cleanupDue) {
@@ -1252,17 +1703,26 @@ export async function maybeRunStatsMaintenance(now = Date.now()): Promise<StatsM
       await writeMaintenanceMarker(SHARD_CLEANUP_MARKER_PATH, now);
     }
     if (compactionDue) {
+      let failed = false;
       try {
         result.compaction = await compactStatsShardsV7(now, SHARD_FILES_DIR, SHARD_ARCHIVE_PATH, { lockToken });
         if (result.compaction.skippedCorrupt) {
-          console.warn(`${LOG_PREFIX}: stats archive ${SHARD_ARCHIVE_PATH} is unreadable; keeping raw shards`);
+          console.warn(`${LOG_PREFIX}: stats archive ${SHARD_ARCHIVE_PATH} is in a newer format this version cannot read; keeping raw shards`);
         }
       } catch (error) {
+        failed = true;
         console.warn(`${LOG_PREFIX}: stats archive compaction failed`, error);
       }
       // A pass that lost a race published nothing; let the next startup retry
-      // instead of waiting out the full interval.
-      if (!result.compaction?.skippedConcurrent) await writeMaintenanceMarker(SHARD_COMPACTION_MARKER_PATH, now);
+      // instead of waiting out the full interval. A pass that failed (a
+      // transient Windows EPERM on an epoch or archive file, a full disk)
+      // published nothing either: retry after a short backoff, not 6 hours
+      // later, without retrying on every single startup.
+      if (failed) {
+        await writeMaintenanceMarker(SHARD_COMPACTION_MARKER_PATH, now, now - SHARD_CLEANUP_INTERVAL_MS + COMPACTION_RETRY_AFTER_FAILURE_MS);
+      } else if (!result.compaction?.skippedConcurrent) {
+        await writeMaintenanceMarker(SHARD_COMPACTION_MARKER_PATH, now);
+      }
     }
   } finally {
     clearInterval(heartbeat);

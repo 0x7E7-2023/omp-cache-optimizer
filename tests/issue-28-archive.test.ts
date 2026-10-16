@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -83,10 +83,14 @@ async function writeShard(I: any, options: ShardOptions): Promise<string> {
   return instanceId;
 }
 
-/** The same combination refreshShardAggregate performs, minus in-memory state. */
+/**
+ * The same combination refreshShardAggregate performs, minus in-memory state:
+ * the directory first, then the archive (never concurrently: an old archive
+ * paired with a post-delete listing would drop counters).
+ */
 async function combinedShards(I: any): Promise<any[]> {
-  const [raw, archive] = await Promise.all([I.readValidStatsShardsV7(), I.readStatsArchive()]);
-  return [...raw.filter((shard: any) => !archive.absorbedIds.has(shard.instanceId)), ...archive.shards];
+  const { rawShards, archive } = await I.readStatsSnapshot();
+  return [...rawShards.filter((shard: any) => !archive.absorbedIds.has(shard.instanceId)), ...archive.shards];
 }
 
 async function views(I: any, shards: any[]) {
@@ -169,7 +173,8 @@ describe("issue #28 phase 2: archive snapshot", () => {
       const now = Date.now();
       const globalEpoch = await I.readGlobalStatsEpoch();
       const models = {};
-      const yesterday = now - DAY - HOUR;
+      // Archived once the day is over in every time zone (issue #28 review M).
+      const yesterday = now - 3 * DAY;
       const ids = {
         today: await writeShard(I, { sessionHash: "s", day: localDay(new Date(now)), updatedAt: now - 1000, globalEpoch, models }),
         closedPast: await writeShard(I, { sessionHash: "s", day: localDay(new Date(yesterday)), updatedAt: yesterday, globalEpoch, models }),
@@ -219,10 +224,12 @@ describe("issue #28 phase 2: archive snapshot", () => {
   test("concurrent maintenance in several processes is serialized by the lock", async () => {
     await withAgentDir(async () => {
       const { I } = await load("concurrent");
+      // Separately loaded module instances: their own lock tokens and caches, like other Pi processes.
+      const others = await Promise.all([1, 2, 3, 4].map(async (index) => (await load(`concurrent-${index}`)).I));
       const now = Date.now();
       await writeRandomFixture(I, 5, now);
       const before = await views(I, await I.readValidStatsShardsV7());
-      const results = await Promise.all(Array.from({ length: 4 }, () => I.maybeRunStatsMaintenance(now)));
+      const results = await Promise.all(others.map((other) => other.maybeRunStatsMaintenance(now)));
       assert.equal(results.filter((r: any) => r.compaction).length, 1, "exactly one runner holds the lock");
       assert.deepEqual((await views(I, await combinedShards(I))).bySession, before.bySession);
     });
@@ -275,18 +282,30 @@ describe("issue #28 phase 2: archive snapshot", () => {
     });
   });
 
-  test("an unreadable archive is never overwritten and raw shards stay authoritative", async () => {
+  test("an unreadable archive is set aside, never merged, and raw shards stay authoritative", async () => {
     await withAgentDir(async () => {
       const { I } = await load("corrupt");
       const now = Date.now();
-      const written = await writeRandomFixture(I, 3, now);
+      await writeRandomFixture(I, 3, now);
       await mkdir(join(I.SHARD_ARCHIVE_PATH, ".."), { recursive: true });
       await writeFile(I.SHARD_ARCHIVE_PATH, "{ not json");
       const before = await views(I, await I.readValidStatsShardsV7());
-      const result = await I.compactStatsShardsV7(now);
-      assert.equal(result.skippedCorrupt, true);
-      assert.equal((await readdir(I.SHARD_FILES_DIR)).length, written);
-      assert.equal(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"), "{ not json");
+      assert.deepEqual((await views(I, await combinedShards(I))).bySession, before.bySession, "read as an empty archive");
+      // Since review G it no longer blocks compaction forever: the next pass
+      // starts over from the raw shards and keeps the file for inspection.
+      const warn = console.warn;
+      console.warn = () => {};
+      let result: any;
+      try {
+        result = await I.compactStatsShardsV7(now);
+      } finally {
+        console.warn = warn;
+      }
+      assert.equal(result.skippedCorrupt, false);
+      assert.ok(result.absorbed > 0);
+      const kept = (await readdir(join(I.SHARD_ARCHIVE_PATH, ".."))).filter((name) => /^archive\.legacy-\d+\.json$/.test(name));
+      assert.equal(kept.length, 1);
+      assert.equal(await readFile(join(I.SHARD_ARCHIVE_PATH, "..", kept[0]!), "utf8"), "{ not json");
       assert.deepEqual((await views(I, await combinedShards(I))).bySession, before.bySession);
     });
   });
@@ -313,7 +332,7 @@ describe("issue #28 phase 2: archive snapshot", () => {
       const modelEpoch = await I.readModelStatsEpoch(KEYS[0]);
       const now = Date.now();
       for (let i = 1; i <= 40; i++) {
-        const at = now - (1 + (i % 5)) * DAY;
+        const at = now - (2 + (i % 5)) * DAY;
         await writeShard(I, { sessionHash, day: localDay(new Date(at)), updatedAt: at, globalEpoch, models: { [KEYS[0]]: { modelEpoch, requests: 1, hits: 1, cached: 50, input: 100 } } });
       }
       await handlers.get("session_start")!({ reason: "startup" }, context);
@@ -337,14 +356,21 @@ describe("issue #28 phase 2: archive snapshot", () => {
       const before = await views(I, await I.readValidStatsShardsV7());
       assert.ok(Object.keys(before.bySession).length > 0);
       // Simulate a transient Windows EPERM/EBUSY (or a damaged file): the
-      // lenient reader would fall back to the initial epoch.
-      await chmod(I.SHARD_GLOBAL_EPOCH_PATH, 0o000);
+      // lenient reader would fall back to the initial epoch. A directory in
+      // its place fails to read even as root (where chmod 000 would not).
+      const epochText = await readFile(I.SHARD_GLOBAL_EPOCH_PATH, "utf8");
+      await rm(I.SHARD_GLOBAL_EPOCH_PATH);
+      await mkdir(I.SHARD_GLOBAL_EPOCH_PATH);
+      const warn = console.warn;
+      console.warn = () => {};
       try {
         await assert.rejects(I.compactStatsShardsV7(now));
         const maintenance = await I.maybeRunStatsMaintenance(now);
         assert.equal(maintenance.compaction, undefined, "the failure is contained by maintenance");
       } finally {
-        await chmod(I.SHARD_GLOBAL_EPOCH_PATH, 0o600);
+        console.warn = warn;
+        await rm(I.SHARD_GLOBAL_EPOCH_PATH, { recursive: true });
+        await writeFile(I.SHARD_GLOBAL_EPOCH_PATH, epochText);
       }
       assert.equal((await readdir(I.SHARD_FILES_DIR)).length, written, "no shard was absorbed or deleted");
       assert.equal((await I.readStatsArchive()).present, false, "no archive was published");
@@ -452,13 +478,14 @@ describe("issue #28 phase 2: archive snapshot", () => {
       await rm(latest);
       await copyFile(tmp, latest);
       await rm(tmp);
-      await chmod(latest, 0o000);
+      // Injected rather than chmod 000, so the test also holds as root.
+      I.setStatsArchiveTestHooks({ beforeReadFile: async (path: string) => { if (path === latest) throw Object.assign(new Error("EPERM"), { code: "EPERM" }); } });
       try {
         const during = await I.readStatsArchive();
         assert.equal(during.corrupt, false, "the last good archive is served");
         assert.equal(during.shards.length, good.shards.length);
       } finally {
-        await chmod(latest, 0o600);
+        I.setStatsArchiveTestHooks(undefined);
       }
       const after = await I.readStatsArchive();
       assert.equal(after.corrupt, false);
