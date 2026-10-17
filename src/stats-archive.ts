@@ -185,8 +185,18 @@ export type StatsArchiveV2Document = {
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const GENERATION_FILE_PATTERN = /^archive\.(\d{1,15})\.json$/;
-/** 2.9.0's archive.json while it is being migrated (see compactStatsShardsV7). */
+/**
+ * 2.9.0's archive.json while it is being migrated (see compactStatsShardsV7):
+ * `archive.migrating-<moved-at ms, 13 digits>-<uuid>.json`, or
+ * `archive.migrating-<uuid>.json` as 2.9.2 named it. Both match this pattern
+ * (2.9.2 reads both).
+ */
 const MIGRATION_PLACEHOLDER_PATTERN = /^archive\.migrating-[0-9a-f-]+\.json$/;
+const MIGRATION_PLACEHOLDER_MOVED_AT_PATTERN = /^archive\.migrating-(\d{13})-[0-9a-f]{8}-[0-9a-f-]+\.json$/;
+
+function migrationPlaceholderPath(archivePath: string, movedAt = Date.now()): string {
+  return join(dirname(archivePath), `archive.migrating-${String(Math.max(0, Math.floor(movedAt))).padStart(13, "0")}-${randomUUID()}.json`);
+}
 
 export function emptyStatsArchive(now = Date.now()): StatsArchiveV1 {
   return { version: 1, kind: "pi-cache-optimizer-archive", updatedAt: now, absorbed: {}, buckets: [], routed: [] };
@@ -792,6 +802,14 @@ export type StatsArchiveTestHooks = {
   link?: (existingPath: string, newPath: string) => Promise<void>;
   /** Runs right after the no-hard-link fallback created a generation file exclusively, before writing it. */
   afterExclusiveCreate?: (target: string) => Promise<void>;
+  /**
+   * Runs between the steps of moving 2.9.0's archive.json aside (to land a
+   * concurrent 2.9.0 write there): "moved-aside" right after archive.json was
+   * renamed to its placeholder, before the tombstone directory is made;
+   * "undo-removed-tombstone" when undoing, right after the tombstone was
+   * removed, before the placeholder is put back.
+   */
+  afterMigrationStep?: (step: "moved-aside" | "undo-removed-tombstone", archivePath: string, placeholder: string) => Promise<void>;
   /** Overrides the maintenance heartbeat interval. */
   heartbeatMs?: number;
 };
@@ -818,6 +836,33 @@ async function listArchiveDirectory(archivePath: string): Promise<ArchiveListing
     else if (MIGRATION_PLACEHOLDER_PATTERN.test(name)) placeholders.push(join(dirname(archivePath), name));
   }
   return { generations: generations.sort((a, b) => a - b), placeholders: placeholders.sort() };
+}
+
+/**
+ * The newest of several migration placeholders, chosen deterministically.
+ * Two exist only after a migration kept one for inspection (a 2.9.0 write
+ * landed between its move and its mkdir) and a later one was interrupted
+ * after its own move: the later one holds what 2.9.0 wrote after the first
+ * was moved, so it is the one to read and migrate from (the older one is set
+ * aside once a generation exists). Ordered by the time the file was moved
+ * aside (in its name), or for 2.9.2's uuid-only names by its mtime (rename
+ * keeps it; content 2.9.0 wrote after an earlier move is always newer than
+ * that move), then by mtime, then by name. A file that disappeared sorts
+ * first; the caller re-lists when it is gone.
+ */
+async function newestMigrationPlaceholder(placeholders: readonly string[]): Promise<string | undefined> {
+  if (placeholders.length <= 1) return placeholders[0];
+  const keyed = await Promise.all(placeholders.map(async (path) => {
+    const info = await lstat(path).catch((error) => {
+      if (getErrorCode(error) === "ENOENT") return undefined;
+      throw error;
+    });
+    const mtime = info?.mtimeMs ?? -Infinity;
+    const moved = MIGRATION_PLACEHOLDER_MOVED_AT_PATTERN.exec(path.slice(dirname(path).length + 1));
+    return { path, time: info ? (moved ? Number(moved[1]) : mtime) : -Infinity, mtime };
+  }));
+  keyed.sort((a, b) => a.time - b.time || a.mtime - b.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return keyed.at(-1)!.path;
 }
 
 const SOURCE_ATTEMPTS = 6;
@@ -883,7 +928,13 @@ function parseArchiveBytes(kind: "legacy" | "generation", generation: number, pa
 
 class ArchiveRestart extends Error {}
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * A retry delay. Deliberately not unref'd: the read is awaited by a Pi
+ * handler (agent_settled, model_select, session_shutdown...), and in print
+ * mode an unref'd delay lets the event loop drain mid-handler, so Pi exits
+ * without session_shutdown (see renameWithRetry).
+ */
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export type ReadStatsArchiveOptions = {
   /** Throw on a transient I/O failure instead of serving the last good snapshot (compaction). */
@@ -1005,7 +1056,7 @@ async function locateAndReadArchive(archivePath: string, options: ReadStatsArchi
     return legacyCorruptView(archivePath, parsed.parsed.sha256);
   }
   if (info && !info.isDirectory()) return legacyCorruptView(archivePath, undefined);
-  const placeholder = listing.placeholders.at(-1);
+  const placeholder = await newestMigrationPlaceholder(listing.placeholders);
   if (placeholder) {
     const parsed = await readArchiveFile(placeholder, "legacy", 0, options, restartIfNewer);
     if (!parsed) throw new ArchiveRestart();
@@ -1349,12 +1400,13 @@ async function moveLegacyArchiveAside(archivePath: string, base: StatsArchiveVie
   const expected = base.legacySourceSha256;
   let placeholder = source;
   if (source === archivePath) {
-    placeholder = join(dirname(archivePath), `archive.migrating-${randomUUID()}.json`);
+    placeholder = migrationPlaceholderPath(archivePath);
     try {
       await renameWithRetry(archivePath, placeholder, LEGACY_ARCHIVE_RENAME_BUDGET_MS);
     } catch {
       return false;
     }
+    await testHooks.afterMigrationStep?.("moved-aside", archivePath, placeholder);
   }
   try {
     await createLegacyTombstone(archivePath);
@@ -1374,11 +1426,36 @@ async function moveLegacyArchiveAside(archivePath: string, base: StatsArchiveVie
     // 2.9.0 republished between this pass's read and the move: undo, so the
     // next pass migrates the newer file.
     await rm(archivePath, { recursive: true, force: true }).catch(() => undefined);
-    await renameWithRetry(placeholder, archivePath, LEGACY_ARCHIVE_RENAME_BUDGET_MS).catch(() => undefined);
+    await testHooks.afterMigrationStep?.("undo-removed-tombstone", archivePath, placeholder);
+    await restoreLegacyArchive(placeholder, archivePath);
     return false;
   }
   await fsyncDirectory(dirname(archivePath));
   return true;
+}
+
+/**
+ * Undo a move aside: put the placeholder back as archive.json without ever
+ * replacing a file there. Between removing the tombstone and this step a
+ * 2.9.0 process (holding the lock after a stale takeover) may already have
+ * published archive.json again; a rename would silently overwrite it, losing
+ * what it absorbed (its raw shards are already deleted). link() is a
+ * compare-and-swap: EEXIST keeps 2.9.0's newer file as the archive and keeps
+ * the placeholder for inspection (set aside once a generation exists, never
+ * counted, so nothing is counted twice). Without hard links the rename is
+ * the only way back (the window stays open on such filesystems).
+ */
+async function restoreLegacyArchive(placeholder: string, archivePath: string): Promise<void> {
+  try {
+    await (testHooks.link ?? link)(placeholder, archivePath);
+  } catch (error) {
+    if (getErrorCode(error) === "EEXIST") return;
+    await renameWithRetry(placeholder, archivePath, LEGACY_ARCHIVE_RENAME_BUDGET_MS).catch(() => undefined);
+    return;
+  }
+  // Both names are the same file now; drop the placeholder. If that fails it
+  // is resolved later (its bytes are the ones the next migration reads).
+  await unlink(placeholder).catch(() => undefined);
 }
 
 /** Instance ids of every shard-named file in `directory`, readable or not. */

@@ -630,6 +630,12 @@ export default function (pi: ExtensionAPI) {
    * own shard was absorbed anyway (see adoptAbsorbedOwnShard).
    */
   let persistedOwnShards: PersistedStatsShardV7[] = [];
+  /**
+   * Which lifetime of the in-memory counters a built shard snapshots: bumped
+   * whenever session_start clears them (see adoptAbsorbedOwnShard).
+   */
+  let countersSession = 0;
+  const countersSessionOfShard = new WeakMap<PersistedStatsShardV7, number>();
   function recordPersistedOwnShard(shard: PersistedStatsShardV7): void {
     if (shard.instanceId !== instanceId) return;
     const last = persistedOwnShards.at(-1);
@@ -653,9 +659,17 @@ export default function (pi: ExtensionAPI) {
     // Not identifiable (clock skew between the processes): assume the
     // archive holds everything, so nothing is ever counted twice.
     const absorbed = candidates.at(-1) ?? buildCurrentStatsShard();
+    // Session guard: subtract only a version built from the counters held
+    // now. session_start clears them (switching to another session, or the
+    // same one on reload) but keeps the id, so a version persisted before it
+    // counts usage these counters no longer hold: subtracting it would hide
+    // this session's usage. Its sessionHash alone cannot tell: a reload keeps
+    // it, and it changes without a reset when the session id first becomes
+    // known after usage (then the counters still hold that usage).
+    const sameSession = countersSessionOfShard.get(absorbed) === countersSession;
     const remaining: Record<string, CacheStats> = {};
     for (const [key, stats] of Object.entries(cacheStatsProcessByModel)) {
-      const entry = absorbed.globalEpoch === currentGlobalEpoch ? absorbed.models[key] : undefined;
+      const entry = sameSession && absorbed.globalEpoch === currentGlobalEpoch ? absorbed.models[key] : undefined;
       const sameEpoch = entry && entry.modelEpoch === (modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`));
       const delta = cloneCacheStats(stats);
       if (sameEpoch) {
@@ -773,7 +787,7 @@ export default function (pi: ExtensionAPI) {
         stats: cloneCacheStats(stats),
       };
     }
-    return {
+    const shard: PersistedStatsShardV7 = {
       version: 7,
       kind: "pi-cache-optimizer-shard",
       instanceId,
@@ -790,6 +804,8 @@ export default function (pi: ExtensionAPI) {
       models,
       ...(lastActualRoutedModel ? { lastRoutedModel: { ...lastActualRoutedModel } } : {}),
     };
+    countersSessionOfShard.set(shard, countersSession);
+    return shard;
   }
 
   function scheduleShardRefresh(ctx?: ExtensionContext, model?: PiModel): void {
@@ -967,6 +983,7 @@ export default function (pi: ExtensionAPI) {
     syncSessionHash(ctx);
     lastStatusText = undefined;
     cacheStatsProcessByModel = {};
+    countersSession++;
     cacheStatsLegacyFamily = emptyAllCacheStats();
     modelEpochByKey.clear();
     modelApiByKey.clear();

@@ -891,7 +891,13 @@ export async function renameWithRetry(from: string, to: string, budgetMs = RENAM
       const remaining = deadline - Date.now();
       if (remaining <= 0 || !RENAME_RETRY_CODES.has(getErrorCode(error) ?? "")) throw error;
       const delay = Math.min(20 * 2 ** attempt, RENAME_RETRY_MAX_DELAY_MS, remaining);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      // Deliberately not unref'd: every caller awaits this rename (a Pi
+      // handler, or the restore that session_shutdown awaits), and Pi's
+      // print mode exits by letting the event loop drain. An unref'd delay
+      // would let the process exit in the middle of an awaited handler,
+      // skipping session_shutdown and its final flush. The delay is bounded
+      // by budgetMs, and interactive mode exits with process.exit anyway.
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
     }
   }
 }
