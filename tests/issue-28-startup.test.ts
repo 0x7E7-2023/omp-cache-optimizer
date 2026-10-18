@@ -106,6 +106,7 @@ describe("issue #28 startup stats restoration", () => {
 
       // Later lifecycle events keep working against the restored aggregate.
       await handlers.get("message_end")!({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 0, cacheWrite: 0 } } }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", new RegExp(`${shardCount}/${shardCount + 1}`));
       await handlers.get("session_shutdown")!({}, context);
       const own = (await I.readValidStatsShardsV7()).filter((shard: { sessionHash: string }) => !shard.sessionHash.startsWith("other-session-"));
@@ -119,8 +120,10 @@ describe("issue #28 startup stats restoration", () => {
       const { I, handlers, statuses, context } = await loadExtension("race");
       const message = { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 40, cacheWrite: 0 } };
       await handlers.get("session_start")!({ reason: "startup" }, context);
-      // Do not await the restore: message_end must serialize behind it.
+      // Do not await the restore: message_end's refresh must serialize
+      // behind it (2.10: in the background, so wait for that refresh).
       await handlers.get("message_end")!({ message }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /1\/1/);
       await handlers.get("session_shutdown")!({}, context);
       const shards = await I.readValidStatsShardsV7();

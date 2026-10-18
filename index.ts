@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
-import { watch } from "node:fs";
-import { join } from "node:path";
+import { appendFile, mkdir } from "node:fs/promises";
+import { basename, join } from "node:path";
 import {
   type ExtensionAPI, type ExtensionContext
 } from "@earendil-works/pi-coding-agent";
@@ -13,9 +12,12 @@ import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, ato
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
 import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
-import { ARCHIVE_ABANDONED_ACTIVE_MS, SHARD_ARCHIVE_PATH, isArchivableShard, type StatsSnapshot, aggregateStatsWithArchiveV7, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveDetailed, readStatsArchiveView, readStatsSnapshot, setStatsArchiveTestHooks, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
-import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, isMaintenanceMarkerDue, renameWithRetry, setStatsFsTestHooks, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7 } from "./src/stats-store.ts";
+import { ARCHIVE_ABANDONED_ACTIVE_MS, SHARD_ARCHIVE_PATH, isArchivableShard, type StatsSnapshot, aggregateEpochKeys, aggregateStatsWithArchiveSync, aggregateStatsWithArchiveV7, readStatsArchiveForRefresh, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveDetailed, readStatsArchiveView, readStatsSnapshot, setStatsArchiveTestHooks, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
+import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, isMaintenanceMarkerDue, renameWithRetry, setStatsFsTestHooks, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7, type ShardEpochs, readEpochFileResult, readEpochFileWithRetry, createShardAggregatorSync, SHARD_FILE_NAME_PATTERN } from "./src/stats-store.ts";
+import { STATS_FULL_SCAN_INTERVAL_MS, StatsRefreshScheduler, type StatsWatchHandle, createFsShardWatch, TieredShardIndex, getStatsRefreshTestHooks, setStatsRefreshTestHooks } from "./src/stats-refresh.ts";
+import { countingStatsReadFs, setStatsReadFsForTests, statsReadFs } from "./src/stats-fs.ts";
 import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
+import { STATS_INCREMENTAL_ENV, STATS_TIMING_ENV, STATS_VERIFY_ENV, isStatsIncrementalEnabled, isStatsVerifyEnabled, statsTimingLogPath } from "./src/config.ts";
 import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
 import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
 import { LONG_CACHE_RETENTION_VALUE, PI_CACHE_RETENTION_BASELINE_SYMBOL, PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, captureCacheRetentionEnv, getOrCaptureCacheRetentionBaseline, decidePromptCacheRetention, recordPromptCacheRetentionDecision, requestLongCacheRetention, restoreCacheRetentionEnv, userRequestedLongCacheRetention } from "./src/retention.ts";
@@ -108,9 +110,36 @@ function notifyCacheCompatIfNeeded(
 // this module. Tests await it after session_start; runtime code uses the
 // per-instance promise instead.
 let latestStatsRestoreForTests: Promise<void> = Promise.resolve();
+/** Per extension instance in this module: resolves once no footer refresh (or its publish) is in flight. */
+const statsRefreshSettledForTests = new Set<() => Promise<void>>();
 
 export const __internals_for_tests = {
   waitForStatsRestore: (): Promise<void> => latestStatsRestoreForTests,
+  /**
+   * Footer refreshes after tool_execution_end, agent_settled and message_end
+   * no longer hold up Pi's handlers (2.10). Tests await this before
+   * asserting on what such a refresh publishes.
+   */
+  statsRefreshSettled: async (): Promise<void> => {
+    for (const settled of statsRefreshSettledForTests) await settled();
+  },
+  setStatsRefreshTestHooks,
+  setStatsReadFsForTests,
+  countingStatsReadFs,
+  TieredShardIndex,
+  StatsRefreshScheduler,
+  createFsShardWatch,
+  aggregateStatsWithArchiveSync,
+  aggregateEpochKeys,
+  createShardAggregatorSync,
+  readStatsArchiveForRefresh,
+  readEpochFileResult,
+  isStatsIncrementalEnabled,
+  statsTimingLogPath,
+  STATS_INCREMENTAL_ENV,
+  STATS_TIMING_ENV,
+  STATS_VERIFY_ENV,
+  isStatsVerifyEnabled,
   getLastSkillCompressionOutcome,
   decidePromptCacheRetention,
   userRequestedLongCacheRetention,
@@ -440,7 +469,7 @@ export default function (pi: ExtensionAPI) {
   let persistenceWarningShown = false;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let shardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let shardWatcher: ReturnType<typeof watch> | undefined;
+  let shardWatcher: StatsWatchHandle | undefined;
   // Historical stats are restored in the background so a large shard
   // directory never holds up Pi's session_start (issue #28). Handlers that
   // read or persist aggregated stats await this first.
@@ -692,23 +721,287 @@ export default function (pi: ExtensionAPI) {
     lastStatusText = undefined;
     // The new id keeps the old shard's day; the next status update rolls it
     // over as usual. Persist in the background (the aggregate below already
-    // counts the in-memory shard).
-    void persistCacheStats();
+    // counts the in-memory shard). Once shutdown began (the refresh gate is
+    // closed), never write an active shard: the flush closes this one.
+    void persistCacheStats(undefined, refreshScheduler.isClosed ? "closed" : "active");
   }
 
   let lastStatsSnapshot: StatsSnapshot | undefined;
 
-  async function refreshShardAggregate(): Promise<ShardAggregate> {
+  // ── Epoch reads: one sequence, so a slow read never rolls back a newer one ──
+  // Every footer epoch read (refresh, message_end, restore) takes a number
+  // when it starts; local resets take one when they wrote. currentGlobalEpoch
+  // and each modelEpochByKey entry remember the number of the read that set
+  // them, and only a read that started later may change them. Without this a
+  // refresh that read E1 before another process reset to E2 could, after
+  // message_end already adopted E2 and recorded usage under it, switch back
+  // to E1 and clear that usage.
+  let epochReadSeq = 0;
+  let globalEpochSeq = 0;
+  /** Model epoch reads at or below this never set a model epoch (global change, session start, local reset). */
+  let modelEpochFloorSeq = 0;
+  const modelEpochSeq = new Map<string, number>();
+  function nextEpochSeq(): number {
+    return ++epochReadSeq;
+  }
+  /** Whether a global epoch read numbered `seq` may set currentGlobalEpoch (and records it when it may). */
+  function acceptGlobalEpochRead(seq: number): boolean {
+    if (seq <= globalEpochSeq) return false;
+    globalEpochSeq = seq;
+    return true;
+  }
+  function acceptModelEpochRead(seq: number, key: string): boolean {
+    if (seq <= modelEpochFloorSeq || seq <= (modelEpochSeq.get(key) ?? 0)) return false;
+    modelEpochSeq.set(key, seq);
+    return true;
+  }
+  /**
+   * acceptModelEpochRead for the read message_end labels new usage with. A
+   * read the floor rejects (a newer read changed the global epoch, or a
+   * session started, while it was in flight) is still the newest knowledge
+   * of this key's epoch when nothing newer set the key: a global reset never
+   * changes model epoch files, and voiding cleared what was known, not what
+   * this read saw. Without it the usage is recorded with no model epoch,
+   * that is the initial one, which every reader filters out when the model
+   * was ever reset, and the next message_end then drops it.
+   */
+  function acceptModelEpochReadForUsage(seq: number, key: string): boolean {
+    if (acceptModelEpochRead(seq, key)) return true;
+    if (modelEpochByKey.has(key) || (modelEpochSeq.get(key) ?? 0) > seq) return false;
+    modelEpochSeq.set(key, seq);
+    return true;
+  }
+  /** Model epochs known so far are void (they were cleared): older reads must not set them again. */
+  function voidModelEpochs(seq: number): void {
+    modelEpochSeq.clear();
+    modelEpochFloorSeq = Math.max(modelEpochFloorSeq, seq);
+  }
+
+  type EpochSnapshot = { seq: number; global: string; models: Map<string, string> };
+
+  /** Read the global epoch and `keys` in parallel, once, for one refresh. Throws on a persistent I/O error. */
+  async function readEpochSnapshot(keys: Iterable<string>): Promise<EpochSnapshot> {
+    const seq = nextEpochSeq();
+    const keyList = Array.from(keys);
+    const results = await Promise.all([
+      readEpochFileWithRetry(SHARD_GLOBAL_EPOCH_PATH, initialEpoch("global")),
+      ...keyList.map((key) => readEpochFileWithRetry(modelEpochPath(key), initialEpoch(`model:${key}`))),
+    ]);
+    const epochs = results.map((result) => {
+      if (!result.ok) throw result.error;
+      return result.epoch;
+    });
+    return { seq, global: epochs[0]!, models: new Map(keyList.map((key, index) => [key, epochs[index + 1]!])) };
+  }
+
+  // ── Footer refresh: tiered index + single flight ──
+  const fullScanIntervalMs = getStatsRefreshTestHooks().fullScanIntervalMs ?? STATS_FULL_SCAN_INTERVAL_MS;
+  const shardIndex = new TieredShardIndex(SHARD_FILES_DIR, {
+    freeze: getStatsRefreshTestHooks().freezeShards,
+    fullScanIntervalMs,
+  });
+  /**
+   * When the archive was last read in full (its newest generation lstat-ed
+   * and its identity checked). Between such reads an unchanged clean
+   * generation is confirmed by the listing alone; but a generation number is
+   * only unique while the archive directory lives: if the stats directory is
+   * deleted and another process compacts from scratch, a new generation 1
+   * replaces the old one under the same name. So the identity is re-checked
+   * on every full refresh and at least every full scan interval, which
+   * bounds that case like a cold shard instead of until the next generation.
+   */
+  let archiveVerifiedAt = -Infinity;
+  const refreshScheduler = new StatsRefreshScheduler<ShardAggregate>((full) => runStatsRefresh(full));
+  /** Background refresh chains (and their publish) in flight; shutdown drains them. */
+  const backgroundStatsTasks = new Set<Promise<void>>();
+  let backgroundRefreshWarned = false;
+  /** The context of the latest session_start, for refreshes no handler asked for (watcher, scans). */
+  let latestStatsCtx: ExtensionContext | undefined;
+
+  function trackBackgroundStatsTask(task: Promise<unknown>): void {
+    const tracked = task.then(() => undefined, warnBackgroundRefreshOnce);
+    backgroundStatsTasks.add(tracked);
+    void tracked.then(() => backgroundStatsTasks.delete(tracked));
+  }
+
+  function warnBackgroundRefreshOnce(error: unknown): void {
+    if (backgroundRefreshWarned) return;
+    backgroundRefreshWarned = true;
+    console.warn(`${LOG_PREFIX}: background footer stats refresh failed (further failures are not reported)`, error);
+  }
+
+  /**
+   * The one entry point for refreshes Pi does not wait for (tool_execution_end,
+   * agent_settled, message_end, the watcher, scans). Never rejects: every
+   * failure, including a stale ctx after reload, is caught and warned once.
+   * Publishes outside the refresh's critical section (a day rollover inside
+   * publishStatus requests refreshes of its own), and not at all once the
+   * gate closed or a newer session_start superseded this one.
+   */
+  function refreshAndPublishInBackground(ctx: ExtensionContext | undefined, pickModel?: () => PiModel | undefined): void {
+    if (refreshScheduler.isClosed) return;
+    const generation = statsRestoreGeneration;
+    trackBackgroundStatsTask((async () => {
+      await waitForStatsRestore();
+      const aggregate = await refreshScheduler.background(false);
+      if (aggregate === undefined || refreshScheduler.isClosed || generation !== statsRestoreGeneration || !ctx) return;
+      ensureShardWatcher();
+      await publishStatus(ctx, pickModel ? pickModel() : ctx.model);
+    })());
+  }
+
+  /**
+   * A refresh whose reads start after this call (see StatsRefreshScheduler).
+   * `full` (default) stats every shard file: commands, doctor, flush and
+   * restore. Lifecycle refreshes use the tiered index.
+   */
+  function refreshShardAggregate({ full = true }: { full?: boolean } = {}): Promise<ShardAggregate> {
+    return refreshScheduler.request(full);
+  }
+
+  function startFullScanIfDue(): void {
+    // The shutdown flush's own refreshes run with the gate closed: no new background scan then.
+    if (refreshScheduler.isClosed) return;
+    const scan = shardIndex.maybeStartFullScan(() => `${instanceId}.json`);
+    if (!scan) return;
+    trackBackgroundStatsTask(scan.then(async (changed) => {
+      await checkShardWatcherDirectory();
+      const mismatched = isStatsVerifyEnabled() && !refreshScheduler.isClosed
+        ? await shardIndex.verifyCachedContents(`${instanceId}.json`)
+        : [];
+      noteStatsVerifyResult(mismatched);
+      if (changed || mismatched.length > 0) refreshAndPublishInBackground(latestStatsCtx);
+    }));
+  }
+
+  // PI_CACHE_OPTIMIZER_STATS_VERIFY: warn (once) when two verifications found
+  // shard content that changed behind an unchanged file identity. A check
+  // only judges files whose identity was the cached one before and after its
+  // read, so a racing writer on a filesystem with real identities is never a
+  // verdict; requiring two keeps a single oddity from warning. (Consecutive
+  // is not required: the re-read after a verdict makes the next check clean.)
+  let statsVerifyMismatches = 0;
+  let statsVerifyWarned = false;
+  function noteStatsVerifyResult(mismatched: readonly string[]): void {
+    if (mismatched.length > 0) statsVerifyMismatches++;
+    const timingPath = statsTimingLogPath();
+    if (timingPath && mismatched.length > 0) writeStatsTiming(timingPath, { at: new Date().toISOString(), pid: process.pid, verifyMismatched: mismatched.length });
+    if (statsVerifyMismatches < 2 || statsVerifyWarned) return;
+    statsVerifyWarned = true;
+    console.warn(
+      `${LOG_PREFIX}: footer stats: ${mismatched.length} shard file(s) changed while their identity (inode, size, timestamps) did not; ` +
+      `this filesystem hides changes from the incremental refresh. Set ${STATS_INCREMENTAL_ENV}=0 and please report it.`,
+    );
+  }
+
+  async function runStatsRefresh(full: boolean): Promise<ShardAggregate> {
+    const startedAt = performance.now();
+    const ownName = `${instanceId}.json`;
+    const incremental = isStatsIncrementalEnabled();
+    let shardPhaseMs = 0;
     // Order matters (readStatsSnapshot): compaction publishes the archive
-    // before deleting the shards it absorbed, so reading the directory first
-    // and the archive second always sees each absorbed shard in at least one
-    // of them. Reading them concurrently could pair an old archive with a
-    // post-delete listing and drop those counters (and the last routed model)
-    // for this refresh. A persistent transient archive read error reuses the
-    // previous consistent snapshot instead of pairing an old archive with a
-    // new listing.
-    const snapshot = await readStatsSnapshot(lastStatsSnapshot);
+    // before deleting the shards it absorbed, so the shard phase (listing,
+    // every lstat and readFile) completes before the archive is listed.
+    // Reading them concurrently could pair an old archive with a post-delete
+    // listing and drop those counters. A persistent transient archive read
+    // error reuses the previous consistent snapshot (its shard contents, not
+    // names) instead of pairing an old archive with a new listing.
+    const verifyArchive = full || startedAt - archiveVerifiedAt >= fullScanIntervalMs;
+    const snapshot = incremental
+      ? await readStatsSnapshot(lastStatsSnapshot, SHARD_FILES_DIR, SHARD_ARCHIVE_PATH, {
+        reuseArchive: !verifyArchive,
+        readShards: async () => {
+          const shards = await shardIndex.refresh({ own: ownName, full });
+          await getStatsRefreshTestHooks().afterShardPhase?.();
+          shardPhaseMs = performance.now() - startedAt;
+          return shards;
+        },
+      })
+      : await readStatsSnapshot(lastStatsSnapshot);
     lastStatsSnapshot = snapshot;
+    if (verifyArchive || !incremental) archiveVerifiedAt = startedAt;
+    const snapshotMs = performance.now() - startedAt;
+    if (incremental) refreshScheduler.outsideRun(startFullScanIfDue);
+    await getStatsRefreshTestHooks().beforeEpochRead?.();
+    // Every epoch the aggregation can look up, read once and in parallel,
+    // shared by both views and the adoption below.
+    const day = currentLocalDay();
+    const sessionsAtRead = new Set(currentSessionHashSet ? [currentSessionHash] : []);
+    const keys = aggregateEpochKeys(snapshot.rawShards, snapshot.archive, [], day, undefined);
+    for (const key of aggregateEpochKeys(snapshot.rawShards, snapshot.archive, [], null, sessionsAtRead)) keys.add(key);
+    for (const shard of retiredShards.values()) for (const key of Object.keys(shard.models)) keys.add(key);
+    for (const key of Object.keys(cacheStatsProcessByModel)) keys.add(key);
+    const epochs = await readEpochSnapshot(keys);
+    await getStatsRefreshTestHooks().beforeCommit?.();
+    // ── Synchronous commit: no await from here on. ──
+    // Usage message_end records meanwhile is in the in-memory counters this
+    // step snapshots, so a refresh never overwrites it with older totals.
+    const aggregate = commitStatsRefresh(snapshot, epochs, day);
+    getStatsRefreshTestHooks().afterCommit?.(aggregate);
+    const timingPath = statsTimingLogPath();
+    if (timingPath) {
+      const totalMs = performance.now() - startedAt;
+      writeStatsTiming(timingPath, {
+        at: new Date().toISOString(), pid: process.pid, incremental, full,
+        totalMs: round(totalMs), shardPhaseMs: round(shardPhaseMs), archivePhaseMs: round(snapshotMs - shardPhaseMs),
+        epochAndCommitMs: round(totalMs - snapshotMs), epochKeys: keys.size,
+        shards: snapshot.rawShards.length, index: incremental ? shardIndex.lastRefresh : undefined,
+      });
+    }
+    return aggregate;
+  }
+
+  const round = (value: number) => Math.round(value * 100) / 100;
+  let timingLinesWritten = 0;
+  let timingWrites: Promise<void> = Promise.resolve();
+  /** Opt-in (PI_CACHE_OPTIMIZER_STATS_TIMING) JSON lines, serialized, capped, failures ignored. */
+  function writeStatsTiming(path: string, record: Record<string, unknown>): void {
+    if (timingLinesWritten >= 20_000) return;
+    timingLinesWritten++;
+    const line = JSON.stringify(record) + "\n";
+    timingWrites = timingWrites.then(() => appendFile(path, line, "utf8")).catch(() => undefined);
+  }
+
+  /** The model epoch a refresh's aggregation filters `key` with. */
+  function aggregationModelEpoch(key: string, epochs: EpochSnapshot): string {
+    // A read (or local reset) newer than this snapshot set our value: it wins.
+    if ((modelEpochSeq.get(key) ?? 0) > epochs.seq && modelEpochByKey.has(key)) return modelEpochByKey.get(key)!;
+    // Keys first seen after the snapshot (usage recorded meanwhile) use the
+    // epoch this process recorded them under.
+    return epochs.models.get(key) ?? modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`);
+  }
+
+  function commitStatsRefresh(snapshot: StatsSnapshot, epochs: EpochSnapshot, day: string): ShardAggregate {
+    // A reset from another process can advance epochs while this instance is
+    // idle. Adopt those epochs during every refresh, not only when a later
+    // message_end arrives, so this instance cannot keep an old in-memory
+    // process bucket visible in `process` mode or rewrite stale counters during
+    // shutdown. Model-scoped resets clear only the affected local bucket. A
+    // read older than the one that set the current value is ignored.
+    let globalChanged = false;
+    if (acceptGlobalEpochRead(epochs.seq) && currentGlobalEpoch !== epochs.global) {
+      globalChanged = true;
+      currentGlobalEpoch = epochs.global;
+      cacheStatsProcessByModel = {};
+      modelEpochByKey.clear();
+      voidModelEpochs(epochs.seq);
+      modelApiByKey.clear();
+      modelNameByKey.clear();
+      lastActualRoutedModel = undefined;
+    }
+    if (!globalChanged) {
+      for (const key of Object.keys(cacheStatsProcessByModel)) {
+        const latestModelEpoch = epochs.models.get(key);
+        // A key first recorded after this snapshot was read: message_end read its epoch.
+        if (latestModelEpoch === undefined || !acceptModelEpochRead(epochs.seq, key)) continue;
+        if ((modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`)) === latestModelEpoch) continue;
+        delete cacheStatsProcessByModel[key];
+        modelEpochByKey.set(key, latestModelEpoch);
+        modelApiByKey.delete(key);
+        modelNameByKey.delete(key);
+      }
+    }
+
     const { rawShards, archive } = snapshot;
     const ownAbsorbedAt = archive.archive.absorbed[instanceId];
     if (ownAbsorbedAt !== undefined) adoptAbsorbedOwnShard(ownAbsorbedAt);
@@ -717,9 +1010,14 @@ export default function (pi: ExtensionAPI) {
     for (const id of archive.absorbedIds) retiredShards.delete(id);
     const persistedShards = rawShards.filter((shard) => !archive.absorbedIds.has(shard.instanceId));
     for (const shard of persistedShards) retiredShards.delete(shard.instanceId);
+    // This process's own file is not even read by the tiered index (its
+    // in-memory copy, the trailing shard, replaces it); the kill-switch path
+    // reads it and drops it here. If a day rollover changed the id while the
+    // snapshot was read, the previous id's content is its retired copy.
     const shards = persistedShards.filter((shard) => shard.instanceId !== instanceId);
     shards.push(...retiredShards.values());
     const trailing = currentSessionHashSet ? [buildCurrentStatsShard()] : [];
+    const epochSource: ShardEpochs = { globalEpoch: currentGlobalEpoch, modelEpoch: (key) => aggregationModelEpoch(key, epochs) };
     // Keep lifetime session footer data separate from daily totals/commands.
     // Both equal aggregating [...shards, ...archive.shards, ...trailing]
     // (issue #28 review H): the current day only sees archive entries of that
@@ -727,36 +1025,11 @@ export default function (pi: ExtensionAPI) {
     // merges the archive's pre-reduced per-(session, model) entries instead
     // of re-aggregating every archived bucket. The all-days view is only read
     // for the current session (cacheStatsByModel lookups and the last routed
-    // model), so it is built for that session alone; rebuilding every
-    // archived session's entries cost more than the rest of the refresh.
-    const aggregate = await aggregateStatsWithArchiveV7(shards, archive, trailing, currentLocalDay());
-    const sessionAggregate = await aggregateStatsWithArchiveV7(
-      shards, archive, trailing, null, new Set(currentSessionHashSet ? [currentSessionHash] : []),
+    // model), so it is built for that session alone.
+    const aggregate = aggregateStatsWithArchiveSync(shards, archive, trailing, day, undefined, epochSource);
+    const sessionAggregate = aggregateStatsWithArchiveSync(
+      shards, archive, trailing, null, new Set(currentSessionHashSet ? [currentSessionHash] : []), epochSource,
     );
-
-    // A reset from another process can advance epochs while this instance is
-    // idle. Adopt those epochs during every aggregate refresh, not only when a
-    // later message_end arrives, so this instance cannot keep an old in-memory
-    // process bucket visible in `process` mode or rewrite stale counters during
-    // shutdown. Model-scoped resets clear only the affected local bucket.
-    const latestGlobalEpoch = await readGlobalStatsEpoch();
-    if (currentGlobalEpoch !== latestGlobalEpoch) {
-      currentGlobalEpoch = latestGlobalEpoch;
-      cacheStatsProcessByModel = {};
-      modelEpochByKey.clear();
-      modelApiByKey.clear();
-      modelNameByKey.clear();
-      lastActualRoutedModel = undefined;
-    } else {
-      for (const key of Object.keys(cacheStatsProcessByModel)) {
-        const latestModelEpoch = await readModelStatsEpoch(key);
-        if ((modelEpochByKey.get(key) ?? initialEpoch(`model:${key}`)) === latestModelEpoch) continue;
-        delete cacheStatsProcessByModel[key];
-        modelEpochByKey.set(key, latestModelEpoch);
-        modelApiByKey.delete(key);
-        modelNameByKey.delete(key);
-      }
-    }
 
     cacheStatsByModel = {};
     for (const [sessionHash, models] of Object.entries(sessionAggregate.bySession)) {
@@ -771,6 +1044,114 @@ export default function (pi: ExtensionAPI) {
     lastStatusText = undefined;
     return aggregate;
   }
+
+  // ── TUI shard watcher: an accelerator only (marks names dirty) ──
+  let shardWatcherWanted = false;
+  let shardWatcherDirectory: string | undefined;
+  let shardWatcherRetryAt = 0;
+
+  function closeShardWatcher(): void {
+    const watcher = shardWatcher;
+    shardWatcher = undefined;
+    shardWatcherDirectory = undefined;
+    try {
+      watcher?.close();
+    } catch {}
+  }
+
+  /**
+   * Create the watcher when wanted (TUI, gate open) and missing. Called after
+   * the background restore (which creates the directory) and after
+   * successful background refreshes, so a watcher that failed (the directory
+   * did not exist yet, or an error closed it) is recreated once the
+   * directory can be listed again, at most every STATS_FULL_SCAN_INTERVAL_MS.
+   */
+  function ensureShardWatcher(): void {
+    if (!shardWatcherWanted || shardWatcher || refreshScheduler.isClosed) return;
+    const now = performance.now();
+    if (now < shardWatcherRetryAt) return;
+    shardWatcherRetryAt = now + STATS_FULL_SCAN_INTERVAL_MS;
+    try {
+      const factory = getStatsRefreshTestHooks().watch ?? createFsShardWatch;
+      shardWatcher = factory(SHARD_FILES_DIR, onShardWatchName, onShardWatchError);
+      shardWatcherRetryAt = 0;
+      void statsReadFs().stat(SHARD_FILES_DIR).then((info) => {
+        if (shardWatcher) shardWatcherDirectory = `${String(info.ino)}:${info.birthtimeMs}`;
+      }, () => undefined);
+    } catch {
+      // ENOENT, ENOSPC (inotify watches exhausted), EPERM: lifecycle
+      // refreshes, the hot set and full scans keep the footer correct.
+      shardWatcher = undefined;
+    }
+  }
+
+  function onShardWatchName(name: string | null): void {
+    if (refreshScheduler.isClosed || !shardWatcher) return;
+    const file = name === null ? undefined : basename(name);
+    if (file === undefined) {
+      // Overflow, or a platform that gives no name: re-check everything.
+      shardIndex.requestFullScan();
+    } else if (file.endsWith(".tmp")) {
+      return; // the rename that publishes it reports the target name
+    } else if (file === `${instanceId}.json`) {
+      return; // this process's own writes: its in-memory copy is authoritative
+    } else if (SHARD_FILE_NAME_PATTERN.test(file)) {
+      shardIndex.markDirty(file);
+    } else {
+      shardIndex.requestFullScan();
+    }
+    scheduleShardRefresh(latestStatsCtx);
+  }
+
+  /**
+   * A watcher 'error' (Windows: the watched directory was deleted) would
+   * otherwise be thrown by the EventEmitter and crash Pi. Close the handle
+   * (holding it would keep a deleted directory pending on Windows), fall
+   * back to full scans, and recreate it only once the directory lists again.
+   */
+  function onShardWatchError(): void {
+    closeShardWatcher();
+    shardWatcherRetryAt = performance.now() + STATS_FULL_SCAN_INTERVAL_MS;
+    shardIndex.requestFullScan();
+  }
+
+  /** After a full scan: a watcher whose directory was replaced (Linux keeps it on the old inode, silently) is recreated. */
+  async function checkShardWatcherDirectory(): Promise<void> {
+    if (!shardWatcher || shardWatcherDirectory === undefined) return;
+    const watched = shardWatcherDirectory;
+    let current: string | undefined;
+    try {
+      const info = await statsReadFs().stat(SHARD_FILES_DIR);
+      current = `${String(info.ino)}:${info.birthtimeMs}`;
+    } catch {
+      current = undefined;
+    }
+    if (current !== watched && shardWatcherDirectory === watched) {
+      closeShardWatcher();
+      shardWatcherRetryAt = 0;
+      if (current !== undefined) ensureShardWatcher();
+    }
+  }
+
+  /** session_shutdown, first step: refuse new background work and stop its sources. */
+  function closeStatsRefreshGate(): void {
+    refreshScheduler.close();
+    shardWatcherWanted = false;
+    if (shardRefreshTimer !== null) clearTimeout(shardRefreshTimer);
+    shardRefreshTimer = null;
+    closeShardWatcher();
+  }
+
+  /** Wait for every refresh, publish and scan in flight. */
+  async function drainStatsRefresh(): Promise<void> {
+    for (;;) {
+      await Promise.all(Array.from(backgroundStatsTasks));
+      await refreshScheduler.drain();
+      await shardIndex.settled();
+      if (backgroundStatsTasks.size === 0 && refreshScheduler.idle && !shardIndex.fullScanInFlight) return;
+    }
+  }
+  statsRefreshSettledForTests.add(drainStatsRefresh);
 
   function buildCurrentStatsShard(state: "active" | "closed" = "active"): PersistedStatsShardV7 {
     const now = Date.now();
@@ -808,14 +1189,12 @@ export default function (pi: ExtensionAPI) {
     return shard;
   }
 
-  function scheduleShardRefresh(ctx?: ExtensionContext, model?: PiModel): void {
+  function scheduleShardRefresh(ctx?: ExtensionContext): void {
+    if (refreshScheduler.isClosed) return;
     if (shardRefreshTimer !== null) clearTimeout(shardRefreshTimer);
     shardRefreshTimer = setTimeout(() => {
       shardRefreshTimer = null;
-      void waitForStatsRestore()
-        .then(() => refreshShardAggregate())
-        .then(() => publishStatus(ctx as ExtensionContext, model ?? ctx?.model))
-        .catch(() => undefined);
+      refreshAndPublishInBackground(ctx);
     }, SHARD_REFRESH_DEBOUNCE_MS);
     shardRefreshTimer.unref?.();
   }
@@ -873,6 +1252,7 @@ export default function (pi: ExtensionAPI) {
     const displayKey = modelKey(model);
     const nextEpoch = await advanceModelStatsEpoch(displayKey);
     modelEpochByKey.set(displayKey, nextEpoch);
+    modelEpochSeq.set(displayKey, nextEpochSeq());
     delete cacheStatsProcessByModel[displayKey];
     delete cacheStatsTotalsByModel[displayKey];
     for (const key of Object.keys(cacheStatsByModel)) {
@@ -886,6 +1266,8 @@ export default function (pi: ExtensionAPI) {
 
   async function resetCurrentSessionStats(): Promise<void> {
     currentGlobalEpoch = await advanceGlobalStatsEpoch();
+    globalEpochSeq = nextEpochSeq();
+    voidModelEpochs(globalEpochSeq);
     cacheStatsByModel = {};
     cacheStatsTotalsByModel = {};
     cacheStatsProcessByModel = {};
@@ -923,10 +1305,10 @@ export default function (pi: ExtensionAPI) {
       persistTimer = null;
       // A persist scheduled while a background restore runs (e.g. a routed
       // model change without usage) must not race the restore's own write.
-      void waitForStatsRestore()
+      trackBackgroundStatsTask(waitForStatsRestore()
         .then(() => persistCacheStats(ctx))
-        .then(() => refreshShardAggregate())
-        .catch(() => undefined);
+        .then(() => refreshScheduler.background(false))
+        .catch(() => undefined));
     }, PERSIST_DEBOUNCE_MS);
     persistTimer.unref?.();
   }
@@ -940,9 +1322,23 @@ export default function (pi: ExtensionAPI) {
     // Adopt resets performed by another Pi process before capturing the shard
     // snapshot. Otherwise shutdown/command flush could rewrite stale local
     // counters under an old epoch even though aggregation already hid them.
-    await refreshShardAggregate();
+    // A refresh that fails (a persistent read error) must not cost the
+    // persist: write the counters under the epochs known so far.
+    try {
+      await refreshShardAggregate();
+    } catch (error) {
+      console.warn(`${LOG_PREFIX}: footer stats refresh before persisting failed`, error);
+    }
     await persistCacheStats(ctx, lifecycleState);
-    await refreshShardAggregate();
+    try {
+      await refreshShardAggregate();
+    } catch (error) {
+      console.warn(`${LOG_PREFIX}: footer stats refresh after persisting failed`, error);
+    }
+    // That refresh may have continued an absorbed own shard under a new id
+    // and queued its write: let it land before the flush (and a shutdown)
+    // returns, or interactive mode's process.exit could cut it off.
+    await enqueuePersist(() => Promise.resolve());
   }
 
   async function rollOverStatsIfNeeded(ctx?: ExtensionContext): Promise<void> {
@@ -986,6 +1382,7 @@ export default function (pi: ExtensionAPI) {
     countersSession++;
     cacheStatsLegacyFamily = emptyAllCacheStats();
     modelEpochByKey.clear();
+    voidModelEpochs(nextEpochSeq());
     modelApiByKey.clear();
     modelNameByKey.clear();
     if (reason === "reload") {
@@ -999,11 +1396,14 @@ export default function (pi: ExtensionAPI) {
     // message_end syncs the epoch before recording. If the disk epoch differs
     // now, a reset happened after that usage: adopt it and drop the stale
     // process bucket instead of re-labelling old counters with the new epoch.
-    const latestGlobalEpoch = await readGlobalStatsEpoch();
-    if (latestGlobalEpoch !== currentGlobalEpoch) {
-      currentGlobalEpoch = latestGlobalEpoch;
+    // A read error keeps the epoch known so far (it is not "no reset").
+    const seq = nextEpochSeq();
+    const latest = await readEpochFileWithRetry(SHARD_GLOBAL_EPOCH_PATH, initialEpoch("global"));
+    if (latest.ok && acceptGlobalEpochRead(seq) && latest.epoch !== currentGlobalEpoch) {
+      currentGlobalEpoch = latest.epoch;
       cacheStatsProcessByModel = {};
       modelEpochByKey.clear();
+      voidModelEpochs(seq);
       modelApiByKey.clear();
       modelNameByKey.clear();
     }
@@ -1166,6 +1566,11 @@ export default function (pi: ExtensionAPI) {
     // publish a stale footer. Handlers that read or persist stats await
     // waitForStatsRestore() first.
     const generation = ++statsRestoreGeneration;
+    // The same extension instance lives on across session switches
+    // (shutdown, then start): reopen what the shutdown closed.
+    refreshScheduler.open();
+    latestStatsCtx = ctx;
+    const tui = ctx.mode === "tui";
     resetStatsForSessionStart(event.reason, ctx);
     const previousRestore = statsRestorePromise;
     statsRestorePromise = previousRestore
@@ -1177,25 +1582,26 @@ export default function (pi: ExtensionAPI) {
       })
       .catch((error) => {
         console.warn(`${LOG_PREFIX}: failed to restore cache stats`, error);
+      })
+      .then(() => {
+        // TUI only, and only after the restore created the directory (2.9.3
+        // watched it on the startup path and stayed without a watcher for
+        // the whole process when it did not exist yet).
+        if (tui && generation === statsRestoreGeneration && !refreshScheduler.isClosed) {
+          shardWatcherWanted = true;
+          shardWatcherRetryAt = 0;
+          ensureShardWatcher();
+        }
       });
     latestStatsRestoreForTests = statsRestorePromise;
-    if (ctx.mode === "tui" && !shardWatcher) {
-      try {
-        shardWatcher = watch(SHARD_FILES_DIR, () => scheduleShardRefresh(ctx));
-        shardWatcher.unref?.();
-      } catch {
-        // Lifecycle and explicit command refreshes remain authoritative.
-      }
-    }
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     // Pi 0.99+ codemode scripts run nested tool calls in parallel; the calling
     // tool's own end event follows them, so one refresh covers the batch.
     if (isNonEmptyString((event as { parentToolCallId?: unknown } | undefined)?.parentToolCallId)) return;
-    await waitForStatsRestore();
-    await refreshShardAggregate();
-    await publishStatus(ctx);
+    // Pi awaits this handler before the next turn: refresh in the background.
+    refreshAndPublishInBackground(ctx);
   });
 
   // Pi 0.86+ native prompt-cache warming: keep it running for models whose
@@ -1213,20 +1619,20 @@ export default function (pi: ExtensionAPI) {
     // a record consumed out of order) so they cannot be correlated with the
     // next run's messages.
     providerRequestStates.length = 0;
-    await waitForStatsRestore();
-    await refreshShardAggregate();
-    await publishStatus(ctx);
+    refreshAndPublishInBackground(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
+      // Close the gate first (no new background refresh, watcher event or
+      // scan-triggered publish), then let what is in flight finish, then
+      // flush. The flush's own refreshes are awaited and still run.
+      closeStatsRefreshGate();
       await waitForStatsRestore();
+      await drainStatsRefresh();
       await flushPersistCacheStats(ctx, "closed");
     } finally {
-      if (shardRefreshTimer !== null) clearTimeout(shardRefreshTimer);
-      shardRefreshTimer = null;
-      shardWatcher?.close();
-      shardWatcher = undefined;
+      closeStatsRefreshGate();
       latestCacheHint = undefined;
       providerRequestStates.length = 0;
       delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
@@ -1238,7 +1644,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
     if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(event.model, ctx) ?? event.model, ctx, warnedModels);
     await waitForStatsRestore();
-    await refreshShardAggregate();
+    await refreshShardAggregate({ full: false });
     await publishStatus(ctx, event.model);
   });
 
@@ -1760,16 +2166,23 @@ export default function (pi: ExtensionAPI) {
     // routed model. The process bucket is intentionally never persisted.
     if (statsModel) {
       const key = modelKey(statsModel);
-      const latestGlobalEpoch = await readGlobalStatsEpoch();
-      const latestModelEpoch = await readModelStatsEpoch(key);
-      if (currentGlobalEpoch !== latestGlobalEpoch) {
-        currentGlobalEpoch = latestGlobalEpoch;
+      // Fresh reads, numbered like every footer epoch read: a refresh that
+      // read older epochs can no longer switch back and clear this usage. A
+      // read error keeps the epochs known so far.
+      const seq = nextEpochSeq();
+      const [latestGlobal, latestModel] = await Promise.all([
+        readEpochFileWithRetry(SHARD_GLOBAL_EPOCH_PATH, initialEpoch("global")),
+        readEpochFileWithRetry(modelEpochPath(key), initialEpoch(`model:${key}`)),
+      ]);
+      if (latestGlobal.ok && acceptGlobalEpochRead(seq) && currentGlobalEpoch !== latestGlobal.epoch) {
+        currentGlobalEpoch = latestGlobal.epoch;
         cacheStatsProcessByModel = {};
         modelEpochByKey.clear();
+        voidModelEpochs(seq - 1);
       }
-      if (modelEpochByKey.get(key) !== latestModelEpoch) {
+      if (latestModel.ok && acceptModelEpochReadForUsage(seq, key) && modelEpochByKey.get(key) !== latestModel.epoch) {
         delete cacheStatsProcessByModel[key];
-        modelEpochByKey.set(key, latestModelEpoch);
+        modelEpochByKey.set(key, latestModel.epoch);
       }
       modelApiByKey.set(key, statsModel.api ?? "");
       modelNameByKey.set(key, statsModel.name || statsModel.id);
@@ -1781,20 +2194,19 @@ export default function (pi: ExtensionAPI) {
       addUsageToCacheStats(getStatsForModel(undefined, adapter), usage);
     }
 
-    await waitForStatsRestore();
     schedulePersistCacheStats(ctx);
-    await refreshShardAggregate();
-    // A late response from an older selection must not replace the active
-    // footer. Only a routed response that still belongs to the currently
-    // selected virtual/router model may publish its physical model directly.
-    const responseBelongsToCurrentSelection =
-      requestCorrelationForMessage.selectionModelKey !== undefined &&
-      ctx.model !== undefined &&
-      requestCorrelationForMessage.selectionModelKey === modelKey(ctx.model);
-    await publishStatus(
-      ctx,
-      requestSelectionIsVirtual && responseBelongsToCurrentSelection ? statsModel : ctx.model,
-    );
+    // The counters above are already updated in memory; the refresh and the
+    // footer update run in the background (Pi awaits message_end).
+    refreshAndPublishInBackground(ctx, () => {
+      // A late response from an older selection must not replace the active
+      // footer. Only a routed response that still belongs to the currently
+      // selected virtual/router model may publish its physical model directly.
+      const responseBelongsToCurrentSelection =
+        requestCorrelationForMessage.selectionModelKey !== undefined &&
+        ctx.model !== undefined &&
+        requestCorrelationForMessage.selectionModelKey === modelKey(ctx.model);
+      return requestSelectionIsVirtual && responseBelongsToCurrentSelection ? statsModel : ctx.model;
+    });
   });
 
   // ────────────────────────────────────────────────────────────────

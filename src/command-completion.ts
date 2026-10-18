@@ -18,9 +18,9 @@ export const CACHE_OPTIMIZER_COMMANDS = [
   "rollback",
 ] as const;
 
-export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "reset"] as const;
+export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"] as const;
 
-export const CACHE_OPTIMIZER_FEATURE_COMMANDS = ["prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming"] as const;
+export const CACHE_OPTIMIZER_FEATURE_COMMANDS = ["prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental"] as const;
 
 export const CACHE_OPTIMIZER_FEATURE_VALUES = ["on", "off"] as const;
 
@@ -33,6 +33,7 @@ export const FEATURE_COMMAND_MAP: Record<string, PersistedCacheOptimizerFeature>
   "openai-cache-key": "openAICacheKey",
   "tool-order": "toolOrder",
   "zero-price-warming": "zeroPriceWarming",
+  "stats-incremental": "statsIncremental",
 };
 
 export const CACHE_OPTIMIZER_STATS_ARGUMENTS = ["all", "contributors"] as const;

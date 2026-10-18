@@ -138,6 +138,59 @@ async function readerViews(I: any, oracle: any): Promise<{ reference: View; redu
   };
 }
 
+/**
+ * The 2.10 incremental refresh path: a tiered shard index per reader (stat
+ * only new, hot and dirty names), the shard phase complete before the
+ * archive listing, an unchanged clean generation confirmed by its listing
+ * alone, and the previous consistent snapshot reused on a stale read.
+ */
+type IncrementalReader = { index: any; previous?: any };
+const incrementalReaders = new WeakMap<any, IncrementalReader>();
+function incrementalReaderOf(I: any): IncrementalReader {
+  let reader = incrementalReaders.get(I);
+  if (!reader) incrementalReaders.set(I, reader = { index: new I.TieredShardIndex(I.SHARD_FILES_DIR, { freeze: true }) });
+  return reader;
+}
+
+async function incrementalSnapshot(I: any): Promise<{ leading: any[]; archive: any }> {
+  const reader = incrementalReaderOf(I);
+  reader.previous = await I.readStatsSnapshot(reader.previous, I.SHARD_FILES_DIR, I.SHARD_ARCHIVE_PATH, {
+    reuseArchive: true,
+    readShards: async () => {
+      const shards = await reader.index.refresh({});
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 4));
+      return shards;
+    },
+  });
+  const { rawShards, archive } = reader.previous;
+  return { leading: rawShards.filter((shard: any) => !archive.absorbedIds.has(shard.instanceId)), archive };
+}
+
+/** The incremental reads, as reference shards and through the synchronous aggregation over pre-read epochs. */
+async function incrementalViews(I: any, oracle: any): Promise<{ reference: View; synchronous: View }> {
+  const { leading, archive } = await incrementalSnapshot(I);
+  const reference = await viewOf(oracle, [...leading, ...archive.shards]);
+  const today = localDay(fakeNow);
+  const keys = new Set<string>([...I.aggregateEpochKeys(leading, archive, [], null, undefined), ...I.aggregateEpochKeys(leading, archive, [], today, undefined)]);
+  const globalEpoch = await I.readGlobalStatsEpoch();
+  const modelEpochs = new Map<string, string>();
+  for (const key of keys) modelEpochs.set(key, await I.readModelStatsEpoch(key));
+  const epochs = { globalEpoch, modelEpoch: (key: string) => { const epoch = modelEpochs.get(key); if (epoch === undefined) throw new Error(`epoch of ${key} not prefetched`); return epoch; } };
+  const all = I.aggregateStatsWithArchiveSync(leading, archive, [], null, undefined, epochs);
+  const day = I.aggregateStatsWithArchiveSync(leading, archive, [], today, undefined, epochs);
+  return {
+    reference,
+    synchronous: {
+      bySession: all.bySession,
+      lastRouted: all.lastRoutedModelBySession,
+      todayTotals: day.totalsByModel,
+      todayBySession: day.bySession,
+      todayInstances: day.instancesByModel,
+      todayRouted: day.lastRoutedModelBySession,
+    },
+  };
+}
+
 async function runScenario(seed: number, steps: number): Promise<{ compactions: number; absorbed: number }> {
   const random = rng(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
@@ -254,6 +307,9 @@ async function runScenario(seed: number, steps: number): Promise<{ compactions: 
     const { reference, reduced } = await readerViews(I, oracle);
     assert.deepEqual(reference, expected, `seed ${seed} ${label} (view reads)`);
     assert.deepEqual(reduced, reference, `seed ${seed} ${label} (reduced view)`);
+    const incremental = await incrementalViews(I, oracle);
+    assert.deepEqual(incremental.reference, expected, `seed ${seed} ${label} (incremental reads)`);
+    assert.deepEqual(incremental.synchronous, expected, `seed ${seed} ${label} (incremental synchronous aggregation)`);
   }
 
   try {
@@ -326,6 +382,8 @@ async function runScenario(seed: number, steps: number): Promise<{ compactions: 
             views.push(await viewOf(oracle, await readerShards(reader)));
             const { reference, reduced } = await readerViews(reader, oracle);
             views.push(reference, reduced);
+            const incremental = await incrementalViews(reader, oracle);
+            views.push(incremental.reference, incremental.synchronous);
             await new Promise((resolve) => setImmediate(resolve));
           } while (!done);
         });

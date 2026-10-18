@@ -19,6 +19,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Persistent opt-out](#persistent-opt-out)
 - [Per-model `prompt_cache_key` opt-out](#per-model-prompt_cache_key-opt-out)
 - [Opt-in deterministic tool ordering](#opt-in-deterministic-tool-ordering)
+- [Footer refresh (2.10)](#footer-refresh-210)
 - [Footer cache stats mode](#footer-cache-stats-mode)
 - [OpenAI-compatible proxy setup](#openai-compatible-proxy-setup)
 - [Prompt cache warming (Pi 0.86+)](#prompt-cache-warming-pi-086)
@@ -100,6 +101,9 @@ Doctor displays endpoint URLs without username/password, query parameters, or fr
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | Keep Pi's verbose skill XML. |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | Disable the OpenAI-compatible `prompt_cache_key` fallback. Preferred explicit opt-out. |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | Disable the same fallback via the legacy inverse switch. Values `0`, `false`, `no`, or `off` disable it. |
+| `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` | Kill switch for the incremental footer refresh (see [Footer refresh](#footer-refresh-210)): every refresh stats every shard file again, as in 2.9.3. Values `0`, `false`, `no`, or `off` disable it. |
+| `PI_CACHE_OPTIMIZER_STATS_TIMING=1` | Opt-in footer refresh timing log (JSON lines in `pi-cache-optimizer-stats-timing.jsonl` under the agent directory; an absolute path instead writes there). Off by default. |
+| `PI_CACHE_OPTIMIZER_STATS_VERIFY=1` | Opt-in check, after each background full scan, that no shard file changed while its identity (inode, size, timestamps) stayed the same, which filesystems without inodes and with coarse timestamps (FAT, some SMB servers) can do. Such files are re-read; a warning suggests the kill switch once it happened twice. Off by default. |
 
 Persistent feature settings are managed under the Pi agent directory by the native command interface. They take precedence over their corresponding environment variables, including both OpenAI cache-key switches above. Runtime `disable` still suppresses optimization regardless of persistent settings:
 
@@ -109,6 +113,7 @@ Persistent feature settings are managed under the Pi agent directory by the nati
 /cache-optimizer config skill-compression on|off
 /cache-optimizer config openai-cache-key on|off
 /cache-optimizer config tool-order on|off
+/cache-optimizer config stats-incremental on|off
 /cache-optimizer config footer-mode total|session|process
 /cache-optimizer config reset
 ```
@@ -132,6 +137,19 @@ bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
 ```
 
 The fixture verifier reports numeric tool-order changes and confirms cache-marked payloads remain unchanged. Because it does not contact a provider, provider cache usage is explicitly unavailable and no synthetic cache hit is claimed.
+
+## Footer refresh (2.10)
+
+Before 2.10 every footer refresh stat-ed every raw shard file (about 400 on a busy day), and Pi waited for it after every tool call, every assistant message and every settle; on Windows, where antivirus scanning makes each file stat expensive, that was about 28 ms per refresh on the agent loop's critical path. Since 2.10:
+
+- **Pi no longer waits.** The refreshes after `tool_execution_end`, `agent_settled` and `message_end` run in the background (usage is still recorded synchronously in memory first). At most one refresh runs at a time; requests made meanwhile share one follow-up refresh that starts after it, so a result is never older than the request. Commands (`stats`, `doctor`, `reset`...), `session_shutdown` and model selection still wait for a fresh refresh, and the shutdown waits for background refreshes in flight before its final write, so print mode never exits mid-refresh.
+- **Fewer file operations.** Each refresh lists the shard directory (new and deleted shards are seen immediately) and stats only new files and the *hot* set: active shards, shards updated within the last 15 minutes, and files the TUI watcher reported as changed. A file is read again only when it changed. This process's own shard is never read back (its in-memory copy is newer). On the benchmark fixture (about 400 raw shards, 0.2 ms per file operation), a refresh went from about 410 file operations and 29 ms to about 18 (2 listings, stats of the 10 active shards, 6 epoch reads) and under 3 ms.
+- **Staleness bound.** A closed shard is rewritten only by the process that owns it, when it starts another session under the same shard (Pi keeps the extension across `/new`, `/resume` and fork: the shutdown closes the shard, the next session writes it active again). That is covered by the 15-minute window when it happens soon; closed shards older than that are re-checked by a background full scan at most every 30 seconds while refreshes happen (two file operations in flight at a time). So a change to such a file, including that late re-activation, shows in the footer after at most about 30 seconds plus the scan time. Active and recently updated shards (every live process's), new and deleted shards, reset epochs and this process's own usage are never stale. Commands and the shutdown flush always stat every file.
+- **Same numbers.** The cached shards are re-aggregated in full on every refresh with the same aggregation as before, so the totals equal a full scan of the same files exactly. Reset epochs are read once per refresh, in parallel, and a slow read can no longer roll a newer epoch back. A Windows read error on an epoch file (`EPERM`/`EBUSY` while another process resets) no longer counts as "no reset ever happened"; before 2.10 it could clear this process's unsaved usage. The on-disk format, file names and write protocol are unchanged, so 2.8.x/2.9.x processes can share the directory.
+- **Archive.** A new archive generation is parsed once as before; reducing it for the footer now only covers the current session (no per-bucket key strings), about a quarter less main-thread time on a 2 MB archive (the JSON parse itself remains). An unchanged generation is confirmed by the directory listing alone, and its file identity is still checked on every command and flush and at least every 30 seconds (a generation number is reused if the archive directory is deleted and rebuilt). 2.9.0's `archive.json`, a generation still being written in place, and an unreadable newest generation are still checked on every refresh, exactly as before.
+- **Watcher.** The TUI shard watcher now has an `error` listener (on Windows, deleting the watched directory made Pi crash), is created after the background restore (it was missing for the whole process when the directory did not exist yet at startup), only marks changed files for the next refresh, ignores this process's own writes, and is closed at shutdown and reload.
+
+Kill switch: `/cache-optimizer config stats-incremental off` or `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` makes every refresh stat every shard file again (the background refresh and the other fixes stay); the persisted setting wins over the environment, like every feature setting. Note: versions before 2.10 do not know this config key and ignore the whole config file (falling back to their defaults) while it is set, so if you run an older version against the same agent directory, prefer the environment variable. `PI_CACHE_OPTIMIZER_STATS_TIMING=1` logs per-refresh phase timings, the hot-set size and file counts; `PI_CACHE_OPTIMIZER_STATS_VERIFY=1` checks that the file identities the refresh relies on are trustworthy on your filesystem.
 
 ## Footer cache stats mode
 

@@ -652,6 +652,7 @@ describe("I: a live process whose own shard was absorbed (PID namespace mismatch
 
       await handlers.get("message_end")!(message, context);
       await handlers.get("tool_execution_end")!({ toolCallId: "t1" }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /0\/2/, "two requests in total, the absorbed one counted once");
       await handlers.get("session_shutdown")!({}, context);
       const files = await readdir(I.SHARD_FILES_DIR);

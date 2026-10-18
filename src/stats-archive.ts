@@ -66,6 +66,7 @@ import {
   type ShardAggregate,
   type ShardAggregator,
   type ShardContribution,
+  type ShardEpochs,
   SHARD_CLEANUP_MARKER_PATH,
   SHARD_FILES_DIR,
   SHARD_IO_CONCURRENCY,
@@ -76,6 +77,7 @@ import {
   acquireStatsMaintenanceLock,
   cleanupStatsShardsV7,
   cloneCacheStats,
+  createShardAggregatorSync,
   createShardAggregatorV7,
   currentLocalDay,
   isMaintenanceMarkerDue,
@@ -96,6 +98,7 @@ import {
   touchStatsMaintenanceLock,
   writeMaintenanceMarker,
 } from "./stats-store.ts";
+import { statsReadFs } from "./stats-fs.ts";
 
 export const SHARD_ARCHIVE_DIR = join(SHARD_STATE_DIR, "archive");
 /**
@@ -486,7 +489,7 @@ export type LoadedStatsArchive = {
 };
 
 type BucketGroup = {
-  /** Position in ReducedArchive.groups. */
+  /** Index of the group's first bucket in the archive: groups keep the order of their first appearance. */
   order: number;
   globalEpoch: string;
   sessionHash: string;
@@ -511,16 +514,20 @@ type RoutedGroup = {
   firstEligibleIndex: number;
 };
 
-type ReducedArchive = {
-  /** Buckets folded per (globalEpoch, session, model, modelEpoch), in order of first appearance. */
+/** One session's buckets folded per (globalEpoch, model, modelEpoch), and its routed entries per globalEpoch. */
+type ReducedSession = {
   groups: BucketGroup[];
   routed: RoutedGroup[];
-  /** The same groups per session (each list in archive order). */
-  groupsBySession: Map<string, BucketGroup[]>;
-  routedBySession: Map<string, RoutedGroup[]>;
-  /** Model keys with buckets under each global epoch, sorted. */
-  keysByGlobalEpoch: Map<string, string[]>;
+  /** Model keys with buckets in this session under each global epoch. */
+  keysByGlobalEpoch: Map<string, Set<string>>;
 };
+
+/** Get (or create) the value for `key` in a nested map level. */
+function slotOf<K, V>(map: Map<K, V>, key: K, create: () => V): V {
+  let value = map.get(key);
+  if (value === undefined) map.set(key, value = create());
+  return value;
+}
 
 /**
  * One parsed archive snapshot, cached per file identity. Besides the raw
@@ -534,7 +541,8 @@ export class StatsArchiveView implements LoadedStatsArchive {
   private syntheticShards?: PersistedStatsShardV7[];
   private dayIndex?: Map<string, { buckets: number[]; routed: number[] }>;
   private dayShards?: { day: string; shards: readonly PersistedStatsShardV7[] };
-  private reduced?: ReducedArchive;
+  private bySessionIndex?: { buckets: Map<string, number[]>; routed: Map<string, number[]> };
+  private readonly reducedSessions = new Map<string, ReducedSession>();
   private contributionCache?: { fingerprint: string; contribution: ShardContribution };
 
   /** Highest generation listed, including unreadable ones above `generation`; the next publish targets newestGeneration + 1. */
@@ -619,16 +627,36 @@ export class StatsArchiveView implements LoadedStatsArchive {
     return shards;
   }
 
-  private reduce(): ReducedArchive {
-    if (this.reduced) return this.reduced;
-    const groups = new Map<string, BucketGroup>();
-    const keys = new Map<string, Set<string>>();
-    this.archive.buckets.forEach((bucket, index) => {
-      const id = JSON.stringify([bucket.globalEpoch, bucket.sessionHash, bucket.modelKey, bucket.modelEpoch]);
-      const group = groups.get(id);
+  /** Bucket and routed indexes per session: one pass, no per-entry key building. */
+  private sessionIndex(): { buckets: Map<string, number[]>; routed: Map<string, number[]> } {
+    if (this.bySessionIndex) return this.bySessionIndex;
+    const buckets = new Map<string, number[]>();
+    const routed = new Map<string, number[]>();
+    const { buckets: archiveBuckets, routed: archiveRouted } = this.archive;
+    for (let index = 0; index < archiveBuckets.length; index++) slotOf(buckets, archiveBuckets[index]!.sessionHash, () => []).push(index);
+    for (let index = 0; index < archiveRouted.length; index++) slotOf(routed, archiveRouted[index]!.sessionHash, () => []).push(index);
+    return this.bySessionIndex = { buckets, routed };
+  }
+
+  /**
+   * One session's reduced form, built on first use. Groups are keyed by
+   * nested maps (no JSON.stringify per bucket, no separator that a string
+   * could contain), and only the sessions a refresh asks for are reduced.
+   */
+  private reduceSession(sessionHash: string): ReducedSession {
+    const cached = this.reducedSessions.get(sessionHash);
+    if (cached) return cached;
+    const index = this.sessionIndex();
+    const groups: BucketGroup[] = [];
+    const groupIndex = new Map<string, Map<string, Map<string, BucketGroup>>>();
+    const keysByGlobalEpoch = new Map<string, Set<string>>();
+    for (const bucketIndex of index.buckets.get(sessionHash) ?? []) {
+      const bucket = this.archive.buckets[bucketIndex]!;
+      const byModelEpoch = slotOf(slotOf(groupIndex, bucket.globalEpoch, () => new Map()), bucket.modelKey, () => new Map<string, BucketGroup>());
+      const group = byModelEpoch.get(bucket.modelEpoch);
       if (!group) {
-        groups.set(id, {
-          order: groups.size,
+        const created: BucketGroup = {
+          order: bucketIndex,
           globalEpoch: bucket.globalEpoch,
           sessionHash: bucket.sessionHash,
           key: bucket.modelKey,
@@ -636,57 +664,64 @@ export class StatsArchiveView implements LoadedStatsArchive {
           stats: bucket.stats,
           count: 1,
           bestUpdatedAt: bucket.updatedAt,
-          bestIndex: index,
-          firstEligibleIndex: bucket.updatedAt > -1 ? index : Infinity,
-        });
-        let set = keys.get(bucket.globalEpoch);
-        if (!set) keys.set(bucket.globalEpoch, set = new Set());
-        set.add(bucket.modelKey);
-        return;
+          bestIndex: bucketIndex,
+          firstEligibleIndex: bucket.updatedAt > -1 ? bucketIndex : Infinity,
+        };
+        byModelEpoch.set(bucket.modelEpoch, created);
+        groups.push(created);
+        slotOf(keysByGlobalEpoch, bucket.globalEpoch, () => new Set()).add(bucket.modelKey);
+        continue;
       }
       if (group.count === 1) group.stats = cloneCacheStats(group.stats);
       mergeStatsAcrossDays(group.stats, bucket.stats, null);
       group.count++;
-      if (group.firstEligibleIndex === Infinity && bucket.updatedAt > -1) group.firstEligibleIndex = index;
+      if (group.firstEligibleIndex === Infinity && bucket.updatedAt > -1) group.firstEligibleIndex = bucketIndex;
       if (bucket.updatedAt > group.bestUpdatedAt) {
         group.bestUpdatedAt = bucket.updatedAt;
-        group.bestIndex = index;
+        group.bestIndex = bucketIndex;
       }
-    });
-    const routed = new Map<string, RoutedGroup>();
-    this.archive.routed.forEach((entry, index) => {
-      const id = JSON.stringify([entry.globalEpoch, entry.sessionHash]);
-      const group = routed.get(id);
-      const eligible = entry.updatedAt > -1 ? index : Infinity;
+    }
+    const routed: RoutedGroup[] = [];
+    const routedIndex = new Map<string, RoutedGroup>();
+    for (const entryIndex of index.routed.get(sessionHash) ?? []) {
+      const entry = this.archive.routed[entryIndex]!;
+      const group = routedIndex.get(entry.globalEpoch);
+      const eligible = entry.updatedAt > -1 ? entryIndex : Infinity;
       if (!group) {
-        routed.set(id, { globalEpoch: entry.globalEpoch, sessionHash: entry.sessionHash, bestUpdatedAt: entry.updatedAt, model: entry.model, firstEligibleIndex: eligible });
-        return;
+        const created: RoutedGroup = { globalEpoch: entry.globalEpoch, sessionHash: entry.sessionHash, bestUpdatedAt: entry.updatedAt, model: entry.model, firstEligibleIndex: eligible };
+        routedIndex.set(entry.globalEpoch, created);
+        routed.push(created);
+        continue;
       }
       if (group.firstEligibleIndex === Infinity) group.firstEligibleIndex = eligible;
       if (entry.updatedAt > group.bestUpdatedAt) {
         group.bestUpdatedAt = entry.updatedAt;
         group.model = entry.model;
       }
-    });
-    const bySession = <T extends { sessionHash: string }>(items: T[]): Map<string, T[]> => {
-      const map = new Map<string, T[]>();
-      for (const item of items) {
-        let list = map.get(item.sessionHash);
-        if (!list) map.set(item.sessionHash, list = []);
-        list.push(item);
-      }
-      return map;
-    };
-    const groupList = Array.from(groups.values());
-    const routedList = Array.from(routed.values());
-    this.reduced = {
-      groups: groupList,
-      routed: routedList,
-      groupsBySession: bySession(groupList),
-      routedBySession: bySession(routedList),
-      keysByGlobalEpoch: new Map(Array.from(keys, ([epoch, set]) => [epoch, Array.from(set).sort()])),
-    };
-    return this.reduced;
+    }
+    const reduced: ReducedSession = { groups, routed, keysByGlobalEpoch };
+    this.reducedSessions.set(sessionHash, reduced);
+    return reduced;
+  }
+
+  /** The sessions a contribution covers: `only`, or every archived session. */
+  private sessionsFor(only?: ReadonlySet<string>): Iterable<string> {
+    if (only) return only;
+    const index = this.sessionIndex();
+    return new Set([...index.buckets.keys(), ...index.routed.keys()]);
+  }
+
+  /**
+   * Every model key the archive's share of an all-days aggregate (of `only`,
+   * when given) can look up an epoch for, under any global epoch: what a
+   * refresh reads before aggregating synchronously.
+   */
+  contributionKeys(only?: ReadonlySet<string>): string[] {
+    const keys = new Set<string>();
+    for (const session of this.sessionsFor(only)) {
+      for (const set of this.reduceSession(session).keysByGlobalEpoch.values()) for (const key of set) keys.add(key);
+    }
+    return Array.from(keys);
   }
 
   /**
@@ -696,21 +731,40 @@ export class StatsArchiveView implements LoadedStatsArchive {
    * session selection, or the archive changes.
    */
   async contribution(aggregator: Pick<ShardAggregator, "globalEpoch" | "modelEpoch">, only?: ReadonlySet<string>): Promise<ShardContribution> {
-    const reduced = this.reduce();
-    const globalEpoch = aggregator.globalEpoch;
-    let groupList = reduced.groups;
-    let routedList = reduced.routed;
-    let keys = reduced.keysByGlobalEpoch.get(globalEpoch) ?? [];
-    if (only) {
-      groupList = Array.from(only, (session) => reduced.groupsBySession.get(session) ?? []).flat()
-        .sort((a, b) => a.order - b.order);
-      routedList = Array.from(only, (session) => reduced.routedBySession.get(session) ?? []).flat();
-      keys = Array.from(new Set(groupList.filter((group) => group.globalEpoch === globalEpoch).map((group) => group.key))).sort();
-    }
+    const keys = this.keysUnder(aggregator.globalEpoch, only);
     const epochs = new Map<string, string>();
     for (const key of keys) epochs.set(key, await aggregator.modelEpoch(key));
+    return this.contributionSync({ globalEpoch: aggregator.globalEpoch, modelEpoch: (key) => epochs.get(key)! }, only);
+  }
+
+  /** Model keys of `only` (or all sessions) with buckets under `globalEpoch`, sorted. */
+  private keysUnder(globalEpoch: string, only?: ReadonlySet<string>): string[] {
+    const keys = new Set<string>();
+    for (const session of this.sessionsFor(only)) {
+      for (const key of this.reduceSession(session).keysByGlobalEpoch.get(globalEpoch) ?? []) keys.add(key);
+    }
+    return Array.from(keys).sort();
+  }
+
+  /** contribution() over epochs read beforehand (ShardEpochs must cover contributionKeys). */
+  contributionSync(epochSource: ShardEpochs, only?: ReadonlySet<string>): ShardContribution {
+    const globalEpoch = epochSource.globalEpoch;
+    const keys = this.keysUnder(globalEpoch, only);
+    const epochs = new Map<string, string>();
+    for (const key of keys) epochs.set(key, epochSource.modelEpoch(key));
     const fingerprint = JSON.stringify([globalEpoch, ...keys.flatMap((key) => [key, epochs.get(key)]), only ? Array.from(only).sort() : null]);
     if (this.contributionCache?.fingerprint === fingerprint) return this.contributionCache.contribution;
+
+    const groupList: BucketGroup[] = [];
+    const routedList: RoutedGroup[] = [];
+    for (const session of this.sessionsFor(only)) {
+      const reduced = this.reduceSession(session);
+      for (const group of reduced.groups) groupList.push(group);
+      for (const group of reduced.routed) routedList.push(group);
+    }
+    // Groups of several sessions in the order of their first bucket (what a
+    // full reduction in archive order produces).
+    groupList.sort((a, b) => a.order - b.order);
 
     type SessionOut = { sessionHash: string; instances: number; models: Array<{ key: string; stats: CacheStats; instances: number }> };
     type ModelOut = { key: string; stats: CacheStats; instances: number; sessions: string[]; refUpdatedAt: number; refIndex: number; firstEligibleIndex: number };
@@ -790,6 +844,48 @@ export async function aggregateStatsWithArchiveV7(
   return aggregator.finish();
 }
 
+/**
+ * aggregateStatsWithArchiveV7 over epochs read beforehand, without a single
+ * await: a refresh commits it in the same synchronous step that builds its
+ * trailing (in-memory) shard, so usage recorded meanwhile is never lost.
+ */
+export function aggregateStatsWithArchiveSync(
+  leading: readonly PersistedStatsShardV7[],
+  archive: StatsArchiveView,
+  trailing: readonly PersistedStatsShardV7[],
+  day: string | null,
+  sessions: ReadonlySet<string> | undefined,
+  epochs: ShardEpochs,
+): ShardAggregate {
+  const aggregator = createShardAggregatorSync(day, epochs);
+  const include = (shard: PersistedStatsShardV7) => !sessions || sessions.has(shard.sessionHash);
+  for (const shard of leading) if (include(shard)) aggregator.add(shard);
+  if (day === null) aggregator.addContribution(archive.contributionSync(epochs, sessions));
+  else for (const shard of archive.shardsForDay(day)) if (include(shard)) aggregator.add(shard);
+  for (const shard of trailing) if (include(shard)) aggregator.add(shard);
+  return aggregator.finish();
+}
+
+/** Every model key aggregateStatsWithArchiveSync may look up an epoch for (a superset). */
+export function aggregateEpochKeys(
+  leading: readonly PersistedStatsShardV7[],
+  archive: StatsArchiveView,
+  trailing: readonly PersistedStatsShardV7[],
+  day: string | null,
+  sessions: ReadonlySet<string> | undefined,
+): Set<string> {
+  const keys = new Set<string>();
+  const include = (shard: PersistedStatsShardV7) => !sessions || sessions.has(shard.sessionHash);
+  const addShard = (shard: PersistedStatsShardV7) => {
+    if (include(shard)) for (const key of Object.keys(shard.models)) keys.add(key);
+  };
+  for (const shard of leading) addShard(shard);
+  for (const shard of trailing) addShard(shard);
+  if (day === null) for (const key of archive.contributionKeys(sessions)) keys.add(key);
+  else for (const shard of archive.shardsForDay(day)) addShard(shard);
+  return keys;
+}
+
 /** Test hooks for archive I/O races and faults; production never sets them. */
 export type StatsArchiveTestHooks = {
   /** Runs after each directory listing a reader makes (to land a concurrent migration or publish in between). */
@@ -823,7 +919,7 @@ type ArchiveListing = { generations: number[]; placeholders: string[] };
 async function listArchiveDirectory(archivePath: string): Promise<ArchiveListing> {
   let names: string[];
   try {
-    names = await readdir(dirname(archivePath));
+    names = await statsReadFs().readdir(dirname(archivePath));
   } catch (error) {
     if (getErrorCode(error) === "ENOENT") return { generations: [], placeholders: [] };
     throw error;
@@ -853,7 +949,7 @@ async function listArchiveDirectory(archivePath: string): Promise<ArchiveListing
 async function newestMigrationPlaceholder(placeholders: readonly string[]): Promise<string | undefined> {
   if (placeholders.length <= 1) return placeholders[0];
   const keyed = await Promise.all(placeholders.map(async (path) => {
-    const info = await lstat(path).catch((error) => {
+    const info = await statsReadFs().lstat(path).catch((error) => {
       if (getErrorCode(error) === "ENOENT") return undefined;
       throw error;
     });
@@ -1044,7 +1140,7 @@ async function locateAndReadArchive(archivePath: string, options: ReadStatsArchi
   let info: import("node:fs").Stats | undefined;
   try {
     await testHooks.beforeLstat?.(archivePath);
-    info = await lstat(archivePath);
+    info = await statsReadFs().lstat(archivePath);
   } catch (error) {
     if (getErrorCode(error) !== "ENOENT") throw error;
   }
@@ -1087,7 +1183,7 @@ async function readArchiveFile(
   let info: import("node:fs").Stats;
   try {
     await testHooks.beforeLstat?.(path);
-    info = await lstat(path);
+    info = await statsReadFs().lstat(path);
   } catch (error) {
     return onError(generation, error);
   }
@@ -1103,7 +1199,7 @@ async function readArchiveFile(
   let bytes: Buffer;
   try {
     await testHooks.beforeReadFile?.(path);
-    bytes = await readFile(path);
+    bytes = await statsReadFs().readFile(path);
   } catch (error) {
     archiveFileCache.delete(path);
     return onError(generation, error);
@@ -1131,7 +1227,50 @@ export async function readStatsArchiveView(archivePath: string = SHARD_ARCHIVE_P
   return (await readStatsArchiveDetailed(archivePath, options)).view;
 }
 
-export type StatsSnapshot = { rawShards: PersistedStatsShardV7[]; archive: StatsArchiveView };
+export type StatsSnapshot = { rawShards: readonly PersistedStatsShardV7[]; archive: StatsArchiveView };
+
+/** A snapshot can reuse its archive without stat-ing it: see readStatsArchiveForRefresh. */
+function isReusableArchiveView(view: StatsArchiveView): boolean {
+  return view.present && !view.corrupt && view.generation > 0 && view.corruptGenerations.length === 0 &&
+    !view.pendingGeneration && view.newestGeneration === view.generation;
+}
+
+/**
+ * readStatsArchiveDetailed for a footer refresh that holds the previous
+ * snapshot's view. Generation files are immutable (published by link or by
+ * an exclusive create that only counts once complete; never rewritten), so
+ * while the newest listed generation is the one `previous` was read from
+ * and that view is a clean read of it, the listing alone confirms it and the
+ * file is not stat-ed again. Every other state goes through the full read
+ * exactly as before: 2.9.0's archive.json (generation 0, rewritten in place
+ * by 2.9.0) and migration placeholders, a newest generation that is still
+ * pending (written in place) or unreadable (the view recovered below it), or
+ * a newer generation.
+ */
+export async function readStatsArchiveForRefresh(previous: StatsArchiveView | undefined, archivePath: string = SHARD_ARCHIVE_PATH): Promise<StatsArchiveRead & { reused: boolean }> {
+  if (previous && isReusableArchiveView(previous)) {
+    let newest: number | undefined;
+    try {
+      newest = (await listArchiveDirectory(archivePath)).generations.at(-1);
+      await testHooks.afterList?.(archivePath);
+    } catch {
+      newest = undefined;
+    }
+    if (newest !== undefined && newest === previous.generation) return { view: previous, stale: false, reused: true };
+  }
+  return { ...(await readStatsArchiveDetailed(archivePath)), reused: false };
+}
+
+export type ReadStatsSnapshotOptions = {
+  /**
+   * The shard phase. Defaults to readValidStatsShardsV7 (stat every file).
+   * Whatever it is, it must have finished every read (listing, lstat and
+   * readFile) before it resolves: the archive is only listed afterwards.
+   */
+  readShards?: () => Promise<readonly PersistedStatsShardV7[]>;
+  /** Confirm an unchanged clean generation by its listing alone (readStatsArchiveForRefresh). */
+  reuseArchive?: boolean;
+};
 
 /**
  * The raw shards and the archive as one consistent snapshot. Order matters:
@@ -1141,15 +1280,21 @@ export type StatsSnapshot = { rawShards: PersistedStatsShardV7[]; archive: Stats
  * persistent transient error and served the last good snapshot, that
  * snapshot may predate shards deleted since; pairing it with the fresh
  * listing would undercount, so the previous snapshot is reused as a whole
- * (it was consistent when read) when it holds that same archive.
+ * (it was consistent when read) when it holds that same archive. The
+ * previous snapshot's rawShards are the shard contents read then (shared,
+ * immutable objects), not names to look up again.
  */
 export async function readStatsSnapshot(
   previous?: StatsSnapshot,
   directory: string = SHARD_FILES_DIR,
   archivePath: string = SHARD_ARCHIVE_PATH,
+  options: ReadStatsSnapshotOptions = {},
 ): Promise<StatsSnapshot> {
-  const rawShards = await readValidStatsShardsV7(directory);
-  const { view, stale } = await readStatsArchiveDetailed(archivePath);
+  // Shard phase first, complete (every lstat and readFile), then the archive.
+  const rawShards = options.readShards ? await options.readShards() : await readValidStatsShardsV7(directory);
+  const { view, stale } = options.reuseArchive
+    ? await readStatsArchiveForRefresh(previous?.archive, archivePath)
+    : await readStatsArchiveDetailed(archivePath);
   if (stale && previous && previous.archive === view) {
     // Only a newer generation can have deleted shards this archive misses.
     // While it is still the newest one (highest generations never go back:

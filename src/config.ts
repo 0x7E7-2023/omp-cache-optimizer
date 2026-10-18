@@ -4,7 +4,7 @@ import { STATE_DIR } from "./paths.ts";
 import { PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, requestLongCacheRetention, restoreCacheRetentionEnv } from "./retention.ts";
 import { type Stats, readFileSync } from "node:fs";
 import { lstat, mkdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 
 export const CONFIG_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-config.json");
@@ -19,6 +19,19 @@ export const NO_ZERO_PRICE_WARMING_ENV = "PI_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMI
 
 export const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
 
+/** Kill switch for the incremental footer refresh (2.10): 0/false/off/no restores the 2.9.3 full scan per refresh. */
+export const STATS_INCREMENTAL_ENV = "PI_CACHE_OPTIMIZER_STATS_INCREMENTAL";
+
+/** Opt-in check (1/true/on/yes) that the footer's shard cache never misses a change the file identity hides (see TieredShardIndex.verifyCachedContents). */
+export const STATS_VERIFY_ENV = "PI_CACHE_OPTIMIZER_STATS_VERIFY";
+
+export function isStatsVerifyEnabled(env: MutableEnv = process.env): boolean {
+  return isEnabledEnv(env[STATS_VERIFY_ENV]);
+}
+
+/** Opt-in footer refresh timing log: 1/true/on/yes writes JSON lines to STATS_TIMING_LOG_PATH; an absolute path writes there. */
+export const STATS_TIMING_ENV = "PI_CACHE_OPTIMIZER_STATS_TIMING";
+
 export type FooterStatsMode = "session" | "total" | "process";
 
 export type FooterStatsModeSource = "config" | "env" | "default";
@@ -28,7 +41,7 @@ export type PersistedCacheOptimizerConfigV1 = {
   footerMode?: FooterStatsMode;
 };
 
-export type PersistedCacheOptimizerFeature = "promptRewrite" | "virtualRewrite" | "skillCompression" | "openAICacheKey" | "toolOrder" | "zeroPriceWarming";
+export type PersistedCacheOptimizerFeature = "promptRewrite" | "virtualRewrite" | "skillCompression" | "openAICacheKey" | "toolOrder" | "zeroPriceWarming" | "statsIncremental";
 
 export type PersistedCacheOptimizerConfigV2 = {
   version: 2;
@@ -71,12 +84,42 @@ export function featureEnabled(
   if (feature === "promptRewrite" || feature === "skillCompression" || feature === "zeroPriceWarming") {
     return !isEnabledEnv(env[envName]);
   }
+  if (feature === "statsIncremental") return !isDisabledEnv(env[envName]);
   return isEnabledEnv(env[envName]) || defaultValue;
 }
 
 /** Keep Pi's cache warming running for models whose prices are unknown (all zero). */
 export function isZeroPriceWarmingEnabled(): boolean {
   return runtimeOptimizerEnabled && featureEnabled("zeroPriceWarming", NO_ZERO_PRICE_WARMING_ENV, true);
+}
+
+/**
+ * Incremental footer refresh (tiered shard index). Unlike the optimizer
+ * features it does not follow /cache-optimizer disable: it changes how stats
+ * are read, not what is sent to providers.
+ *
+ * Kill switch: `/cache-optimizer config stats-incremental off` (persisted,
+ * wins over the environment like every feature setting) or
+ * PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0. Note: versions before 2.10 reject a
+ * config file with a feature key they do not know, so while this key is
+ * persisted an older Pi sharing the agent directory falls back to its
+ * defaults; the README says so.
+ */
+export function isStatsIncrementalEnabled(
+  env: MutableEnv = process.env,
+  config: PersistedCacheOptimizerConfigV3 = persistedCacheOptimizerConfig,
+): boolean {
+  return featureEnabled("statsIncremental", STATS_INCREMENTAL_ENV, true, env, config);
+}
+
+export const STATS_TIMING_LOG_PATH = join(STATE_DIR, "pi-cache-optimizer-stats-timing.jsonl");
+
+/** Where the opt-in refresh timing log goes, or undefined when it is off. */
+export function statsTimingLogPath(env: MutableEnv = process.env): string | undefined {
+  const value = env[STATS_TIMING_ENV]?.trim();
+  if (!value || isDisabledEnv(value)) return undefined;
+  if (isEnabledEnv(value)) return STATS_TIMING_LOG_PATH;
+  return isAbsolute(value) ? value : undefined;
 }
 
 export function isToolOrderEnabled(env: MutableEnv = process.env): boolean {
@@ -101,7 +144,7 @@ export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCac
   const rawFeatures = record.version === 3 ? record.features : undefined;
   if (rawFeatures !== undefined && !asRecord(rawFeatures)) return undefined;
   const featuresRecord = asRecord(rawFeatures);
-  const featureNames = new Set<PersistedCacheOptimizerFeature>(["promptRewrite", "virtualRewrite", "skillCompression", "openAICacheKey", "toolOrder", "zeroPriceWarming"]);
+  const featureNames = new Set<PersistedCacheOptimizerFeature>(["promptRewrite", "virtualRewrite", "skillCompression", "openAICacheKey", "toolOrder", "zeroPriceWarming", "statsIncremental"]);
   if (featuresRecord && Object.keys(featuresRecord).some((key) => !featureNames.has(key as PersistedCacheOptimizerFeature) || typeof featuresRecord[key] !== "boolean")) return undefined;
 
   const rawPromptCacheKey = record.promptCacheKey;
@@ -362,6 +405,7 @@ export function formatPersistentFeatureConfig(): string {
     ["OpenAI cache key", "openAICacheKey", NO_OPENAI_CACHE_KEY_ENV, true],
     ["Tool ordering", "toolOrder", TOOL_ORDER_ENV, false],
     ["Zero-price cache warming", "zeroPriceWarming", NO_ZERO_PRICE_WARMING_ENV, true],
+    ["Incremental footer refresh", "statsIncremental", STATS_INCREMENTAL_ENV, true],
   ];
   for (const [label, feature, envName, defaultValue] of entries) {
     const hasEnv = process.env[envName] !== undefined || (feature === "openAICacheKey" && process.env[OPENAI_CACHE_KEY_ENV] !== undefined);

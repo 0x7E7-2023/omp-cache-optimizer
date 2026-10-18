@@ -1100,6 +1100,7 @@ describe("v7 shard persistence and aggregation", () => {
       // Lifecycle refresh must clear the stale process-local bucket before the
       // final closed write, even when no new assistant message arrives.
       await handlers.get("agent_settled")?.({}, context);
+      await fresh.__internals_for_tests.statsRefreshSettled();
       await handlers.get("session_shutdown")?.({ reason: "quit" }, context);
       const shardDir = fresh.__internals_for_tests.SHARD_FILES_DIR;
       const shardName = (await readdir(shardDir)).find((name) => name.endsWith(".json"));

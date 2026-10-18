@@ -292,10 +292,15 @@ describe("R7: an awaited retry holds the process open", () => {
         await I.waitForStatsRestore();
         await handlers.get("message_end")({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 0, cacheWrite: 0 } } }, context);
         let failures = 0;
-        I.setStatsArchiveTestHooks({ beforeLstat: async () => { if (failures < 2) { failures++; throw Object.assign(new Error("EBUSY"), { code: "EBUSY" }); } } });
+        // 2.10: agent_settled's refresh runs in the background, and an
+        // unchanged clean generation is confirmed by its listing alone (no
+        // lstat), so the fault is injected at the listing. The retry must
+        // still finish (its timers keep the process alive) and
+        // session_shutdown must drain it before flushing.
+        I.setStatsArchiveTestHooks({ afterList: async () => { if (failures < 2) { failures++; throw Object.assign(new Error("EBUSY"), { code: "EBUSY" }); } } });
         await handlers.get("agent_settled")({}, context);
-        I.setStatsArchiveTestHooks(undefined);
         await handlers.get("session_shutdown")({ reason: "quit" }, context);
+        I.setStatsArchiveTestHooks(undefined);
         const [name] = readdirSync(I.SHARD_FILES_DIR).filter((file) => file.endsWith(".json"));
         const shard = JSON.parse(readFileSync(join(I.SHARD_FILES_DIR, name), "utf8"));
         writeFileSync(${JSON.stringify(join(dir, "flushed"))}, JSON.stringify({ failures, state: shard.lifecycle.state, requests: shard.models["${KEY}"]?.stats.totalRequests }));
@@ -424,6 +429,7 @@ describe("R8: I rebase across a session_start", () => {
 
       await handlers.get("message_end")!(message, second);
       await handlers.get("tool_execution_end")!({ toolCallId: "t1" }, second);
+      await I.statsRefreshSettled();
       // The session footer: after a reload the archived request is this
       // session's too (same sessionHash), so it shows both.
       const expected = reason === "new" ? /0\/1\b/ : /0\/2\b/;
@@ -490,9 +496,11 @@ describe("R8: the session guard keeps the no-double-count fallback", () => {
 
       // A refresh notices the absorption (counters: the 1 absorbed request).
       await handlers.get("tool_execution_end")!({ toolCallId: "t0" }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /0\/1\b/, "the absorbed request is counted once");
       await handlers.get("message_end")!(message, context);
       await handlers.get("tool_execution_end")!({ toolCallId: "t1" }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /0\/2\b/, "archived 1 + new 1, the archived request not counted twice");
       await handlers.get("session_shutdown")!({}, context);
       const files = await readdir(I.SHARD_FILES_DIR);

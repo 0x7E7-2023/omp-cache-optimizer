@@ -19,6 +19,7 @@
 - [持久 Opt-out](#持久-opt-out)
 - [按模型关闭 `prompt_cache_key`](#按模型关闭-prompt_cache_key)
 - [Opt-in 确定性工具排序](#opt-in-确定性工具排序)
+- [Footer 刷新（2.10）](#footer-刷新210)
 - [Footer 缓存统计模式](#footer-缓存统计模式)
 - [OpenAI-compatible 代理配置](#openai-compatible-代理配置)
 - [Prompt cache 保温（Pi 0.86+）](#prompt-cache-保温pi-086)
@@ -100,6 +101,9 @@ Doctor 显示的 endpoint URL 会移除用户名/密码、查询参数和 fragme
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 Pi 原始 verbose skill XML。 |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | 通过旧的反向开关关闭同一个 fallback。取值 `0`、`false`、`no`、`off` 时关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` | 增量 footer 刷新的 kill switch（见 [Footer 刷新（2.10）](#footer-刷新210)）：每次刷新重新 stat 全部 shard 文件，与 2.9.3 相同。取值 `0`、`false`、`no`、`off` 时关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_TIMING=1` | 开启 footer 刷新计时日志（JSON lines，写到 agent 目录下的 `pi-cache-optimizer-stats-timing.jsonl`；取值为绝对路径时写到该路径）。默认关闭。 |
+| `PI_CACHE_OPTIMIZER_STATS_VERIFY=1` | 开启校验：每次后台全扫之后，检查有没有 shard 文件内容变了、文件身份（inode、大小、时间戳）却没变。没有 inode、时间戳精度又粗的文件系统（FAT、部分 SMB 服务器）会出现这种情况。发现的文件会被重新读取；出现两次后提示一次改用 kill switch。默认关闭。 |
 
 持久化 feature 配置由 Pi agent 目录中的原生命令管理，并且优先于对应环境变量，包括上面的两个 OpenAI cache-key 开关。运行时 `disable` 仍会抑制优化，不受持久配置影响：
 
@@ -109,6 +113,7 @@ Doctor 显示的 endpoint URL 会移除用户名/密码、查询参数和 fragme
 /cache-optimizer config skill-compression on|off
 /cache-optimizer config openai-cache-key on|off
 /cache-optimizer config tool-order on|off
+/cache-optimizer config stats-incremental on|off
 /cache-optimizer config footer-mode total|session|process
 /cache-optimizer config reset
 ```
@@ -132,6 +137,19 @@ bun .trellis/tasks/09-03-context-epoch-tool-ordering/verify.ts
 ```
 
 该 verifier 只报告数字形式的工具排序变化，并确认带 cache marker 的 payload 不会变化。由于它不会连接 provider，provider cache usage 会明确报告为 unavailable，也不会虚构 cache hit。
+
+## Footer 刷新（2.10）
+
+2.10 之前，每次 footer 刷新都要 stat 每一个原始 shard 文件（忙碌的一天约 400 个），而且 Pi 在每次工具调用、每条 assistant 消息和每次 settle 之后都要等它完成。在 Windows 上，杀毒软件扫描让每次 stat 都很贵，一次刷新约 28 ms，直接压在 agent 循环的关键路径上。自 2.10 起：
+
+- **Pi 不再等待。** `tool_execution_end`、`agent_settled`、`message_end` 之后的刷新改在后台进行（用量仍先同步记入内存）。同一时刻最多只有一个刷新在跑；期间到来的请求共享一个在它之后开始的后续刷新，所以拿到的结果不会早于请求时刻。命令（`stats`、`doctor`、`reset` 等）、`session_shutdown` 和切换模型仍然等待一次新鲜的刷新；shutdown 会先等后台刷新结束再做最后一次写入，所以 print 模式不会在刷新中途退出。
+- **文件操作更少。** 每次刷新列一次 shard 目录（新增和删除的 shard 立刻可见），只 stat 新文件和"热"集合：active shard、最近 15 分钟内更新过的 shard，以及 TUI watcher 报告有变化的文件。文件只有变了才重新读取。本进程自己的 shard 从不读回（内存里的副本更新）。在基准夹具上（约 400 个原始 shard，每次文件操作 0.2 ms），一次刷新从约 410 次文件操作、29 ms 降到约 18 次（2 次列目录、10 个 active shard 的 stat、6 次 epoch 读取）、3 ms 以内。
+- **陈旧上限。** 已关闭的 shard 只会被它所属的进程改写：该进程用同一个 shard 开始另一个 session 时（Pi 在 `/new`、`/resume`、fork 之间沿用同一个 extension：shutdown 把 shard 关闭，下一个 session 又把它写回 active）。如果很快发生，15 分钟窗口能覆盖；关闭超过 15 分钟的 shard 只在有刷新发生时由后台全扫复查，最多每 30 秒一次（同时最多 2 个文件操作）。所以这类文件的变化（包括这种较晚的重新激活）最迟约 30 秒加一次全扫的时间后反映到 footer。active 和最近更新的 shard（所有活着的进程的）、新增和删除的 shard、reset epoch 以及本进程自己的用量都不会陈旧。命令和 shutdown 的 flush 始终 stat 全部文件。
+- **数字不变。** 每次刷新都用与以前相同的聚合，对缓存的 shard 做完整的重新聚合，所以总数与对同一批文件做全量扫描完全相同。reset epoch 每次刷新并行读取一次，慢的读取不能再把较新的 epoch 改回去。epoch 文件在 Windows 上的读取错误（另一个进程 reset 时的 `EPERM`/`EBUSY`）不再被当作"从未 reset"；2.10 之前它可能清掉本进程尚未落盘的用量。磁盘格式、文件名和写入协议都不变，2.8.x/2.9.x 进程可以共用同一目录。
+- **Archive。** 新的 archive generation 仍然只解析一次；为 footer 做的归约现在只覆盖当前 session（不再为每个 bucket 拼接键字符串），2 MB 的 archive 主线程耗时约减少四分之一（JSON 解析本身仍在）。未变化的 generation 只凭目录列表确认，但每次命令和 flush、以及至少每 30 秒仍会核对一次它的文件身份（archive 目录被删除重建时，generation 编号会被重复使用）。2.9.0 的 `archive.json`、仍在原地写入的 generation 和不可读的最新 generation，照旧每次刷新都核对。
+- **Watcher。** TUI 的 shard watcher 现在有 `error` 监听（Windows 上删除被监视的目录曾让 Pi 崩溃），在后台 restore 之后才创建（以前启动时目录还不存在，整个进程都没有 watcher），只把变化的文件标记给下一次刷新，忽略本进程自己的写入，并在 shutdown 和 reload 时关闭。
+
+Kill switch：`/cache-optimizer config stats-incremental off` 或 `PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0` 让每次刷新重新 stat 全部 shard 文件（后台刷新和其他修复保留）；和其他功能设置一样，持久化配置优先于环境变量。注意：2.10 之前的版本不认识这个配置键，设置后会忽略整个配置文件（回到默认值），如果同一 agent 目录下还会运行旧版本，请优先使用环境变量。`PI_CACHE_OPTIMIZER_STATS_TIMING=1` 记录每次刷新的分阶段耗时、热集合大小和文件数；`PI_CACHE_OPTIMIZER_STATS_VERIFY=1` 检查刷新所依赖的文件身份在你的文件系统上是否可靠。
 
 ## Footer 缓存统计模式
 

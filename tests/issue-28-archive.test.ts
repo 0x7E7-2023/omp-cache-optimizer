@@ -341,8 +341,10 @@ describe("issue #28 phase 2: archive snapshot", () => {
       // Startup maintenance folded all 40 past-day shards; only this process's shard remains.
       assert.equal((await readdir(I.SHARD_FILES_DIR)).length, 1);
       await handlers.get("message_end")!({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 0, cacheWrite: 0 } } }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /40\/41/);
       await handlers.get("tool_execution_end")!({ toolCallId: "t1" }, context);
+      await I.statsRefreshSettled();
       assert.match(statuses.at(-1) ?? "", /40\/41/);
       await handlers.get("session_shutdown")!({}, context);
     });

@@ -483,12 +483,14 @@ describe("native virtual model hooks", () => {
     await hooks.get("session_start")!({ reason: "startup" }, startCtx);
     await extension.__internals_for_tests.waitForStatsRestore();
     await hooks.get("message_end")!({ message }, routedCtx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     const routedStatus = statuses.at(-1);
     assert.match(routedStatus ?? "", /^· Kimi cache 1\/1·/);
 
     // Later lifecycle refreshes resolve the same physical model instead of
     // clearing the footer for the virtual selection.
     await hooks.get("agent_settled")!({}, routedCtx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.at(-1), routedStatus);
 
     await commands.get("cache-optimizer")!.handler("stats", routedCtx);
@@ -517,6 +519,7 @@ describe("native virtual model hooks", () => {
     const ctx = context(selected, { sessionId: "unrouted-session" }, { statuses, notifications });
 
     await hooks.get("agent_settled")!({}, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.deepEqual(statuses.filter((status) => status !== undefined), []);
 
     await commands.get("cache-optimizer")!.handler("compat", ctx);
@@ -815,9 +818,11 @@ describe("native virtual model hooks", () => {
     const ctx = context(physical("proxy", "kimi-k3", { name: "Kimi K3" }), { sessionId: "nested-session" }, { statuses });
 
     await hooks.get("tool_execution_end")!({ toolCallId: "nested", toolName: "read", parentToolCallId: "codemode-1", isError: false }, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.length, 0);
 
     await hooks.get("tool_execution_end")!({ toolCallId: "codemode-1", toolName: "codemode", isError: false }, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.length, 1);
     assert.match(statuses[0] ?? "", /^· Kimi cache 0\/0/);
   });

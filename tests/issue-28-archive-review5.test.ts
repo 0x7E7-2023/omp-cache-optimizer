@@ -252,6 +252,7 @@ describe("2.9.2 review: I rebase across a reset", () => {
 
         await handlers.get("message_end")!(message, context);
         await handlers.get("tool_execution_end")!({ toolCallId: "t1" }, context);
+        await I.statsRefreshSettled();
         assert.match(statuses.at(-1) ?? "", /0\/1\b/, "only the post-reset request is visible");
         await handlers.get("session_shutdown")!({}, context);
         const files = await readdir(I.SHARD_FILES_DIR);

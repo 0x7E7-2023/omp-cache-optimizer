@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, readdir, rename, rm, stat, unlink, utimes, writ
 import { dirname, join } from "node:path";
 import { LOG_PREFIX, asRecord, getErrorCode, getNonNegativeNumber, isNonEmptyString, isProcessAlive } from "./common.ts";
 import { STATE_DIR } from "./paths.ts";
+import { statsReadFs } from "./stats-fs.ts";
 
 export type CacheProviderId = "deepseek" | "openai" | "claude" | "gemini";
 
@@ -226,12 +227,54 @@ export function parseEpochRecord(value: unknown): string | undefined {
   return record?.version === 1 && isNonEmptyString(record.epoch) ? record.epoch.trim() : undefined;
 }
 
-export async function readEpochFile(path: string, fallback: string): Promise<string> {
+/** Outcome of a footer epoch read: an epoch, or an I/O error the caller must not mistake for "no reset". */
+export type EpochReadResult = { ok: true; epoch: string } | { ok: false; error: unknown };
+
+/**
+ * Footer (non-strict) epoch read. A missing file means no reset ever
+ * happened (the fallback); so does a file that is not a valid epoch record,
+ * which every reader since 2.8.20 treats the same way, so processes of
+ * different versions keep agreeing. Any other read failure (a Windows
+ * EPERM/EBUSY while a reset renames the file or a scanner holds it) is
+ * reported as an error: before 2.10 it fell back to the initial epoch, and a
+ * refresh then "adopted" that epoch and wiped this process's unsaved usage.
+ */
+export async function readEpochFileResult(path: string, fallback: string): Promise<EpochReadResult> {
+  let text: string;
   try {
-    return parseEpochRecord(JSON.parse(await readFile(path, "utf8"))) ?? fallback;
-  } catch {
-    return fallback;
+    text = (await statsReadFs().readFile(path)).toString("utf8");
+  } catch (error) {
+    if (getErrorCode(error) === "ENOENT") return { ok: true, epoch: fallback };
+    return { ok: false, error };
   }
+  try {
+    return { ok: true, epoch: parseEpochRecord(JSON.parse(text)) ?? fallback };
+  } catch {
+    return { ok: true, epoch: fallback };
+  }
+}
+
+const EPOCH_TRANSIENT_CODES = new Set(["EPERM", "EBUSY", "EACCES", "EAGAIN"]);
+const EPOCH_RETRY_DELAYS_MS = [15, 60];
+
+/**
+ * readEpochFileResult, retrying a transient Windows error briefly. The
+ * delay is deliberately not unref'd (see renameWithRetry): awaited reads
+ * must not let print mode exit mid-handler.
+ */
+export async function readEpochFileWithRetry(path: string, fallback: string): Promise<EpochReadResult> {
+  for (let attempt = 0; ; attempt++) {
+    const result = await readEpochFileResult(path, fallback);
+    if (result.ok || attempt >= EPOCH_RETRY_DELAYS_MS.length || !EPOCH_TRANSIENT_CODES.has(getErrorCode(result.error) ?? "")) return result;
+    await new Promise<void>((resolve) => setTimeout(resolve, EPOCH_RETRY_DELAYS_MS[attempt]));
+  }
+}
+
+/** readEpochFileResult that throws on an I/O error (callers keep their current epoch). */
+export async function readEpochFile(path: string, fallback: string): Promise<string> {
+  const result = await readEpochFileResult(path, fallback);
+  if (result.ok) return result.epoch;
+  throw result.error;
 }
 
 /**
@@ -492,6 +535,25 @@ function cloneShard(shard: PersistedStatsShardV7): PersistedStatsShardV7 {
   return structuredClone(shard);
 }
 
+/** File names the shard directory holds shards under (every version since 2.8.20). */
+export const SHARD_FILE_NAME_PATTERN = /^[0-9a-f-]+\.json$/i;
+
+/**
+ * Parse one shard file's text the way readShardFileCached does: `parsed` is
+ * the schema-valid shard, `shard` the same only when its instanceId matches
+ * the file name. Throws SyntaxError on malformed JSON.
+ */
+export function parseShardFileText(name: string, text: string): { shard: PersistedStatsShardV7 | undefined; parsed: PersistedStatsShardV7 | undefined } {
+  const filenameInstanceId = name.slice(0, -".json".length);
+  const parsed = parsePersistedStatsShardV7(JSON.parse(text));
+  return { parsed, shard: parsed && parsed.instanceId === filenameInstanceId ? parsed : undefined };
+}
+
+/** The test hook view of a shard lstat (production: the stats unchanged). */
+export function applyShardStatHook(path: string, info: import("node:fs").Stats): import("node:fs").Stats {
+  return statsFsTestHooks.shardStat ? statsFsTestHooks.shardStat(path, info) : info;
+}
+
 export async function readValidStatsShardsV7(directory: string = SHARD_FILES_DIR): Promise<PersistedStatsShardV7[]> {
   let names: string[];
   try {
@@ -562,10 +624,31 @@ export type ShardAggregator = {
   finish(): ShardAggregate;
 };
 
-/** Incremental form of aggregateStatsShardsV7: add shards (and pre-reduced contributions) in order, then finish. */
-export async function createShardAggregatorV7(day: string | null = currentLocalDay()): Promise<ShardAggregator> {
-  const globalEpoch = await readGlobalStatsEpoch();
-  const modelEpochs = new Map<string, string>();
+/** One consistent set of epochs (global plus every model key an aggregation meets), read before aggregating. */
+export type ShardEpochs = {
+  readonly globalEpoch: string;
+  /** Must cover every model key the aggregation meets (throws otherwise: a missing prefetch is a bug). */
+  modelEpoch(key: string): string;
+};
+
+/** Synchronous form of the aggregator, over epochs read beforehand: no await between the first add and finish. */
+export type SyncShardAggregator = {
+  readonly day: string | null;
+  readonly globalEpoch: string;
+  add(shard: PersistedStatsShardV7): void;
+  addContribution(contribution: ShardContribution): void;
+  finish(): ShardAggregate;
+};
+
+/** Model keys `add(shard)` would look up an epoch for (none when the shard is filtered out up front). */
+export function shardEpochKeys(shard: PersistedStatsShardV7, day: string | null, globalEpoch: string): string[] {
+  if ((day !== null && shard.day !== day) || shard.globalEpoch !== globalEpoch) return [];
+  return Object.keys(shard.models);
+}
+
+/** The aggregation itself (aggregateStatsShardsV7's semantics), over pre-read epochs. */
+export function createShardAggregatorSync(day: string | null, epochs: ShardEpochs): SyncShardAggregator {
+  const globalEpoch = epochs.globalEpoch;
   const result: ShardAggregate = {
     bySession: {},
     totalsByModel: {},
@@ -579,29 +662,20 @@ export async function createShardAggregatorV7(day: string | null = currentLocalD
   const routedUpdatedAt = new Map<string, number>();
   const modelRefUpdatedAt = new Map<string, number>();
   const modelSessions = new Map<string, Set<string>>();
-  const modelEpoch = async (key: string): Promise<string> => {
-    let epoch = modelEpochs.get(key);
-    if (!epoch) {
-      epoch = await readModelStatsEpoch(key);
-      modelEpochs.set(key, epoch);
-    }
-    return epoch;
-  };
 
   return {
     day,
     globalEpoch,
-    modelEpoch,
-    async add(shard) {
+    add(shard) {
       if ((day !== null && shard.day !== day) || shard.globalEpoch !== globalEpoch) return;
       let contributed = false;
       if (shard.lastRoutedModel && (routedUpdatedAt.get(shard.sessionHash) ?? -1) < shard.lifecycle.updatedAt) {
         routedUpdatedAt.set(shard.sessionHash, shard.lifecycle.updatedAt);
-        result.lastRoutedModelBySession[shard.sessionHash] = shard.lastRoutedModel;
+        // A copy: shards are shared, read-only cache entries (no per-refresh clone).
+        result.lastRoutedModelBySession[shard.sessionHash] = { ...shard.lastRoutedModel };
       }
       for (const [key, entry] of Object.entries(shard.models)) {
-        const epoch = modelEpochs.get(key) ?? await modelEpoch(key);
-        if (entry.modelEpoch !== epoch || (day !== null && entry.stats.day !== day)) continue;
+        if (entry.modelEpoch !== epochs.modelEpoch(key) || (day !== null && entry.stats.day !== day)) continue;
         contributed = true;
         const sessionModels = result.bySession[shard.sessionHash] ??= {};
         sessionModels[key] = mergeStatsAcrossDays(sessionModels[key], entry.stats, day);
@@ -662,6 +736,39 @@ export async function createShardAggregatorV7(day: string | null = currentLocalD
       for (const [key, sessions] of modelSessions) result.sessionsByModel[key] = sessions.size;
       return result;
     },
+  };
+}
+
+/** Incremental form of aggregateStatsShardsV7: add shards (and pre-reduced contributions) in order, then finish. */
+export async function createShardAggregatorV7(day: string | null = currentLocalDay()): Promise<ShardAggregator> {
+  const globalEpoch = await readGlobalStatsEpoch();
+  const modelEpochs = new Map<string, string>();
+  const modelEpoch = async (key: string): Promise<string> => {
+    let epoch = modelEpochs.get(key);
+    if (!epoch) {
+      epoch = await readModelStatsEpoch(key);
+      modelEpochs.set(key, epoch);
+    }
+    return epoch;
+  };
+  const core = createShardAggregatorSync(day, {
+    globalEpoch,
+    modelEpoch: (key) => {
+      const epoch = modelEpochs.get(key);
+      if (epoch === undefined) throw new Error(`model epoch of ${key} was not read before aggregating`);
+      return epoch;
+    },
+  });
+  return {
+    day,
+    globalEpoch,
+    modelEpoch,
+    async add(shard) {
+      for (const key of shardEpochKeys(shard, day, globalEpoch)) if (!modelEpochs.has(key)) await modelEpoch(key);
+      core.add(shard);
+    },
+    addContribution: (contribution) => core.addContribution(contribution),
+    finish: () => core.finish(),
   };
 }
 
