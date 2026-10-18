@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, lstat, mkdir } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
   type ExtensionAPI, type ExtensionContext
 } from "@earendil-works/pi-coding-agent";
-import { LOG_PREFIX, type PiModel, asRecord, isNonEmptyString } from "./src/common.ts";
+import { LOG_PREFIX, type PiModel, asRecord, getErrorCode, isNonEmptyString } from "./src/common.ts";
 import { FIX_RECEIPT_FILE_NAME, FIX_RECEIPT_PATH, MODELS_JSON_PATH, STATE_DIR } from "./src/paths.ts";
 import { type FixSuggestion } from "./src/fix-types.ts";
 import { deepEqualIgnoringKeys, findExistingCompatKeysInJsonc, locateModelOverrideInJsonc, locateProviderCompatInJsonc, parseJsonc, stripJsoncComments, stripJsoncTrailingCommas } from "./src/jsonc.ts";
@@ -1380,11 +1380,44 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * Retired shards whose closing write failed: counted from memory only, so
+   * they would be lost when the process exits. The shutdown flush writes
+   * each one once more (see retryUnpersistedRetiredShards).
+   */
+  const unpersistedRetiredShards = new Map<string, { shard: PersistedStatsShardV7; path: string; landed: boolean }>();
+
+  /**
+   * One more closing write for each retired shard whose write failed, at
+   * shutdown. Skipped once its retired copy is gone: compaction absorbed the
+   * id (the archive counts it), or a file at least as new already landed.
+   * Also skipped when an earlier write of the id had landed but its file is
+   * gone now: compaction folded it into the archive and deleted it (a later
+   * pass then forgets the id, so a refresh that missed the archive in
+   * between still holds the retired copy). Writing it back would count it
+   * twice. A second failure only warns: there is nothing left to retry with.
+   */
+  async function retryUnpersistedRetiredShards(): Promise<void> {
+    for (const [id, { shard, path, landed }] of Array.from(unpersistedRetiredShards)) {
+      unpersistedRetiredShards.delete(id);
+      if (retiredShards.get(id) !== shard) continue;
+      await enqueuePersist(async () => {
+        try {
+          if (landed && await lstat(path).then(() => false, (error) => getErrorCode(error) === "ENOENT")) return;
+          await writeStatsShardV7(path, shard);
+        } catch (error) {
+          console.warn(`${LOG_PREFIX}: failed again to persist a retired stats shard at shutdown; its usage is lost`, error);
+        }
+      });
+    }
+  }
+
+  /**
    * Retire the current shard: snapshot it closed, keep that snapshot as its
    * retired copy, continue under a new id on `day`, and queue the snapshot's
-   * write (a failure only warns: the retired copy keeps counting it). The
-   * written and the retired copy are one object, so once its write lands
-   * the file (same updatedAt) replaces the retired copy. Synchronous up to
+   * write (a failure warns and the retired copy keeps counting it; the
+   * shutdown flush writes it once more). The written and the retired copy
+   * are one object, so once its write lands the file (same updatedAt)
+   * replaces the retired copy. Synchronous up to
    * the queued write, so usage recorded after this goes to the new id.
    */
   function retireCurrentShard(day: string, ctx?: ExtensionContext): Promise<void> {
@@ -1394,6 +1427,7 @@ export default function (pi: ExtensionAPI) {
     }
     const closed = buildCurrentStatsShard("closed");
     const closedPath = instanceShardPath;
+    const landed = persistedOwnShards.length > 0;
     retiredShards.set(instanceId, closed);
     instanceId = randomUUID();
     instanceShardPath = join(SHARD_FILES_DIR, `${instanceId}.json`);
@@ -1404,6 +1438,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await writeStatsShardV7(closedPath, closed);
       } catch (error) {
+        unpersistedRetiredShards.set(closed.instanceId, { shard: closed, path: closedPath, landed });
         console.warn(`${LOG_PREFIX}: failed to persist a retired stats shard`, error);
         if (!persistenceWarningShown) {
           persistenceWarningShown = true;
@@ -1699,7 +1734,12 @@ export default function (pi: ExtensionAPI) {
       closeStatsRefreshGate();
       await waitForStatsRestore();
       await drainStatsRefresh();
-      await flushPersistCacheStats(ctx, "closed");
+      try {
+        await flushPersistCacheStats(ctx, "closed");
+      } finally {
+        // Also when the flush failed (e.g. its rollover's refresh threw).
+        await retryUnpersistedRetiredShards();
+      }
     } finally {
       closeStatsRefreshGate();
       latestCacheHint = undefined;

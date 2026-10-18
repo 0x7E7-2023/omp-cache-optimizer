@@ -220,6 +220,55 @@ describe("a second session_start on the same extension instance", () => {
           h.I.setStatsFsTestHooks(undefined);
           console.warn = warn;
         }
+        const shards = await h.I.readValidStatsShardsV7();
+        assert.deepEqual(shards.map(requests).sort(), [1, 2], "the shutdown flush wrote the retired shard once more");
+        for (const shard of shards) assert.equal(shard.lifecycle.state, "closed");
+      });
+    });
+  });
+
+  test("a retired shard whose write fails again at shutdown only warns: the shutdown completes", async () => {
+    await withEnv({ PI_CACHE_OPTIMIZER_FOOTER_MODE: "total" }, async () => {
+      await withAgentDir(async () => {
+        const h = await harness("write-fails-twice");
+        await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
+        await h.I.waitForStatsRestore();
+        await usage(h, h.ctx, 2);
+        let failed = 0;
+        const warnings: string[] = [];
+        const warn = console.warn;
+        console.warn = (message: unknown) => { warnings.push(String(message)); };
+        h.I.setStatsFsTestHooks({
+          beforeRename: async (from: string, to: string) => {
+            if (!to.endsWith(".json")) return;
+            const { readFile } = await import("node:fs/promises");
+            const shard = JSON.parse(await readFile(from, "utf8"));
+            if (shard.lifecycle.state === "closed" && requests(shard) === 2) {
+              failed++;
+              throw Object.assign(new Error("EIO: disk full"), { code: "EIO" });
+            }
+          },
+        });
+        const next = ctxFor(h, "session-two");
+        try {
+          await h.handlers.get("session_start")!({ reason: "new" }, next);
+          await h.I.waitForStatsRestore();
+          await usage(h, next, 1);
+          await h.handlers.get("session_shutdown")!({}, next);
+        } finally {
+          h.I.setStatsFsTestHooks(undefined);
+          console.warn = warn;
+        }
+        assert.equal(failed, 2, "written once at retirement and retried exactly once at shutdown");
+        assert.ok(warnings.some((message) => /failed again/.test(message)));
+        const shards = await h.I.readValidStatsShardsV7();
+        const fresh = shards.find((shard: any) => shard.sessionHash === h.I.hashSessionId("session-two"));
+        assert.equal(fresh?.lifecycle.state, "closed", "the current shard's flush still landed");
+        // A later shutdown (same instance, next session) does not retry again.
+        await h.handlers.get("session_start")!({ reason: "new" }, ctxFor(h, "session-three"));
+        await h.I.waitForStatsRestore();
+        await h.handlers.get("session_shutdown")!({}, ctxFor(h, "session-three"));
+        assert.equal(failed, 2);
       });
     });
   });
@@ -308,6 +357,105 @@ describe("a second session_start on the same instance: kill switch and day rollo
         const total = shards.reduce((sum: number, shard: any) => sum + requests(shard), 0);
         assert.equal(total, 4, "every request is on disk exactly once");
         assert.deepEqual(shards.filter((shard: any) => shard.day === "2026-09-20").map(requests), [2]);
+      });
+    });
+  });
+
+  test("a retired shard compaction folded in and removed meanwhile is not written back at shutdown (no double count)", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 8, 20, 12).getTime() });
+    await withEnv({ PI_CACHE_OPTIMIZER_FOOTER_MODE: "total" }, async () => {
+      await withAgentDir(async () => {
+        const h = await harness("retired-absorbed-pruned");
+        await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
+        await h.I.waitForStatsRestore();
+        await usage(h, h.ctx, 2);
+        // Session one's closed file lands; its retirement's closing write fails.
+        await h.handlers.get("session_shutdown")!({}, h.ctx);
+        let failed = 0;
+        const warn = console.warn;
+        console.warn = () => {};
+        h.I.setStatsFsTestHooks({
+          beforeRename: async (from: string, to: string) => {
+            if (failed > 0 || !to.endsWith(".json")) return;
+            const { readFile } = await import("node:fs/promises");
+            const shard = JSON.parse(await readFile(from, "utf8"));
+            if (shard.lifecycle.state === "closed" && requests(shard) === 2) {
+              failed++;
+              throw Object.assign(new Error("EIO: disk full"), { code: "EIO" });
+            }
+          },
+        });
+        const next = ctxFor(h, "session-two");
+        try {
+          t.mock.timers.setTime(new Date(2026, 8, 20, 13).getTime());
+          await h.handlers.get("session_start")!({ reason: "new" }, next);
+          await h.I.waitForStatsRestore();
+          await usage(h, next, 1);
+          assert.equal(failed, 1);
+          // Two days later, while this instance is idle, other processes'
+          // maintenance folds session one's closed file into the archive and
+          // deletes it, and a later pass forgets the id (its file is gone).
+          t.mock.timers.setTime(new Date(2026, 8, 22, 12).getTime());
+          const now = Date.now();
+          assert.equal((await h.I.compactStatsShardsV7(now)).absorbed, 1);
+          await h.I.compactStatsShardsV7(now + 1);
+          assert.equal((await h.I.readStatsArchive()).absorbedIds.size, 0, "the id is forgotten once its file is gone");
+          await h.handlers.get("session_shutdown")!({}, next);
+        } finally {
+          h.I.setStatsFsTestHooks(undefined);
+          console.warn = warn;
+        }
+        const shards = await diskShards(h.I);
+        assert.equal(shards.reduce((sum: number, shard: any) => sum + requests(shard), 0), 3, "session one's 2 requests are on disk once (in the archive)");
+      });
+    });
+  });
+
+  test("the retired shard's retry still runs when the shutdown flush itself fails", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 8, 20, 12).getTime() });
+    await withEnv({ PI_CACHE_OPTIMIZER_FOOTER_MODE: "total" }, async () => {
+      await withAgentDir(async () => {
+        let refreshFails = false;
+        const h = await harness("retired-retry-flush-fails", {
+          hooks: { beforeCommit: async () => { if (refreshFails) throw new Error("persistent read error"); } },
+        });
+        await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
+        await h.I.waitForStatsRestore();
+        await usage(h, h.ctx, 2);
+        let failed = 0;
+        const warn = console.warn;
+        console.warn = () => {};
+        h.I.setStatsFsTestHooks({
+          beforeRename: async (from: string, to: string) => {
+            if (failed > 0 || !to.endsWith(".json")) return;
+            const { readFile } = await import("node:fs/promises");
+            const shard = JSON.parse(await readFile(from, "utf8"));
+            if (shard.lifecycle.state === "closed" && requests(shard) === 2) {
+              failed++;
+              throw Object.assign(new Error("EIO: disk full"), { code: "EIO" });
+            }
+          },
+        });
+        const next = ctxFor(h, "session-two");
+        try {
+          t.mock.timers.setTime(new Date(2026, 8, 20, 13).getTime());
+          await h.handlers.get("session_start")!({ reason: "new" }, next);
+          await h.I.waitForStatsRestore();
+          await usage(h, next, 1);
+          assert.equal(failed, 1);
+          // The next day: the shutdown flush's rollover refresh throws.
+          t.mock.timers.setTime(new Date(2026, 8, 21, 12).getTime());
+          refreshFails = true;
+          await assert.rejects(Promise.resolve(h.handlers.get("session_shutdown")!({}, next)), /persistent read error/);
+        } finally {
+          refreshFails = false;
+          h.I.setStatsFsTestHooks(undefined);
+          console.warn = warn;
+        }
+        const shards = await h.I.readValidStatsShardsV7();
+        const retired = shards.filter((shard: any) => requests(shard) === 2);
+        assert.equal(retired.length, 1);
+        assert.equal(retired[0].lifecycle.state, "closed", "the retired shard's closing write landed");
       });
     });
   });
