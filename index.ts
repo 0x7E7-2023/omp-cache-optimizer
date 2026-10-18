@@ -1008,8 +1008,18 @@ export default function (pi: ExtensionAPI) {
     // Shards folded into the archive are counted there. Ignore their raw file
     // (a crash may leave it behind) and this process's in-memory retired copy.
     for (const id of archive.absorbedIds) retiredShards.delete(id);
-    const persistedShards = rawShards.filter((shard) => !archive.absorbedIds.has(shard.instanceId));
-    for (const shard of persistedShards) retiredShards.delete(shard.instanceId);
+    // A retired copy gives way to its file once the file is at least as new
+    // (its closing write landed). An older file (the id's last active write,
+    // when the closing write failed or is still queued) is ignored instead:
+    // it may hold fewer counters than the retired copy.
+    const persistedShards = rawShards.filter((shard) => {
+      if (archive.absorbedIds.has(shard.instanceId)) return false;
+      const retired = retiredShards.get(shard.instanceId);
+      if (!retired) return true;
+      if (shard.lifecycle.updatedAt < retired.lifecycle.updatedAt) return false;
+      retiredShards.delete(shard.instanceId);
+      return true;
+    });
     // This process's own file is not even read by the tiered index (its
     // in-memory copy, the trailing shard, replaces it); the kill-switch path
     // reads it and drops it here. If a day rollover changed the id while the
@@ -1350,24 +1360,82 @@ export default function (pi: ExtensionAPI) {
         clearTimeout(persistTimer);
         persistTimer = null;
       }
+      // Adopt other processes' epoch resets before the snapshot below.
+      await refreshShardAggregate();
+      // A session_start on this instance may have retired the shard (and
+      // moved to today's day) while that refresh ran: nothing left to roll.
+      if (shardDay === day) return;
       // Preserve yesterday under its original UUID/day before clearing daily
       // counters. Each day owns a new shard so total never includes yesterday.
-      await refreshShardAggregate();
-      await persistCacheStats(ctx, "closed");
-      retiredShards.set(instanceId, buildCurrentStatsShard("closed"));
-      instanceId = randomUUID();
-      instanceShardPath = join(SHARD_FILES_DIR, `${instanceId}.json`);
-      persistedOwnShards = [];
-      shardDay = day;
-      shardCreatedAt = Date.now();
+      const closing = retireCurrentShard(day, ctx);
       cacheStatsProcessByModel = {};
       cacheStatsLegacyFamily = emptyAllCacheStats();
       lastStatusText = undefined;
+      await closing;
       await persistCacheStats(ctx);
       await refreshShardAggregate();
     })();
     try { await rolloverPromise; }
     finally { rolloverPromise = undefined; }
+  }
+
+  /**
+   * Retire the current shard: snapshot it closed, keep that snapshot as its
+   * retired copy, continue under a new id on `day`, and queue the snapshot's
+   * write (a failure only warns: the retired copy keeps counting it). The
+   * written and the retired copy are one object, so once its write lands
+   * the file (same updatedAt) replaces the retired copy. Synchronous up to
+   * the queued write, so usage recorded after this goes to the new id.
+   */
+  function retireCurrentShard(day: string, ctx?: ExtensionContext): Promise<void> {
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    const closed = buildCurrentStatsShard("closed");
+    const closedPath = instanceShardPath;
+    retiredShards.set(instanceId, closed);
+    instanceId = randomUUID();
+    instanceShardPath = join(SHARD_FILES_DIR, `${instanceId}.json`);
+    persistedOwnShards = [];
+    shardCreatedAt = Date.now();
+    shardDay = day;
+    return enqueuePersist(async () => {
+      try {
+        await writeStatsShardV7(closedPath, closed);
+      } catch (error) {
+        console.warn(`${LOG_PREFIX}: failed to persist a retired stats shard`, error);
+        if (!persistenceWarningShown) {
+          persistenceWarningShown = true;
+          ctx?.ui.notify(
+            `${LOG_PREFIX}: failed to persist footer stats; using in-memory stats for this process.`,
+            "warning",
+          );
+        }
+      }
+    });
+  }
+
+  /**
+   * session_start calls this instance has handled. Pi 1.3 builds a new
+   * extension instance for every session (new/resume/fork/reload), but a
+   * host that keeps one instance across sessions sends it a second
+   * session_start, which clears the in-memory counters.
+   */
+  let sessionStartsHandled = 0;
+
+  /**
+   * Before a second session_start on the same instance clears the counters,
+   * retire the shard holding them and continue under a new id, as the day
+   * rollover does. Without this, the next persist rewrites the old id with
+   * the cleared counters and the earlier session's usage for the day is lost
+   * (the shutdown flush closed it, but the id was reused). See
+   * retireCurrentShard.
+   */
+  function retireShardForSessionStart(): void {
+    // The retired shard keeps its own day; the new id starts on today's, so
+    // the restore does not roll over again into an empty extra shard.
+    void retireCurrentShard(currentLocalDay());
   }
 
   /**
@@ -1571,6 +1639,7 @@ export default function (pi: ExtensionAPI) {
     refreshScheduler.open();
     latestStatsCtx = ctx;
     const tui = ctx.mode === "tui";
+    if (sessionStartsHandled++ > 0) retireShardForSessionStart();
     resetStatsForSessionStart(event.reason, ctx);
     const previousRestore = statsRestorePromise;
     statsRestorePromise = previousRestore
