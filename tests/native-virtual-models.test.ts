@@ -692,6 +692,33 @@ describe("native virtual model hooks", () => {
       assert.ok(event.systemPrompt.includes("- alpha: alpha skill description"), "earlier compression survives later section edits");
     });
 
+    test("compresses a verbose copy in customPrompt too, so an inherited parent prompt is not forced", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      // pi-subagents passes an idle parent's base render (verbose skills list) as the child's customPrompt.
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent + "\n\n<sub_agent_context/>" });
+      assert.ok(event.systemPrompt.split("<available_skills>").length === 3, "both copies are verbose before");
+      const result = await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.deepEqual(result, {}, "no forced prompt");
+      assert.equal(typeof options.sections.skills, "string");
+      assert.ok(!event.systemPrompt.includes("<available_skills>"));
+      assert.equal(event.systemPrompt.split("- alpha: alpha skill description").length, 3, "both copies are compressed");
+      assert.ok(options.customPrompt?.endsWith("<sub_agent_context/>"));
+    });
+
+    test("leaves customPrompt unchanged when the section edit is rolled back", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent });
+      // A later-applied verbose copy outside customPrompt and sections keeps the re-render verbose.
+      options.appendSystemPrompt = t.formatSkillsForPrompt(skills as any).trim();
+      await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.equal(options.customPrompt, parent);
+      assert.equal(options.sections.skills, undefined);
+    });
+
     test("falls back to the string substitution after a forced prompt or without sections support", async () => {
       const pi = await loadPi();
       const { hooks } = setup();

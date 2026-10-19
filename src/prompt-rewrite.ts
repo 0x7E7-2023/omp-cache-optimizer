@@ -182,6 +182,12 @@ export function compressSkillsInSystemPrompt(
  * position and `<skills>` wrapper. Returns true only when Pi's re-rendered prompt
  * really contains the compressed list; otherwise the section is restored and the
  * caller falls back to the string substitution.
+ *
+ * A custom base prompt (`customPrompt`) can hold its own copy of the verbose
+ * list: pi-subagents passes the parent's rendered prompt there, and an idle
+ * parent renders its unedited base options. That copy is compressed in place
+ * too; otherwise the re-render still contains the verbose list, the section edit
+ * is rolled back, and the string fallback forces the prompt.
  */
 export function compressSkillsViaSection(event: {
   readonly systemPrompt: string;
@@ -199,11 +205,18 @@ export function compressSkillsViaSection(event: {
   const compressed = formatSkillsForPromptCompressed(options.skills, skillFileReadTool(options) ?? "read").trim();
   if (!compressed || compressed.length >= verbose.length) return false;
 
+  const previousCustom = options.customPrompt;
+  const customHasVerbose = typeof previousCustom === "string" && previousCustom.includes(verbose);
+  if (customHasVerbose) options.customPrompt = previousCustom.split(verbose).join(compressed);
+  // Only the custom prompt held the list (Pi renders no skills section of its own): done.
+  if (customHasVerbose && !event.systemPrompt.includes(verbose)) return true;
+
   const previous = sections.skills;
   sections.skills = compressed;
   if (event.systemPrompt.includes(compressed) && !event.systemPrompt.includes(verbose)) return true;
   if (previous === undefined) delete sections.skills;
   else sections.skills = previous;
+  options.customPrompt = previousCustom;
   return false;
 }
 
