@@ -208,8 +208,13 @@ export function compressSkillsViaSection(event: {
   const previousCustom = options.customPrompt;
   const customHasVerbose = typeof previousCustom === "string" && previousCustom.includes(verbose);
   if (customHasVerbose) options.customPrompt = previousCustom.split(verbose).join(compressed);
-  // Only the custom prompt held the list (Pi renders no skills section of its own): done.
-  if (customHasVerbose && !event.systemPrompt.includes(verbose)) return true;
+  // Only the custom prompt held the list (Pi renders no skills section of its own, e.g. no
+  // read/bash tool): done, and no `<skills>` section is added where Pi renders none.
+  if (customHasVerbose && !event.systemPrompt.includes(verbose)) {
+    if (event.systemPrompt.includes(compressed)) return true;
+    options.customPrompt = previousCustom;
+    return false;
+  }
 
   const previous = sections.skills;
   sections.skills = compressed;

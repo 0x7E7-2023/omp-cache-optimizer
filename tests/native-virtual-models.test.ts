@@ -707,6 +707,35 @@ describe("native virtual model hooks", () => {
       assert.ok(options.customPrompt?.endsWith("<sub_agent_context/>"));
     });
 
+    test("compresses an inherited list without adding a skills section when Pi renders none (no read/bash tool)", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent, selectedTools: ["edit", "write"] });
+      assert.equal(pi.buildSystemPromptSections(options as any).skills, undefined, "Pi renders no skills section for this child");
+      const result = await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.deepEqual(result, {}, "no forced prompt");
+      assert.equal(options.sections.skills, undefined, "no skills section is added");
+      assert.equal(pi.buildSystemPromptSections(options as any).skills, undefined);
+      assert.ok(!event.systemPrompt.includes("<available_skills>"));
+      assert.ok(event.systemPrompt.includes("- alpha: alpha skill description"));
+      assert.equal(t.getLastSkillCompressionOutcome()?.applied, "section");
+    });
+
+    test("rolls customPrompt back when the re-render drops the verbose list but not into the compressed one", async () => {
+      const rw = await jiti.import<typeof import("../src/prompt-rewrite.ts")>(join(process.cwd(), "src", "prompt-rewrite.ts"));
+      const options: any = { customPrompt: "", sections: {}, skills, selectedTools: ["read"] };
+      const verbose = t.formatSkillsForPrompt(skills as any).trim();
+      options.customPrompt = `head\n${verbose}`;
+      const original = options.customPrompt;
+      let reads = 0;
+      // First read (gate) sees the verbose list; later reads see neither form.
+      const event = { get systemPrompt() { return reads++ === 0 ? original : "unrelated"; }, systemPromptOptions: options };
+      assert.equal(rw.compressSkillsViaSection(event as any), false);
+      assert.equal(options.customPrompt, original);
+      assert.equal(options.sections.skills, undefined);
+    });
+
     test("leaves customPrompt unchanged when the section edit is rolled back", async () => {
       const pi = await loadPi();
       const { hooks } = setup();
