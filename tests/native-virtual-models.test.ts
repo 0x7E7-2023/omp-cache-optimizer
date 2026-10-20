@@ -748,6 +748,35 @@ describe("native virtual model hooks", () => {
       assert.equal(options.sections.skills, undefined);
     });
 
+    test("compresses every inherited copy byte-safely, deterministically, and keeps the parent's sent prompt as the child's prefix", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      // `$&`/`$'` would be expanded by a String#replace with a string replacement; two copies need a global replace.
+      const dollarSkills = skills.map((skill, index) => index === 0 ? { ...skill, description: "costs $& and $' tokens" } : skill);
+      const base = { cwd: "/repo", skills: dollarSkills, selectedTools: ["read", "bash"] };
+      const parentIdle = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions(base as any));
+      // What the parent actually sends while running (its own hook compressed the section).
+      const parent = piEvent(pi, { skills: dollarSkills });
+      assert.deepEqual(await hooks.get("before_agent_start")!(parent.event, context(physical("proxy", "kimi-k3"))), {});
+      const parentSent = parent.event.systemPrompt;
+      const compressed = t.formatSkillsForPromptCompressed(dollarSkills as any).trim();
+      assert.ok(parentSent.includes(compressed));
+
+      const childRender = async (customPrompt: string) => {
+        const child = piEvent(pi, { skills: dollarSkills, customPrompt });
+        assert.deepEqual(await hooks.get("before_agent_start")!(child.event, context(physical("proxy", "kimi-k3"))), {}, "no forced prompt");
+        return child.event.systemPrompt;
+      };
+      const first = await childRender(parentIdle + "\n\n<sub_agent_context/>");
+      assert.equal(first, await childRender(parentIdle + "\n\n<sub_agent_context/>"), "byte-identical across runs (cache-stable)");
+      assert.ok(first.startsWith(parentSent), "child prefix equals the prompt the parent sends");
+      assert.ok(!first.includes("<available_skills>"));
+
+      const twice = await childRender(parentIdle + "\n\n" + parentIdle);
+      assert.ok(!twice.includes("<available_skills>"), "every copy is compressed");
+      assert.equal(twice.split(compressed).length, 4, "two inherited copies plus the child's own section");
+    });
+
     test("falls back to the string substitution after a forced prompt or without sections support", async () => {
       const pi = await loadPi();
       const { hooks } = setup();
