@@ -1,4 +1,5 @@
 import { type PiModel, asRecord } from "./common.ts";
+import { buildModelsJsonTypoHintLines } from "./models-json-lint.ts";
 
 /**
  * Diagnostics for Pi's native prompt-cache warming (Pi 0.86+, `cacheWarming`
@@ -123,6 +124,12 @@ export type CacheWarmingDiagnosisInput = {
   tier: "short" | "long";
   /** Whether the extension keeps warming running for zero-price models. */
   zeroPriceWarming?: boolean;
+  /**
+   * Append near-miss models.json key hints (issue #30). Default true;
+   * `/cache-optimizer doctor` passes false because it lists every typo in its
+   * own section.
+   */
+  typoHints?: boolean;
 };
 
 export type CacheWarmingDiagnosis = {
@@ -168,6 +175,10 @@ export function buildCacheWarmingDiagnosis(model: PiModel, input: CacheWarmingDi
     }
     if (input.tier === "long" && suggested.long === undefined) {
       lines.push("  Only add a long lifetime your provider documents; use the conservative end of any range.");
+    }
+    // A misspelled promptCache/modelOverrides key is accepted and ignored by Pi (issue #30).
+    if (input.typoHints !== false) {
+      for (const hint of buildModelsJsonTypoHintLines(model.provider, model.id)) lines.push(`  ${hint}`);
     }
   } else {
     lines.push(`- promptCache.${input.tier}: ${formatSeconds(ttl)}`);

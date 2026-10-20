@@ -1,6 +1,6 @@
 import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type PiModel, isNonEmptyString } from "./common.ts";
-import { buildDeepSeekCompatWarningText, buildOpenAIProxyCompatWarningText, describeMissingCacheCompatForModel, describeMissingOpenAICompatibleProxyCompat, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
+import { appendModelsJsonTypoHints, buildDeepSeekCompatWarningText, buildOpenAIProxyCompatWarningText, describeMissingCacheCompatForModel, describeMissingOpenAICompatibleProxyCompat, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, hasAnyTokenContaining } from "./model-detect.ts";
 import { ALEPH_MODEL_PATTERN, ARCTIC_MODEL_PATTERN, AYA_MODEL_PATTERN, DOUBAO_SEED_PATTERN, MIMO_MODEL_PATTERN, MPT_MODEL_PATTERN, NOVA_MODEL_PATTERN, ORION_MODEL_PATTERN, PHI_MODEL_PATTERN, PPLX_MODEL_PATTERN, XAI_MODEL_PATTERN, YI_MODEL_PATTERN, getAssistantRecord, getCompat, isAssistantMessage, isClaudeLikeAssistantMessage, isClaudeLikeModel, isDeepSeekLikeAssistantMessage, isDeepSeekLikeModel, isGeminiLikeAssistantMessage, isGeminiLikeModel, isNativeVirtualModel, isOpenAICompatibleApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, modelKey } from "./model-identity.ts";
 import { firstNonEmptyString, getRoutingRegistry, isRouterModel, resolveActiveRouteSnapshot } from "./routing.ts";
@@ -191,10 +191,12 @@ export const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       if (!isClaudeLikeModel(model) || !isOpenAICompatibleApi(model.api) || isPiBuiltInLlamaCppModel(model)) return undefined;
       if (getCompat(model).cacheControlFormat === "anthropic") return undefined;
 
-      return (
+      const lines = [
         `💡 Cache optimizer: ${modelKey(model)} looks Claude/Anthropic-like but OpenAI-compatible compat lacks cacheControlFormat: "anthropic". ` +
-        "Pi may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag."
-      );
+        "Pi may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag.",
+      ];
+      appendModelsJsonTypoHints(lines, model.provider, model.id);
+      return lines.join("\n");
     },
   },
   {

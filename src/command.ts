@@ -14,6 +14,7 @@ import { locateModelOverrideInJsonc, parseJsonc } from "./jsonc.ts";
 import { invalidateModelsConfigCache, isValidModelsConfigForEffectiveCompat, modelKey } from "./model-identity.ts";
 import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeModelOverrideInsertion, composeProviderAffinityInsertion, createBaseUrlFixReceipt, createModelsJsonFixReceipt, createPromptCacheFixReceipt, formatCompatKeysForInsertion, formatMissingEntryManualSnippet, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./models-json-fix.ts";
 import { MODELS_JSON_PATH } from "./paths.ts";
+import { buildModelsJsonLintDoctorLines, buildModelsJsonTypoHintLines } from "./models-json-lint.ts";
 import { applyPromptCacheKeyConfigFix, isActionablePromptCacheKeyConfigReceipt, readPromptCacheKeyConfigReceiptSnapshot, rollbackPromptCacheKeyConfig } from "./prompt-cache-key-config.ts";
 import { getEffectiveCompatValueSource, isPromptCacheKeyOmittedForModel } from "./request-payload.ts";
 import { describeNativeVirtualRouteNote, resolveRouteModel } from "./routing.ts";
@@ -120,10 +121,12 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
             mode: runtime.getCacheWarmingMode(),
             tier: process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? "long" : "short",
             zeroPriceWarming: isZeroPriceWarmingEnabled(),
+            typoHints: false,
           }).lines
           : [];
         const kimiBaseUrlLines = buildKimiBaseUrlDoctorLines(model);
-        const fullDiagnosis = [routeNote, diagnosis, kimiBaseUrlLines.length > 0 ? kimiBaseUrlLines.join("\n") : undefined, describeSkillCompressionOutcome(), describePromptCacheRetentionDecision(getLastPromptCacheRetentionDecision()), ...warmingLines, ...lowHitLines].filter((line) => line !== undefined).join("\n");
+        const modelsJsonLintLines = buildModelsJsonLintDoctorLines();
+        const fullDiagnosis = [routeNote, diagnosis, kimiBaseUrlLines.length > 0 ? kimiBaseUrlLines.join("\n") : undefined, modelsJsonLintLines.length > 0 ? modelsJsonLintLines.join("\n") : undefined, describeSkillCompressionOutcome(), describePromptCacheRetentionDecision(getLastPromptCacheRetentionDecision()), ...warmingLines, ...lowHitLines].filter((line) => line !== undefined).join("\n");
         cmdCtx.ui.notify(fullDiagnosis, "info");
       } else if (subcommand === "stats") {
         const aggregate = await refreshShardAggregate();
@@ -456,6 +459,9 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
           cmdCtx.ui.notify(`✅ Nothing to fix for "${key}". Compat already configured.`, "info");
           return;
         }
+        // Issue #30: a misspelled key next to the target is silently ignored by
+        // Pi. Point it out in every fix output; never rename it automatically.
+        const typoNoteLines = buildFixTypoNoteLines(suggestion.providerLabel, suggestion.modelId);
 
         if (!cmdCtx.hasUI) {
           // No UI — refuse to write, show manual guidance instead.
@@ -507,6 +513,8 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
           if (compatResult) {
             manualLines.push("", compatResult);
           }
+          // buildCompatDiagnosis already names the typos; avoid repeating them.
+          manualLines.push(...typoNoteLines.filter((line) => line === "" || !compatResult?.includes(line)));
           cmdCtx.ui.notify(manualLines.join("\n"), "warning");
           return;
         }
@@ -568,6 +576,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
               `⚠️ This affects all models using this provider across all sessions; model-level overrides remain authoritative.`,
               `A timestamped backup will be written to: ${backupPath}`,
               "Run /reload or restart Pi for the change to take effect.",
+              ...typoNoteLines,
               "Apply these changes?",
             ].join("\n"));
             if (!confirmed) {
@@ -655,7 +664,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
                   "prompt_cache_retention parameter to this provider.",
                 );
               }
-              previewLines.push("", `Apply these changes?`);
+              previewLines.push(...typoNoteLines, "", `Apply these changes?`);
               const confirmed = await cmdCtx.ui.confirm(
                 repairsExistingOverride ? "Cache Optimizer — Fix (model override)" : "Cache Optimizer — Fix (new override)",
                 previewLines.join("\n"),
@@ -751,7 +760,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
               "Add the following modelOverrides entry (keep existing auth):",
             );
           }
-          adviceLines.push("", snippet, "", "Then save and run /reload.");
+          adviceLines.push("", snippet, "", "Then save and run /reload.", ...typoNoteLines);
           cmdCtx.ui.notify(adviceLines.join("\n"), "warning");
           return;
         }
@@ -872,7 +881,7 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
             "prompt_cache_retention parameter to this provider.",
           );
         }
-        previewLines.push("", `Apply these changes?`);
+        previewLines.push(...typoNoteLines, "", `Apply these changes?`);
 
         const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Fix", previewLines.join("\n"));
         if (!confirmed) {
@@ -1042,6 +1051,20 @@ export function createCacheOptimizerCommandHandler(runtime: CommandRuntime) {
   }
 }
 
+/**
+ * Fix-output note for near-miss models.json keys on the target provider/model
+ * (issue #30). Hint only: the fix never renames or removes a user's key.
+ */
+export function buildFixTypoNoteLines(providerLabel: string, modelId: string): string[] {
+  const hints = buildModelsJsonTypoHintLines(providerLabel, modelId);
+  if (hints.length === 0) return [];
+  return [
+    "",
+    ...hints,
+    "   This fix does not rename or remove misspelled keys; correct or delete them by hand.",
+  ];
+}
+
 function declaredPromptCacheTier(model: PiModel, tier: "short" | "long"): number | undefined {
   const value = asRecord(asRecord(model as unknown)?.promptCache)?.[tier];
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
@@ -1061,8 +1084,9 @@ async function runPromptCacheFix(cmdCtx: ExtensionCommandContext, model: PiModel
     return;
   }
   const choice = choosePromptCacheLifetimes(model, tier);
+  const typoNoteLines = buildFixTypoNoteLines(model.provider, model.id);
   if ("error" in choice) {
-    cmdCtx.ui.notify(`ℹ️ ${choice.error} No changes were made.`, "warning");
+    cmdCtx.ui.notify([`ℹ️ ${choice.error} No changes were made.`, ...typoNoteLines].join("\n"), "warning");
     return;
   }
   const snippet = `"promptCache": ${JSON.stringify(choice.promptCache)}`;
@@ -1072,6 +1096,7 @@ async function runPromptCacheFix(cmdCtx: ExtensionCommandContext, model: PiModel
     `Add this to the model entry in ${getModelsJsonDisplayPath()} (custom models) or under`,
     `providers["${model.provider}"].modelOverrides["${model.id}"] (built-in models), then run /reload:`,
     `  ${snippet}`,
+    ...typoNoteLines,
   ].join("\n");
 
   if (!cmdCtx.hasUI) {
@@ -1109,6 +1134,7 @@ async function runPromptCacheFix(cmdCtx: ExtensionCommandContext, model: PiModel
       ? `⚠️ This replaces the rollback receipt of the earlier fix for ${pendingReceipt.provider}/${pendingReceipt.modelId}; its backup ${pendingReceipt.backupFile} stays on disk.`
       : "",
     "Run /reload or restart Pi for the change to take effect.",
+    ...typoNoteLines,
     "",
     "Apply this change?",
   ].filter((line, index, lines) => line !== "" || lines[index - 1] !== "").join("\n"));

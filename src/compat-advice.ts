@@ -1,6 +1,7 @@
 import { type PiModel, isNonEmptyString, lower } from "./common.ts";
 import { isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./model-detect.ts";
 import { getCompat, isDeepSeekLikeModel, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isOpenAICompatibleProxyApi, isThirdPartyOpenAIProxyEndpoint, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, isRoutedFallbackModel } from "./model-identity.ts";
+import { buildModelsJsonTypoHintLines } from "./models-json-lint.ts";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 
@@ -123,6 +124,11 @@ export function buildSafeOpenAIProxyCompatSuggestion(missing: string[]): Record<
 export type CompatAdvicePlacement = {
   providerLabel?: string;
   modelId?: string;
+  /**
+   * Append near-miss models.json key hints for this provider/model (issue #30).
+   * Default true; `/cache-optimizer doctor` lists every typo in its own section.
+   */
+  typoHints?: boolean;
 };
 
 export function buildProviderCompatOverride(providerLabel: string, compat: Record<string, unknown>): Record<string, unknown> {
@@ -150,6 +156,25 @@ export function buildModelCompatOverride(providerLabel: string, modelId: string,
 }
 
 export function appendCredentialSafeProviderGuidance(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
+  appendProviderGuidanceBody(lines, placement, compatSuggestion);
+  if (placement.providerLabel && placement.typoHints !== false) {
+    appendModelsJsonTypoHints(lines, placement.providerLabel, placement.modelId);
+  }
+}
+
+/**
+ * Explain why a compat key the user believes they set is still missing: Pi
+ * accepts and ignores unknown keys, so `model0verrides` or
+ * `sendSessionAfinityHeaders` never takes effect. Hint only; never throws.
+ */
+export function appendModelsJsonTypoHints(lines: string[], providerLabel: string | undefined, modelId?: string): void {
+  const hints = buildModelsJsonTypoHintLines(providerLabel, modelId);
+  if (hints.length === 0) return;
+  lines.push("");
+  lines.push(...hints);
+}
+
+function appendProviderGuidanceBody(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
   const providerLabel = placement.providerLabel;
   if (!providerLabel) return;
 

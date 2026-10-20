@@ -450,12 +450,12 @@ export function buildDoctorDiagnosis(model: PiModel, options: { promptCacheReten
     const modelsJsonPath = getModelsJsonDisplayPath();
     lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (same level as baseUrl/api/apiKey/models).`);
     if (adaptiveThinkingApplicable) {
-      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
     } else if (deepSeekCompatApplicable) {
-      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
-      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
+      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     }
   } else if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {

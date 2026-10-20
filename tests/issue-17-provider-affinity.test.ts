@@ -241,6 +241,37 @@ test("observed affinity-header 403 stays model-scoped", async () => {
   assert.equal(changed.providers.proxy.modelOverrides.sibling, undefined);
 });
 
+test("issue #30: misspelled provider compat key is named in the affinity warning and fix preview", async () => {
+  const path = join(agentDir, "models.json");
+  const original = JSON.stringify({
+    providers: {
+      proxy: {
+        api: "openai-completions",
+        baseUrl: "https://proxy.example/v1",
+        compat: { sendSessionAfinityHeaders: true },
+      },
+    },
+  });
+  await writeFile(path, original);
+  const hint = '⚠️ providers["proxy"].compat.sendSessionAfinityHeaders is not a known Pi 1.3 key and looks like a typo of "sendSessionAffinityHeaders"; Pi ignores unknown keys, so it most likely has no effect.';
+  const { hooks, commands, context, notifications, previews } = setup();
+  const current = model("mimo-typo");
+  await hooks.get("model_select")?.({ model: current }, context(current));
+  const warning = notifications.find((text) => text.includes("merged compat lacks"));
+  assert.ok(warning?.includes(hint));
+
+  await commands.get("cache-optimizer")!.handler("fix", context(current, false));
+  assert.ok(previews.at(-1)?.includes(hint));
+  assert.equal(await readFile(path, "utf8"), original);
+
+  // An approved fix adds the correct key and leaves the misspelled one untouched.
+  await commands.get("cache-optimizer")!.handler("fix", context(current, true));
+  const written = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(written.providers.proxy.compat.sendSessionAfinityHeaders, true);
+  assert.equal(written.providers.proxy.compat.sendSessionAffinityHeaders, true);
+  await rm(join(agentDir, "pi-cache-optimizer-fix-receipt.json"), { force: true });
+});
+
 test("ambiguous or malformed provider compat fails closed", () => {
   const internals = extension.__internals_for_tests;
   assert.equal(

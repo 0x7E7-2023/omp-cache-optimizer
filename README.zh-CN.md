@@ -226,6 +226,7 @@ Pi 0.84.1 还修复了内置 Fireworks 渠道对拒绝 `prompt_cache_retention` 
 - 不要把 `supportsPromptCacheKey` 加入 `models.json`：Pi 1.0.3 没有定义这个 compat 字段。请使用 `/cache-optimizer fix prompt-cache-key` 在扩展自有配置中保存精确 provider/model 的 omit 规则；它会移除两种 key 写法，包括 Pi 提供的 key。
 - 如果出现 `400 Unsupported parameter: prompt_cache_retention`，请为该渠道移除 / 避免 `supportsLongCacheRetention`；如支持，可保留 `sendSessionAffinityHeaders`。扩展会从响应头或最终 assistant error message 中识别这条明确错误，并在当前进程的后续请求中移除该参数。
 - 使用 `/cache-optimizer compat` 或 `/cache-optimizer doctor` 查看当前模型的具体建议。
+- 如果修改 `models.json` 后 compat 警告仍反复出现，请检查拼写：Pi 会忽略未知 key，`model0verrides`、`sendSessionAfinityHeaders` 这类拼错的 key 很可能不会生效。警告、`doctor` 和 `fix` 会指出疑似拼错的已知 Pi 1.3 key（仅提示，不会自动改名）。
 - DeepSeek 模型名只用于选择 `DS cache` adapter，不能证明 reasoning wire protocol。缺少或使用非 DeepSeek format 时仍保留通用缓存 / 路由建议；只有 effective `compat.thinkingFormat: "deepseek"` 被明确配置时，才显示 DeepSeek replay 建议，且不会把 `thinkingFormat` 列为缺失修复项。
 - 不要因为模型 id 含有 `deepseek` 就添加 `thinkingFormat: "deepseek"`；catalog 中也存在 `openai`、`qwen`、`openrouter`、`together` 或没有显式 format 的情况。
 - 本扩展的 `doctor` 和 `compat` 命令只给建议，不会修改 `models.json`。
