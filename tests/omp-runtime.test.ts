@@ -809,6 +809,25 @@ describe("message_end counting", () => {
     ]), 2);
   });
 
+  test("user and tool-result messages are neither counted nor sampled as missing usage", async () => {
+    await withExtension(async (ext) => {
+      const notices: string[] = [];
+      const ctx = makeContext({ notices });
+      await startSession(ext, ctx);
+      // OMP 对用户消息和工具结果也发 message_end；它们没有 provider usage。
+      await endMessage(ext, { role: "user", content: [{ type: "text", text: "hi" }] }, ctx);
+      await endMessage(ext, assistantMessage(), ctx);
+      await endMessage(ext, { role: "toolResult", toolCallId: "t1", toolName: "read", content: [], isError: false }, ctx);
+      await ext.I.statsRefreshSettled();
+      await ext.commands.get("cache-optimizer")!.handler("stats", ctx);
+      const stats = notices.at(-1) ?? "";
+      assert.match(stats, /最近 1\/10 次：1\/1 次命中/, stats);
+      assert.doesNotMatch(stats, /usage 缺失/, stats);
+      await ext.on("session_shutdown")({}, ctx);
+      assert.equal(await totalRequestsOnDisk(ext), 1);
+    });
+  });
+
   test("modelFromAssistantMessage recognizes OMP's upstreamModel", async () => {
     await withExtension(async (ext) => {
       const fallback = makeModel({ id: "router-alias" });

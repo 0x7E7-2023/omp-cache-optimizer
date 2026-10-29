@@ -2136,6 +2136,12 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Only a finalized assistant message carries provider usage. OMP also
+    // emits message_end for user and tool-result messages; recording those
+    // would add a usage-less sample per turn and make every model look like
+    // its proxy drops usage fields.
+    if (msgRecord?.role !== "assistant") return;
+
     const currentSelectionIsVirtual = isVirtualRoutingModel(ctx.model, ctx);
     const requestSelectionIsVirtual = requestCorrelationForMessage.virtualSelection ?? currentSelectionIsVirtual;
     const directSelection = !requestSelectionIsVirtual;
