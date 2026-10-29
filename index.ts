@@ -520,8 +520,18 @@ export default function (pi: ExtensionAPI) {
   }
   messageEndSettledForTests.add(drainPendingMessageEnds);
 
+  /**
+   * OMP keeps one extension instance across /new, /resume, /fork and branch
+   * transitions, and background refreshes hold contexts whose session manager
+   * already reports the next session. Adopt a different session id only on
+   * the first sync or during an explicit transition (startSessionStats), so a
+   * late refresh can never move the counters before the outgoing shard is
+   * retired; turn_start catches a transition no event announced.
+   */
+  let adoptNextSessionId = false;
   function syncSessionHash(ctx: Pick<ExtensionContext, "sessionManager">): void {
     const sid = ctx.sessionManager.getSessionId();
+    if (currentSessionHashSet && sid !== currentSessionId && !adoptNextSessionId) return;
     if (sid && (sid !== currentSessionId || !currentSessionHashSet)) {
       currentSessionId = sid;
       currentSessionHash = hashSessionId(sid);
@@ -1621,7 +1631,12 @@ export default function (pi: ExtensionAPI) {
     latestStatsCtx = ctx;
     const tui = ctx.mode === "tui" && !isSubagentContext(ctx);
     if (sessionStartsHandled++ > 0) retireShardForSessionStart();
-    resetStatsForSessionStart(reason, ctx);
+    adoptNextSessionId = true;
+    try {
+      resetStatsForSessionStart(reason, ctx);
+    } finally {
+      adoptNextSessionId = false;
+    }
     lastModelKeyForStatus = undefined;
     const previousRestore = statsRestorePromise;
     statsRestorePromise = previousRestore
