@@ -1,11 +1,9 @@
 {
-  "name": "omp-cache-optimizer",
-  "version": "1.2.3",
-  "description": "Improve OMP prompt/KV cache hit rates with safer prompt churn cleanup, proxy compat warnings, and footer cache stats.",
+  "name": "pi-cache-optimizer",
+  "version": "2.10.4",
+  "description": "Improve Pi prompt/KV cache hit rates with stable prompts, OpenAI-compatible cache keys, proxy compat warnings, and footer cache stats.",
   "keywords": [
-    "omp-package",
-    "omp",
-    "oh-my-pi",
+    "pi-package",
     "deepseek",
     "openai",
     "claude",
@@ -15,30 +13,41 @@
     "prompt-cache",
     "optimizer"
   ],
-  "author": "n1netynine99",
+  "author": "freescheme",
   "license": "MIT",
   "files": [
-    "index.ts"
+    "index.ts",
+    "src"
   ],
-  "omp": {
-    "extensions": [
-      "./index.ts"
-    ],
-    "image": "https://img.shields.io/badge/OMP-Cache%20Optimizer-4A90D9"
-  },
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://img.shields.io/badge/Pi-Cache%20Optimizer-4A90D9"
+  },
+  "imports": {
+    "#extension": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --import jiti/register --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit --pretty false",
+    "check:diff": "git diff --check",
+    "check:pack": "node scripts/check-pack.mjs",
+    "check": "npm run typecheck && npm test && npm run check:diff && npm run check:modules && npm run check:pack",
+    "check:modules": "node scripts/check-module-graph.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.3.0",
+    "@earendil-works/pi-server": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "jiti": "^2.7.0",
+    "typescript": "^5.8.3"
   },
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": ">=17.0.0 <18.0.0"
+    "@earendil-works/pi-coding-agent": ">=0.82.0"
   },
   "repository": {
-    "url": "git+https://github.com/EF-FlowCode/omp-cache-optimizer.git"
-  },
-  "homepage": "https://github.com/EF-FlowCode/omp-cache-optimizer",
-  "bugs": {
-    "url": "https://github.com/EF-FlowCode/omp-cache-optimizer/issues"
+    "type": "git",
+    "url": "git+https://github.com/jiangge/pi-cache-optimizer.git"
   }
 }
