@@ -2,10 +2,10 @@ import { type CacheProviderAdapter } from "./adapters.ts";
 import { type PiModel, type UnknownRecord, asRecord, isNonEmptyString, lower } from "./common.ts";
 import { type CompatAdvicePlacement, appendDeepSeekCompatAdviceLines, appendOpenAIProxyCompatAdviceLines, buildDeepSeekCompatSuggestion, buildSafeOpenAIProxyCompatSuggestion, describeMissingCacheCompatForModel, getModelsYmlDisplayPath, isAdaptiveThinkingCompatApplicable, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { type FixSuggestion } from "./fix-types.ts";
-import { getCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, modelKey } from "./model-identity.ts";
+import { getCompat, getExplicitCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, modelKey } from "./model-identity.ts";
 import { type CacheUsageSample, type PromptDiagnosticSample, formatRecentTrendSummary } from "./stats-report.ts";
 import { type CacheStats, emptyCacheStats } from "./stats-store.ts";
-import { snapshotBaseUrlForDiagnostics } from "./request-state.ts";
+import { snapshotBaseUrlForDiagnostics, snapshotCompatForDiagnostics } from "./request-state.ts";
 
 /** OMP divergence：OMP 自动处理 adaptive thinking，没有可建议的 compat（保留以对齐上游调用点）。 */
 export function buildAdaptiveThinkingCompatSuggestion(_missing: string[]): Record<string, unknown> {
@@ -313,8 +313,11 @@ export function buildDoctorDiagnosis(model: PiModel, options: { promptCacheReten
   const endpoint = snapshotBaseUrlForDiagnostics(model.baseUrl);
   lines.push(`Base URL：${endpoint || (isNonEmptyString(model.baseUrl) ? "（不可用）" : "（默认）")}`);
 
-  const compat = getCompat(model);
-  lines.push(`Compat：  ${JSON.stringify(compat)}`);
+  // OMP's resolved compat has dozens of transport fields; show only the
+  // cache-relevant ones, plus what models.yml sets explicitly.
+  lines.push(`Compat（缓存相关，OMP 解析后）：${JSON.stringify(snapshotCompatForDiagnostics(model))}`);
+  const explicitCompat = getExplicitCompat(model);
+  lines.push(`Compat（models.yml 中显式设置）：${Object.keys(explicitCompat).length > 0 ? JSON.stringify(explicitCompat) : "（无）"}`);
 
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
