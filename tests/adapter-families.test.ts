@@ -115,7 +115,7 @@ describe("model family adapter selection", () => {
     assert.equal(internals.selectAdapterForModel(model("gemini-2.5"))?.label, "Gemini cache");
   });
 
-  test("every family adapter reads OpenAI-shaped usage and shares the proxy compat warning", () => {
+  test("every family adapter reads OpenAI-shaped usage", () => {
     const usageOf = (usage: Record<string, number>, rawUsage?: Record<string, unknown>) =>
       ({ role: "assistant", model: "x", usage: { output: 5, cacheRead: 0, cacheWrite: 0, ...usage }, ...(rawUsage ? { rawUsage } : {}) });
     for (const name of ["qwen3-coder", "rwkv-world", "aya-expanse-8b", "yi-lightning"]) {
@@ -127,8 +127,8 @@ describe("model family adapter selection", () => {
         { cacheRead: 40, cacheWrite: 10, totalInput: 150 },
         name,
       );
-      // A third-party OpenAI-compatible endpoint without cache/affinity compat flags gets the proxy warning.
-      assert.match(adapter.warningText!(model(name)) ?? "", /session|affinity|compat/i, name);
+      // OMP has no session-affinity compat flags, so a third-party OpenAI-compatible endpoint gets no proxy warning.
+      assert.equal(adapter.warningText!(model(name)) ?? "", "", name);
     }
   });
 });

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -280,64 +279,6 @@ describe("#7: filesystems without hard links", () => {
 });
 
 describe("2.9.1 #4: migrating from a 2.9.0 archive.json", () => {
-  async function load290(): Promise<{ I: any; cleanup: () => Promise<void> } | undefined> {
-    let files: Record<string, string>;
-    try {
-      files = Object.fromEntries(["common.ts", "paths.ts", "stats-store.ts", "stats-archive.ts"].map((name) => [
-        name,
-        execFileSync("git", ["show", `v2.9.0:src/${name}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }),
-      ]));
-    } catch {
-      return undefined;
-    }
-    const root = await mkdtemp(join(tmpdir(), "pi-cache-optimizer-2.9.0-"));
-    await mkdir(join(root, "src"));
-    for (const [name, text] of Object.entries(files)) await writeFile(join(root, "src", name), text);
-    await symlink(join(process.cwd(), "node_modules"), join(root, "node_modules"), "dir");
-    const jiti = createJiti(join(root, "loader.ts"), { interopDefault: false, moduleCache: false });
-    const archive = await jiti.import<any>(join(root, "src", "stats-archive.ts"));
-    const store = await jiti.import<any>(join(root, "src", "stats-store.ts"));
-    return { I: { ...store, ...archive }, cleanup: () => rm(root, { recursive: true, force: true }) };
-  }
-
-  test("a 2.9.0 republish while the migrating pass was suspended is migrated by the next pass, not set aside", async (t) => {
-    await withAgentDir(async () => {
-      const old = await load290();
-      if (!old) {
-        t.skip("git tag v2.9.0 is not available");
-        return;
-      }
-      try {
-        const I = await load("m4-stalled");
-        const now = Date.now();
-        await writeClosedShard(I, now - 6 * DAY, 3);
-        await old.I.compactStatsShardsV7(now); // 2.9.0's archive.json: 3
-        await writeClosedShard(I, now - 5 * DAY, 4);
-        const { value: stalled, warnings } = await quietly(() => I.compactStatsShardsV7(now, I.SHARD_FILES_DIR, I.SHARD_ARCHIVE_PATH, {
-          // Every publish check passed, then this process slept past the
-          // stale-lock window: a 2.9.0 process took over, archived a shard
-          // this pass never saw, and deleted the originals.
-          beforeCommit: async () => {
-            await writeClosedShard(I, now - 4 * DAY, 5);
-            const result = await old.I.compactStatsShardsV7(now);
-            assert.equal(result.absorbed, 2);
-          },
-        }));
-        assert.equal(stalled.skippedConcurrent, true, "the changed archive.json is noticed after the stall");
-        assert.equal(stalled.removed, 0);
-        assert.deepEqual(warnings, []);
-        assert.equal((await lstat(I.SHARD_ARCHIVE_PATH)).isFile(), true, "2.9.0's file is put back");
-        assert.equal(await sessionRequests(await load("m4-stalled-reader")), 12);
-        const migrated = await I.compactStatsShardsV7(now);
-        assert.equal(migrated.generation, 1);
-        assert.equal(await sessionRequests(await load("m4-stalled-reader-2")), 12, "nothing 2.9.0 archived is lost");
-        assert.ok(!(await readdir(archiveDir(I))).some((name) => name.startsWith("archive.legacy-") || name.startsWith("archive.migrating-")));
-      } finally {
-        await old.cleanup();
-      }
-    });
-  });
-
   test("moving archive.json aside waits out a scanner holding it for over a second", async () => {
     await withAgentDir(async () => {
       const I = await load("m4-budget");

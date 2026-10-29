@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import extension, { __internals_for_tests as internals } from "#extension";
 import { derivePromptCacheKey } from "../src/request-payload.ts";
@@ -34,7 +34,7 @@ function model(overrides: Partial<PiModel> = {}): PiModel {
     contextWindow: 128_000,
     maxTokens: 8192,
     ...overrides,
-  };
+  } as unknown as PiModel;
 }
 
 function functionCompletionTool(name: string, extra: Record<string, unknown> = {}) {
@@ -222,7 +222,7 @@ describe("deterministic tool ordering", () => {
     const result = request({ payload }, context) as typeof payload;
     assert.deepEqual(result.tools.map((tool) => tool.name), ["z", "a"]);
     assert.equal(result.tools[1].cache_control.ttl, undefined);
-    // Pi's payload object is never mutated in place.
+    // The host's payload object is never mutated in place.
     assert.equal(payload.tools[1].cache_control.ttl, "1h");
   });
 
@@ -243,7 +243,7 @@ describe("deterministic tool ordering", () => {
       messages: [],
     };
     const context = {
-      model: model({ compat: { supportsLongCacheRetention: true } }),
+      model: model({ compat: { supportsLongCacheRetention: true } as any }),
       sessionManager: { getSessionId: () => "tool-order-session" },
       modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
     };
@@ -255,8 +255,10 @@ describe("deterministic tool ordering", () => {
     const responseResult = request({ payload }, {
       ...context,
       model: model({ api: "openai-responses", id: "gpt-5.5-responses" }),
-    }) as typeof payload & { prompt_cache_key?: string } | undefined;
-    assert.equal(responseResult, undefined);
+    }) as typeof payload & { prompt_cache_key?: string };
+    // OMP writes the project-level stable prompt_cache_key for Responses-family APIs; the tools stay untouched.
+    assert.match(responseResult.prompt_cache_key ?? "", /^omp-cache-v1-[0-9a-f]{48}$/);
+    assert.deepEqual(responseResult.tools.map((tool) => tool.function.name), ["z", "a"]);
     assert.deepEqual(payload.tools.map((tool) => tool.function.name), ["z", "a"]);
 
     const googleSignal = new AbortController().signal;

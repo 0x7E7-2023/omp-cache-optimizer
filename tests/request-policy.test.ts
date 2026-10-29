@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
-import { createJiti } from "jiti";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import extension, { __internals_for_tests as internals } from "#extension";
 import { derivePromptCacheKey, withAnthropicCacheTtlRepair, withoutPromptCacheRetention } from "../src/request-payload.ts";
@@ -30,14 +29,14 @@ function model(overrides: Partial<PiModel> = {}): PiModel {
     name: "Policy model",
     api: "openai-completions",
     baseUrl: "https://proxy.example/v1",
-    compat: {},
+    compat: {} as any,
     reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128_000,
     maxTokens: 8192,
     ...overrides,
-  };
+  } as unknown as PiModel;
 }
 
 function requestHook(): Handler {
@@ -70,10 +69,12 @@ describe("prompt_cache_retention gate", () => {
     );
   });
 
-  test("only a pre-existing PI_CACHE_RETENTION=long counts as the user's own request", () => {
-    assert.equal(userRequestedLongCacheRetention({ wasSet: true, value: "long" }), true);
-    assert.equal(userRequestedLongCacheRetention({ wasSet: true, value: "short" }), false);
-    assert.equal(userRequestedLongCacheRetention({ wasSet: false }), false);
+  test("only a pre-existing OMP_/PI_CACHE_RETENTION=long counts as the user's own request", () => {
+    assert.equal(userRequestedLongCacheRetention({ ompWasSet: true, ompValue: "long", piWasSet: false }), true);
+    assert.equal(userRequestedLongCacheRetention({ ompWasSet: false, piWasSet: true, piValue: "long" }), true);
+    assert.equal(userRequestedLongCacheRetention({ ompWasSet: true, ompValue: "short", piWasSet: true, piValue: "long" }), false);
+    assert.equal(userRequestedLongCacheRetention({ ompWasSet: true, ompValue: "short", piWasSet: false }), false);
+    assert.equal(userRequestedLongCacheRetention({ ompWasSet: false, piWasSet: false }), false);
   });
 
   test("strips the optimizer-injected field on unverified endpoints without mutating Pi's payload", async () => {
@@ -96,7 +97,7 @@ describe("prompt_cache_retention gate", () => {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
       internals.setRuntimeOptimizerEnabled(true);
       const payload = { messages: [], prompt_cache_retention: "24h" };
-      const optedIn = model({ compat: { supportsLongCacheRetention: true } as any });
+      const optedIn = model({ compat: { supportsLongPromptCacheRetention: true } as any });
       const result = (requestHook()({ payload }, context(optedIn)) ?? payload) as Record<string, unknown>;
       assert.equal(result.prompt_cache_retention, "24h");
     } finally {
@@ -104,27 +105,23 @@ describe("prompt_cache_retention gate", () => {
     }
   });
 
-  test("an explicit models.json false beats a runtime true", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-policy-"));
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-        providers: { "policy-proxy": { modelOverrides: { "policy-model": { compat: { supportsLongCacheRetention: false } } } } },
-      }));
-      // MODELS_JSON_PATH is resolved at module load, so load a fresh copy.
-      const jiti = createJiti(join(process.cwd(), "tests", "request-policy.test.ts"), { interopDefault: false, moduleCache: false });
-      const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      const handlers = new Map<string, Handler>();
-      fresh.default({ on(name: string, handler: Handler) { handlers.set(name, handler); }, registerCommand() {} } as any);
-      const hook = handlers.get("before_provider_request");
-      assert.ok(hook);
-      const payload = { messages: [], prompt_cache_retention: "24h" };
-      const optedIn = model({ compat: { supportsLongCacheRetention: true } as any });
-      const result = hook({ payload }, context(optedIn)) as Record<string, unknown>;
-      assert.equal("prompt_cache_retention" in result, false);
-    } finally {
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
+  test("runtime compat beats an explicit compatConfig false", () => {
+    internals.setRuntimeOptimizerEnabled(true);
+    const payload = { messages: [], prompt_cache_retention: "24h" };
+    const optedIn = model({
+      compatConfig: { supportsLongPromptCacheRetention: false },
+      compat: { supportsLongPromptCacheRetention: true },
+    } as any);
+    const result = (requestHook()({ payload }, context(optedIn)) ?? payload) as Record<string, unknown>;
+    assert.equal(result.prompt_cache_retention, "24h");
+  });
+
+  test("an explicit compatConfig false without a runtime override strips the field", () => {
+    internals.setRuntimeOptimizerEnabled(true);
+    const payload = { messages: [], prompt_cache_retention: "24h" };
+    const optedOut = model({ compatConfig: { supportsLongPromptCacheRetention: false } } as any);
+    const result = requestHook()({ payload }, context(optedOut)) as Record<string, unknown>;
+    assert.equal("prompt_cache_retention" in result, false);
   });
 
   test("withoutPromptCacheRetention returns a copy or undefined", () => {
@@ -139,7 +136,7 @@ describe("session identifiers sent upstream", () => {
   test("derivePromptCacheKey is stable, opaque, and within OpenAI's 64-character limit", () => {
     const key = derivePromptCacheKey("  019a-session-id  ");
     assert.equal(key, derivePromptCacheKey("019a-session-id"));
-    assert.match(key ?? "", /^pi-[0-9a-f]{32}$/);
+    assert.match(key ?? "", /^omp-[0-9a-f]{32}$/);
     assert.ok((key ?? "").length <= 64);
     assert.equal(key?.includes("019a-session-id"), false);
     assert.notEqual(key, derivePromptCacheKey("another-session"));

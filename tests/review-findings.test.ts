@@ -1,31 +1,30 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { __internals_for_tests as internals } from "#extension";
 
 describe("footer status separation and command completion", () => {
-  test("prefixes every extension-owned footer status exactly once", () => {
+  test("leaves footer status text unchanged (OMP adds its own separator)", () => {
+    // OMP 状态栏自己加分隔点，prefixFooterStatus 是恒等函数。
     assert.equal(
-      internals.prefixFooterStatus("OpenAI cache 0/0·0M/0M 0.0%"),
-      "· OpenAI cache 0/0·0M/0M 0.0%",
+      internals.prefixFooterStatus("OpenAI Cache | 缓存命中率：0%"),
+      "OpenAI Cache | 缓存命中率：0%",
     );
     assert.equal(
-      internals.prefixFooterStatus("Cache Optimizer disabled · OpenAI cache 0/0·0M/0M 0.0% ⚠️ compat"),
-      "· Cache Optimizer disabled · OpenAI cache 0/0·0M/0M 0.0% ⚠️ compat",
+      internals.prefixFooterStatus("缓存优化已关闭 · OpenAI Cache | 缓存命中率：0% ⚠️ 配置"),
+      "缓存优化已关闭 · OpenAI Cache | 缓存命中率：0% ⚠️ 配置",
     );
-    assert.equal(internals.prefixFooterStatus("· OpenAI cache 0/0·0M/0M 0.0%"), "· OpenAI cache 0/0·0M/0M 0.0%");
     assert.equal(internals.prefixFooterStatus(undefined), undefined);
   });
 
-  test("formats compact footer stats with one-decimal token hit rate", () => {
+  test("formats footer stats in the Chinese fork format", () => {
     assert.equal(
       internals.formatCacheStats(
-        { label: "OpenAI cache", showCacheWrite: false } as any,
+        { label: "OpenAI Cache", showCacheWrite: false } as any,
         {
           day: "2026-08-08",
           totalRequests: 234,
@@ -35,11 +34,11 @@ describe("footer status separation and command completion", () => {
           totalInputTokens: 56_100_000,
         },
       ),
-      "OpenAI cache 224/234·52.2M/56.1M 93.0%",
+      "OpenAI Cache | 缓存命中率：93% | 缓存请求命中次数：224/234 次 | 缓存token/总输入：52.2M/56.1M",
     );
   });
 
-  test("publishes the ownership prefix through setStatus", async () => {
+  test("publishes the footer status through setStatus", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-footer-status-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
@@ -92,8 +91,8 @@ describe("footer status separation and command completion", () => {
       await sessionStart({ reason: "startup" }, context);
       await freshModule.__internals_for_tests.waitForStatsRestore();
 
-      assert.equal(statuses.at(-1)?.key, "pi-cache-stats");
-      assert.match(statuses.at(-1)?.value ?? "", /^· OpenAI cache /);
+      assert.equal(statuses.at(-1)?.key, "omp-cache-stats");
+      assert.match(statuses.at(-1)?.value ?? "", /^OpenAI Cache \| 缓存命中率：/);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -114,7 +113,7 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config "),
-      ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
+      ["footer-mode", "prompt-rewrite", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats "),
@@ -134,7 +133,7 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("fix p"),
-      [{ value: "fix prompt-cache", label: "prompt-cache" }, { value: "fix prompt-cache-key", label: "prompt-cache-key" }],
+      [{ value: "fix prompt-cache-key", label: "prompt-cache-key" }],
     );
     assert.equal(internals.getCacheOptimizerArgumentCompletions("unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config unknown "), null);
@@ -328,7 +327,7 @@ describe("footer stats modes", () => {
 
   test("persists the command override atomically", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-footer-mode-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
 
     try {
       await internals.writePersistedFooterMode("session", configPath);
@@ -337,7 +336,7 @@ describe("footer stats modes", () => {
         internals.parsePersistedCacheOptimizerConfig(JSON.parse(await readFile(configPath, "utf8"))),
         { version: 1, footerMode: "session" },
       );
-      assert.deepEqual(await readdir(tempDir), ["pi-cache-optimizer-config.json"]);
+      assert.deepEqual(await readdir(tempDir), ["omp-cache-optimizer-config.json"]);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -346,10 +345,10 @@ describe("footer stats modes", () => {
   test("feature settings persist, override env values, and reset without losing unrelated config", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-feature-command-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousVirtualRewrite = process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE;
+    const previousPromptRewrite = process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE;
     try {
       process.env.PI_CODING_AGENT_DIR = tempDir;
-      process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = "0";
+      process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE = "0";
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
       const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
       const commands = new Map<string, any>();
@@ -357,25 +356,25 @@ describe("footer stats modes", () => {
       const command = commands.get("cache-optimizer");
       const notifications: string[] = [];
       const context = { model: undefined, hasUI: false, sessionManager: { getSessionId: () => "feature-session" }, modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] }, ui: { notify: (message: string) => notifications.push(message), setStatus() {} } };
-      const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+      const configPath = join(tempDir, "omp-cache-optimizer-config.json");
 
-      assert.equal(freshModule.__internals_for_tests.featureEnabled("virtualRewrite", "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE", false), false);
-      await command.handler("config virtual-rewrite on", context);
-      assert.equal(freshModule.__internals_for_tests.featureEnabled("virtualRewrite", "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE", false), true);
+      assert.equal(freshModule.__internals_for_tests.featureEnabled("promptRewrite", "OMP_CACHE_OPTIMIZER_PROMPT_REWRITE", false), false);
+      await command.handler("config prompt-rewrite on", context);
+      assert.equal(freshModule.__internals_for_tests.featureEnabled("promptRewrite", "OMP_CACHE_OPTIMIZER_PROMPT_REWRITE", false), true);
       const persisted = JSON.parse(await readFile(configPath, "utf8"));
       assert.equal(persisted.version, 3);
-      assert.equal(persisted.features.virtualRewrite, true);
-      assert.match(notifications.at(-1) ?? "", /virtual-rewrite set to on/);
+      assert.equal(persisted.features.promptRewrite, true);
+      assert.match(notifications.at(-1) ?? "", /prompt-rewrite 已设为 on/);
 
       await command.handler("config", context);
-      assert.match(notifications.at(-1) ?? "", /Persistent feature configuration/);
+      assert.match(notifications.at(-1) ?? "", /持久化特性配置/);
       await command.handler("config reset", context);
       const reset = JSON.parse(await readFile(configPath, "utf8"));
       assert.equal(reset.features, undefined);
-      assert.equal(freshModule.__internals_for_tests.featureEnabled("virtualRewrite", "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE", false), false);
+      assert.equal(freshModule.__internals_for_tests.featureEnabled("promptRewrite", "OMP_CACHE_OPTIMIZER_PROMPT_REWRITE", false), false);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousVirtualRewrite === undefined) delete process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE; else process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = previousVirtualRewrite;
+      if (previousPromptRewrite === undefined) delete process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE; else process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE = previousPromptRewrite;
       await rm(tempDir, { recursive: true, force: true });
     }
   });
@@ -426,12 +425,12 @@ describe("footer stats modes", () => {
           setStatus() {},
         },
       };
-      const configPath = join(tempAgentDir, "pi-cache-optimizer-config.json");
+      const configPath = join(tempAgentDir, "omp-cache-optimizer-config.json");
 
       await command.handler("config footer-mode total", commandContext);
       assert.equal(freshModule.__internals_for_tests.readPersistedFooterMode(configPath), "total");
       assert.equal(freshModule.__internals_for_tests.footerStatsMode(), "total");
-      assert.match(notifications.at(-1)?.message ?? "", /set to total/);
+      assert.match(notifications.at(-1)?.message ?? "", /Footer 模式已设为 total/);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -478,19 +477,19 @@ describe("footer stats modes", () => {
           setStatus() {},
           select: async (title: string, options: string[]) => {
             selectCalls.push(title);
-            if (title === "Cache Optimizer") return options.find((option) => option.startsWith("Footer mode"));
+            if (title === "缓存优化器") return options.find((option) => option.startsWith("Footer 模式"));
             return options.find((option) => option.startsWith("process"));
           },
         },
       };
-      const configPath = join(tempAgentDir, "pi-cache-optimizer-config.json");
+      const configPath = join(tempAgentDir, "omp-cache-optimizer-config.json");
 
       await command.handler("", commandContext);
 
-      assert.deepEqual(selectCalls, ["Cache Optimizer", "Footer cache stats mode"]);
+      assert.deepEqual(selectCalls, ["缓存优化器", "Footer 缓存统计模式"]);
       assert.equal(freshModule.__internals_for_tests.readPersistedFooterMode(configPath), "process");
       assert.equal(freshModule.__internals_for_tests.footerStatsMode(), "process");
-      assert.match(notifications.at(-1) ?? "", /set to process/);
+      assert.match(notifications.at(-1) ?? "", /Footer 模式已设为 process/);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -501,320 +500,72 @@ describe("footer stats modes", () => {
   });
 });
 
-describe("Pi 0.83 adaptive-thinking compatibility", () => {
-  function claudeModel(
-    id: string,
-    compat: Record<string, unknown> = {},
-  ): NonNullable<ExtensionContext["model"]> {
-    return {
-      provider: "anthropic",
-      id,
-      name: `Claude ${id}`,
-      api: "anthropic-messages",
-      baseUrl: "https://api.anthropic.com",
-      compat,
-      reasoning: true,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 200_000,
-      maxTokens: 32_000,
-    };
-  }
-
-  test("reports missing adaptive compat for native Claude Opus 5", () => {
-    const model = claudeModel("claude-opus-5");
-
-    assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), true);
-    assert.deepEqual(
-      internals.describeMissingCacheCompatForModel(model),
-      ["forceAdaptiveThinking"],
-    );
-    assert.match(
-      internals.buildAdaptiveThinkingCompatWarningText(
-        "anthropic/claude-opus-5",
-        ["forceAdaptiveThinking"],
-      ),
-      /forceAdaptiveThinking/,
-    );
-  });
-
-  test("does not report adaptive compat when Claude Opus 5 is configured", () => {
-    const model = claudeModel("claude-opus-5", { forceAdaptiveThinking: true });
-
-    assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), true);
-    assert.deepEqual(internals.describeMissingAdaptiveThinkingCompat(model), []);
-    assert.deepEqual(internals.describeMissingCacheCompatForModel(model), []);
-  });
-
-  test("reports missing adaptive compat for Claude Haiku 5.5 (Pi 1.1.0+)", () => {
-    for (const id of ["claude-haiku-5-5", "claude-haiku-5.5", "anthropic/claude-haiku-5-5-20261001"]) {
-      const model = claudeModel(id);
-      assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), true, id);
-      assert.deepEqual(internals.describeMissingCacheCompatForModel(model), ["forceAdaptiveThinking"], id);
-    }
-    assert.deepEqual(
-      internals.describeMissingCacheCompatForModel(claudeModel("claude-haiku-5-5", { forceAdaptiveThinking: true })),
-      [],
-    );
-  });
-
-  test("keeps Claude Haiku 4.x as a non-adaptive negative case", () => {
-    for (const id of ["claude-haiku-4-5", "claude-3-5-haiku"]) {
-      assert.equal(internals.isAdaptiveThinkingCompatApplicable(claudeModel(id)), false, id);
-    }
-  });
-
-  test("keeps older non-adaptive Claude models as a negative case", () => {
-    const model = claudeModel("claude-opus-4-5");
-
-    assert.equal(internals.isAdaptiveThinkingCompatApplicable(model), false);
-    assert.deepEqual(internals.describeMissingCacheCompatForModel(model), []);
-  });
-});
-
 describe("explicit compat precedence", () => {
   const provider = "proxy";
   const modelId = "builtin-model";
-  const compatKey = "supportsLongCacheRetention";
 
-  function config(values: { provider?: boolean; model?: boolean; modelOverride?: boolean }) {
+  function openAIModel(extra: Record<string, unknown> = {}) {
     return {
-      providers: {
-        [provider]: {
-          compat: values.provider === undefined ? {} : { [compatKey]: values.provider },
-          models: [{
-            id: modelId,
-            compat: values.model === undefined ? {} : { [compatKey]: values.model },
-          }],
-          modelOverrides: {
-            [modelId]: {
-              compat: values.modelOverride === undefined
-                ? {}
-                : { [compatKey]: values.modelOverride },
-            },
-          },
-        },
-      },
-    };
+      provider,
+      id: modelId,
+      name: "Built-in model through proxy",
+      api: "openai-responses",
+      baseUrl: "https://proxy.example/v1",
+      compat: {},
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 4096,
+      ...extra,
+    } as any;
   }
 
-  test("modelOverrides true wins over false model and provider values", () => {
-    const input = config({ provider: false, model: false, modelOverride: true });
+  test("resolved compat wins over compatConfig and compatConfig remains the explicit layer", () => {
+    const model = openAIModel({
+      compatConfig: { supportsLongPromptCacheRetention: true, supportsDeveloperRole: false },
+      compat: { supportsLongPromptCacheRetention: false },
+    });
 
+    assert.deepEqual(internals.getCompat(model), {
+      supportsLongPromptCacheRetention: false,
+      supportsDeveloperRole: false,
+    });
+    assert.deepEqual(internals.getExplicitCompat(model), {
+      supportsLongPromptCacheRetention: true,
+      supportsDeveloperRole: false,
+    });
     assert.deepEqual(
-      internals.resolveExplicitCompatValue(input, provider, modelId, compatKey),
-      { source: "modelOverride", value: true },
-    );
-    assert.equal(
-      internals.hasExplicitLongRetentionOptInFromConfig(input, provider, modelId),
-      true,
+      internals.getEffectiveCompatSources(model).map(({ source }) => source),
+      ["config", "runtime"],
     );
   });
 
-  test("modelOverrides false wins over true model and provider values", () => {
-    const input = config({ provider: true, model: true, modelOverride: false });
-
+  test("compatConfig alone and missing compat layers resolve safely", () => {
     assert.deepEqual(
-      internals.resolveExplicitCompatValue(input, provider, modelId, compatKey),
-      { source: "modelOverride", value: false },
+      internals.getCompat(openAIModel({ compatConfig: { supportsLongPromptCacheRetention: true }, compat: undefined })),
+      { supportsLongPromptCacheRetention: true },
     );
-    assert.equal(
-      internals.hasExplicitLongRetentionOptInFromConfig(input, provider, modelId),
-      false,
-    );
+    assert.deepEqual(internals.getCompat(openAIModel({ compat: undefined })), {});
+    assert.deepEqual(internals.getCompat(undefined), {});
+    assert.deepEqual(internals.getExplicitCompat(openAIModel({ compat: { supportsLongPromptCacheRetention: true } })), {});
   });
 
-  test("custom model wins over provider and provider remains the fallback", () => {
-    assert.deepEqual(
-      internals.resolveExplicitCompatValue(
-        config({ provider: true, model: false }),
-        provider,
-        modelId,
-        compatKey,
-      ),
-      { source: "model", value: false },
-    );
-    assert.deepEqual(
-      internals.resolveExplicitCompatValue(
-        config({ provider: true }),
-        provider,
-        modelId,
-        compatKey,
-      ),
-      { source: "provider", value: true },
-    );
-  });
-
-  test("effective compat merges provider, custom model, runtime model, and modelOverrides", () => {
-    const runtimeModel = {
-      provider,
-      id: modelId,
-      compat: { sendSessionAffinityHeaders: true, supportsLongCacheRetention: true },
-    } as any;
-    const input = {
-      providers: {
-        [provider]: {
-          compat: { sendSessionAffinityHeaders: true, supportsLongCacheRetention: false },
-          models: [{
-            id: modelId,
-            compat: { sendSessionAffinityHeaders: false, supportsDeveloperRole: false },
-          }],
-          modelOverrides: {
-            [modelId]: { compat: { supportsLongCacheRetention: false } },
-          },
-        },
-      },
-    };
+  test("nested compat records merge key by key across layers", () => {
+    const model = openAIModel({
+      compatConfig: { openRouterRouting: { allow_fallbacks: false, only: ["openai"] } },
+      compat: { openRouterRouting: { order: ["openai", "anthropic"] } },
+    });
 
     assert.deepEqual(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, input),
-      {
-        sendSessionAffinityHeaders: true,
-        supportsLongCacheRetention: false,
-        supportsDeveloperRole: false,
-      },
-    );
-    assert.deepEqual(
-      internals.resolveEffectiveCompatFromConfig(
-        { ...runtimeModel, compat: {} },
-        {
-          providers: {
-            [provider]: {
-              compat: { openRouterRouting: { allow_fallbacks: false, only: ["openai"] } },
-              models: [{ id: modelId, compat: { openRouterRouting: { order: ["openai", "anthropic"] } } }],
-            },
-          },
-        },
-      ).openRouterRouting,
+      internals.getCompat(model).openRouterRouting,
       { allow_fallbacks: false, only: ["openai"], order: ["openai", "anthropic"] },
     );
-    const overrideInput = {
-      providers: {
-        [provider]: {
-          compat: { sendSessionAffinityHeaders: true },
-          models: [{ id: modelId, compat: { sendSessionAffinityHeaders: false } }],
-          modelOverrides: { [modelId]: { compat: { sendSessionAffinityHeaders: true } } },
-        },
-      },
-    };
-    assert.equal(
-      internals.resolveEffectiveCompatFromConfig(
-        { ...runtimeModel, compat: { sendSessionAffinityHeaders: false } },
-        overrideInput,
-      ).sendSessionAffinityHeaders,
-      true,
-    );
-    assert.equal(
-      internals.getEffectiveCompatValueSource(
-        { ...runtimeModel, compat: { sendSessionAffinityHeaders: false } },
-        overrideInput,
-        "sendSessionAffinityHeaders",
-      ),
-      "modelOverride",
-    );
   });
 
-  test("duplicate custom model ids follow Pi's last-definition-wins behavior", () => {
-    const runtimeModel = {
-      provider,
-      id: modelId,
-      compat: {},
-    } as any;
-    const input = {
-      providers: {
-        [provider]: {
-          models: [
-            {
-              id: modelId,
-              api: "openai-responses",
-              baseUrl: "https://first.example/v1",
-              compat: { sendSessionAffinityHeaders: false },
-            },
-            {
-              id: modelId,
-              api: "openai-completions",
-              baseUrl: "https://last.example/v1",
-              compat: { sendSessionAffinityHeaders: true },
-            },
-          ],
-        },
-      },
-    };
-
-    assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, input).sendSessionAffinityHeaders,
-      true,
-    );
-    assert.deepEqual(
-      internals.resolveExplicitCompatValue(input, provider, modelId, "sendSessionAffinityHeaders"),
-      { source: "model", value: true },
-    );
-    assert.deepEqual(
-      internals.applyConfiguredTransportToModel(
-        { ...runtimeModel, api: "", baseUrl: "" },
-        input,
-      ),
-      { ...runtimeModel, api: "openai-completions", baseUrl: "https://last.example/v1" },
-    );
-  });
-
-  test("malformed models.json falls back to runtime model compat", () => {
-    const runtimeModel = {
-      provider,
-      id: modelId,
-      compat: { sendSessionAffinityHeaders: true },
-    } as any;
-    assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, undefined).sendSessionAffinityHeaders,
-      true,
-    );
-    assert.equal(
-      internals.resolveEffectiveCompatFromConfig(runtimeModel, { providers: "invalid" }).sendSessionAffinityHeaders,
-      true,
-    );
-  });
-
-  test("schema-invalid models.json is rejected before compat resolution", () => {
-    assert.equal(
-      internals.isValidModelsConfigForEffectiveCompat({
-        providers: {
-          [provider]: {
-            baseUrl: 123,
-            compat: { sendSessionAffinityHeaders: true },
-          },
-        },
-      }),
-      false,
-    );
-    assert.equal(
-      internals.isValidModelsConfigForEffectiveCompat({
-        providers: {
-          [provider]: {
-            compat: { sendSessionAffinityHeaders: true },
-            models: [{ id: modelId, thinkingLevelMap: { high: 4 } }],
-          },
-        },
-      }),
-      false,
-    );
-    assert.equal(
-      internals.isValidModelsConfigForEffectiveCompat({
-        providers: {
-          [provider]: {
-            baseUrl: "https://proxy.example/v1",
-            compat: { sendSessionAffinityHeaders: true },
-            modelOverrides: { [modelId]: { cost: { input: 1, extra: 2 } } },
-          },
-        },
-      }),
-      true,
-    );
-  });
-
-  test("before_provider_request reads modelOverrides from the active agent directory", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-review-test-"));
+  test("before_provider_request gates prompt_cache_retention by the model's compat, not models.json", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-review-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousRetention = process.env.PI_CACHE_RETENTION;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -834,62 +585,45 @@ describe("explicit compat precedence", () => {
       } as any);
       const hook = handlers.get("before_provider_request");
       assert.ok(hook);
-      const context = {
-        model: {
-          provider,
-          id: modelId,
-          name: "Built-in model through proxy",
-          api: "openai-completions",
-          baseUrl: "https://proxy.example/v1",
-          compat: {},
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128_000,
-          maxTokens: 4096,
-        },
+      const contextFor = (model: unknown) => ({
+        model,
         sessionManager: { getSessionId: () => "review-test-session" },
         modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
         ui: { notify() {}, setStatus() {} },
+      });
+      const run = (model: unknown) => {
+        const payload: Record<string, unknown> = { prompt_cache_retention: "24h" };
+        const result = (hook({ payload }, contextFor(model)) ?? payload) as Record<string, unknown>;
+        assert.equal(payload.prompt_cache_retention, "24h", "the original payload is never mutated");
+        return result;
       };
 
+      // Pi's old models.json is not read any more: an opt-in written there is ignored.
       await writeFile(
         join(tempAgentDir, "models.json"),
-        JSON.stringify(config({ provider: true, model: true, modelOverride: false })),
+        JSON.stringify({ providers: { [provider]: { compat: { supportsLongPromptCacheRetention: true } } } }),
       );
-      const deniedPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
-      const deniedPayloadResult = (hook({ payload: deniedPayload }, context) ?? deniedPayload) as Record<string, unknown>;
-      assert.equal("prompt_cache_retention" in deniedPayloadResult, false);
-      assert.equal(deniedPayload.prompt_cache_retention, "24h");
+      assert.equal("prompt_cache_retention" in run(openAIModel()), false);
 
-      await writeFile(
-        join(tempAgentDir, "models.json"),
-        JSON.stringify(config({ provider: false, model: false, modelOverride: true })),
+      assert.equal(
+        run(openAIModel({ compat: { supportsLongPromptCacheRetention: true } })).prompt_cache_retention,
+        "24h",
       );
-      const allowedPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
-      const allowedPayloadResult = (hook({ payload: allowedPayload }, context) ?? allowedPayload) as Record<string, unknown>;
-      assert.equal(allowedPayloadResult.prompt_cache_retention, "24h");
-
-      await writeFile(
-        join(tempAgentDir, "models.json"),
-        JSON.stringify({
-          providers: {
-            [provider]: {
-              compat: { supportsLongCacheRetention: true },
-              models: [{ id: modelId, thinkingLevelMap: { high: 4 } }],
-            },
-          },
-        }),
+      assert.equal(
+        run(openAIModel({ compatConfig: { supportsLongPromptCacheRetention: true } })).prompt_cache_retention,
+        "24h",
       );
-      const invalidConfigPayload: Record<string, unknown> = { prompt_cache_retention: "24h" };
-      const invalidConfigPayloadResult = (hook({ payload: invalidConfigPayload }, context) ?? invalidConfigPayload) as Record<string, unknown>;
-      assert.equal("prompt_cache_retention" in invalidConfigPayloadResult, false);
-      assert.equal(invalidConfigPayload.prompt_cache_retention, "24h");
+      // The resolved compat layer outranks the user's raw compatConfig.
+      assert.equal(
+        "prompt_cache_retention" in run(openAIModel({
+          compatConfig: { supportsLongPromptCacheRetention: true },
+          compat: { supportsLongPromptCacheRetention: false },
+        })),
+        false,
+      );
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
-      else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
@@ -903,23 +637,6 @@ describe("provider response recovery", () => {
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(
-        join(tempAgentDir, "models.json"),
-        JSON.stringify({
-          providers: {
-            proxy: {
-              models: [{
-                id: "gpt-5.5",
-                compat: {
-                  supportsLongCacheRetention: true,
-                  sendSessionAffinityHeaders: true,
-                },
-              }],
-            },
-          },
-        }),
-        "utf8",
-      );
 
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
         interopDefault: false,
@@ -942,10 +659,7 @@ describe("provider response recovery", () => {
         name: "GPT-5.5",
         api: "openai-completions",
         baseUrl: "https://proxy.example/v1",
-        compat: {
-          supportsLongCacheRetention: true,
-          sendSessionAffinityHeaders: true,
-        },
+        compat: { supportsLongPromptCacheRetention: true },
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -1020,20 +734,6 @@ describe("provider response recovery", () => {
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(
-        join(tempAgentDir, "models.json"),
-        JSON.stringify({
-          providers: {
-            proxy: {
-              models: [{
-                id: "gpt-5.5",
-                compat: { supportsLongCacheRetention: true },
-              }],
-            },
-          },
-        }),
-        "utf8",
-      );
 
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
         interopDefault: false,
@@ -1070,7 +770,7 @@ describe("provider response recovery", () => {
         name: "GPT-5.5",
         api: "openai-completions",
         baseUrl: "https://proxy.example/v1",
-        compat: { supportsLongCacheRetention: true },
+        compat: { supportsLongPromptCacheRetention: true },
       };
       const baseContext = {
         sessionManager: { getSessionId: () => "routed-retention-recovery-session" },
@@ -1108,320 +808,6 @@ describe("provider response recovery", () => {
   });
 });
 
-describe("modelOverrides JSONC fixes", () => {
-  const provider = "proxy";
-  const modelId = "builtin-model";
-  const compatKeys = { supportsLongCacheRetention: true };
-
-  test("surgically repairs an existing override and preserves comments", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "compat": { "supportsLongCacheRetention": false },
-      "models": [{
-        "id": "builtin-model",
-        "compat": { "supportsLongCacheRetention": false }
-      }],
-      "modelOverrides": {
-        "builtin-model": {
-          // Keep this explanation.
-          "compat": {
-            "supportsLongCacheRetention": false,
-            "unrelated": "preserved"
-          }
-        }
-      }
-    }
-  }
-}`;
-    const location = internals.locateModelInJsonc(original, provider, modelId);
-
-    assert.ok(location);
-    assert.deepEqual(internals.chooseFixPlacement(original, location, compatKeys, provider), {
-      placement: "modelOverride",
-      reason: "an existing modelOverrides entry has Pi's highest precedence — repairing it directly",
-    });
-
-    const modified = internals.composeFixInsertion(original, location, compatKeys, "modelOverride");
-    assert.equal(
-      internals.selfCheckFix(original, modified, provider, modelId, compatKeys, "modelOverride"),
-      null,
-    );
-    assert.match(modified, /\/\/ Keep this explanation\./);
-    assert.match(modified, /"unrelated": "preserved"/);
-    assert.deepEqual(
-      internals.resolveExplicitCompatValue(
-        internals.parseJsonc(modified),
-        provider,
-        modelId,
-        "supportsLongCacheRetention",
-      ),
-      { source: "modelOverride", value: true },
-    );
-  });
-
-  test("self-check rejects a lower-layer edit shadowed by modelOverrides", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "compat": { "supportsLongCacheRetention": false },
-      "models": [{ "id": "builtin-model" }],
-      "modelOverrides": {
-        "builtin-model": {
-          "compat": { "supportsLongCacheRetention": false }
-        }
-      }
-    }
-  }
-}`;
-    const location = internals.locateModelInJsonc(original, provider, modelId);
-    assert.ok(location);
-
-    const wronglyModified = internals.composeFixInsertion(original, location, compatKeys, "provider");
-    assert.match(
-      internals.selfCheckFix(original, wronglyModified, provider, modelId, compatKeys, "provider") ?? "",
-      /effective compat\.supportsLongCacheRetention has wrong value/,
-    );
-  });
-
-  test("self-check includes runtime compat and requires a higher-precedence override", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "models": [{
-        "id": "builtin-model",
-        "compat": { "thinkingFormat": "deepseek" }
-      }]
-    }
-  }
-}`;
-    const runtimeModel = {
-      provider,
-      id: modelId,
-      name: "DeepSeek Builtin",
-      api: "openai-completions",
-      baseUrl: "https://proxy.example/v1",
-      compat: { thinkingFormat: "deepseek" },
-    } as any;
-    const location = internals.locateModelInJsonc(original, provider, modelId);
-    assert.ok(location);
-    const lowerLayer = internals.composeFixInsertion(
-      original,
-      location,
-      { thinkingFormat: "openai" },
-      "model",
-    );
-    assert.match(
-      internals.selfCheckFix(
-        original,
-        lowerLayer,
-        provider,
-        modelId,
-        { thinkingFormat: "openai" },
-        "model",
-        runtimeModel,
-      ) ?? "",
-      /effective compat\.thinkingFormat has wrong value/,
-    );
-
-    const override = internals.composeModelOverrideInsertion(
-      original,
-      provider,
-      modelId,
-      { thinkingFormat: "openai" },
-    );
-    assert.ok(override);
-    assert.equal(
-      internals.selfCheckMissingEntryInsertion(
-        original,
-        override.modifiedText,
-        provider,
-        modelId,
-        { thinkingFormat: "openai" },
-        runtimeModel,
-      ),
-      null,
-    );
-    assert.equal(
-      internals.resolveEffectiveCompatFromConfig(
-        runtimeModel,
-        internals.parseJsonc(override.modifiedText),
-      ).thinkingFormat,
-      "openai",
-    );
-  });
-
-  test("refuses ambiguous duplicate JSONC path keys before editing", () => {
-    const model = `"models": [{ "id": "builtin-model", "compat": { "supportsLongCacheRetention": false } }]`;
-    const providerEntry = `"proxy": { ${model} }`;
-    const cases = [
-      `{
-  "providers": { ${providerEntry} },
-  "providers": { ${providerEntry} }
-}`,
-      `{
-  "providers": { ${providerEntry}, ${providerEntry} }
-}`,
-      `{
-  "providers": { "proxy": { ${model}, ${model} } }
-}`,
-      `{
-  "providers": { "proxy": {
-    ${model},
-    "modelOverrides": { "builtin-model": { "compat": { "supportsLongCacheRetention": false } } },
-    "modelOverrides": { "builtin-model": { "compat": { "supportsLongCacheRetention": false } } }
-  } }
-}`,
-      `{
-  "providers": { "proxy": {
-    ${model},
-    "modelOverrides": {
-      "builtin-model": { "compat": { "supportsLongCacheRetention": false } },
-      "builtin-model": { "compat": { "supportsLongCacheRetention": false } }
-    }
-  } }
-}`,
-      `{
-  "providers": { "proxy": {
-    "compat": { "providerOnly": false },
-    "compat": { "providerOnly": true },
-    ${model}
-  } }
-}`,
-      `{
-  "providers": { "proxy": {
-    ${model},
-    "modelOverrides": {
-      "builtin-model": {
-        "compat": { "supportsLongCacheRetention": false },
-        "compat": { "supportsLongCacheRetention": true }
-      }
-    }
-  } }
-}`,
-      `{
-  "providers": { "proxy": {
-    "models": [{ "id": "builtin-model", "compat": { "supportsLongCacheRetention": false }, "compat": { "supportsLongCacheRetention": false } }]
-  } }
-}`,
-      `{
-  "providers": { "proxy": {
-    "models": [{ "id": "builtin-model", "id": "builtin-model", "compat": { "supportsLongCacheRetention": false } }]
-  } }
-}`,
-    ];
-
-    for (const text of cases) {
-      assert.equal(internals.locateModelInJsonc(text, provider, modelId), undefined);
-      assert.equal(internals.analyzeModelsJsonForMissingEntry(text, provider, modelId), undefined);
-    }
-  });
-
-  test("self-check rejects unrelated additions instead of accepting a one-way subset", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "models": [{ "id": "builtin-model" }]
-    }
-  }
-}`;
-    const location = internals.locateModelInJsonc(original, provider, modelId);
-    assert.ok(location);
-    const modified = internals.composeFixInsertion(
-      original,
-      location,
-      { sendSessionAffinityHeaders: true },
-      "model",
-    );
-    const withUnrelatedSecret = modified.replace(
-      '"models":',
-      '"apiKey": "env:SHOULD_NOT_BE_ADDED",\n      "models":',
-    );
-    assert.match(
-      internals.selfCheckFix(
-        original,
-        withUnrelatedSecret,
-        provider,
-        modelId,
-        { sendSessionAffinityHeaders: true },
-        "model",
-      ) ?? "",
-      /original structure was altered/,
-    );
-  });
-
-  test("creates only a modelOverrides entry for a built-in model", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      // Authentication and endpoint configuration stay untouched.
-      "baseUrl": "https://proxy.example/v1",
-      "apiKey": "env:PROXY_API_KEY"
-    }
-  }
-}`;
-    const result = internals.composeModelOverrideInsertion(
-      original,
-      provider,
-      modelId,
-      compatKeys,
-    );
-
-    assert.ok(result);
-    assert.equal(
-      internals.selfCheckMissingEntryInsertion(
-        original,
-        result.modifiedText,
-        provider,
-        modelId,
-        compatKeys,
-      ),
-      null,
-    );
-    assert.match(result.modifiedText, /\/\/ Authentication and endpoint configuration stay untouched\./);
-    assert.doesNotMatch(result.modifiedText, /"models"\s*:/);
-    assert.match(result.modifiedText, /"modelOverrides"\s*:/);
-    assert.match(result.modifiedText, /"apiKey": "env:PROXY_API_KEY"/);
-  });
-
-  test("creates a comment-safe modelOverrides-only provider entry", () => {
-    const original = `{
-  "providers": {
-    // Other provider entries may be added here.
-  }
-}`;
-    const result = internals.composeModelOverrideInsertion(
-      original,
-      provider,
-      modelId,
-      compatKeys,
-    );
-
-    assert.ok(result);
-    assert.equal(
-      internals.selfCheckMissingEntryInsertion(
-        original,
-        result.modifiedText,
-        provider,
-        modelId,
-        compatKeys,
-      ),
-      null,
-    );
-    assert.match(result.modifiedText, /\/\/ Other provider entries may be added here\./);
-    assert.doesNotMatch(result.modifiedText, /"models"\s*:/);
-    assert.deepEqual(
-      internals.resolveExplicitCompatValue(
-        internals.parseJsonc(result.modifiedText),
-        provider,
-        modelId,
-        "supportsLongCacheRetention",
-      ),
-      { source: "modelOverride", value: true },
-    );
-  });
-});
-
 describe("DeepSeek protocol-first compatibility", () => {
   const model = (compat: Record<string, unknown> = {}, overrides: Partial<Record<string, unknown>> = {}) => ({
     provider: "amd-radeon",
@@ -1438,61 +824,77 @@ describe("DeepSeek protocol-first compatibility", () => {
     ...overrides,
   }) as any;
 
-  test("does not infer DeepSeek wire protocol from the family name or reasoning effort support", () => {
+  test("checks DeepSeek reasoning replay only for reasoning models on openai-completions", () => {
     const current = model({ supportsReasoningEffort: true });
-    assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
-    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
-    assert.deepEqual(internals.buildDeepSeekCompatSuggestion(["sendSessionAffinityHeaders"]), {
-      sendSessionAffinityHeaders: true,
+    assert.equal(internals.isDeepSeekWireCompatApplicable(current), true);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), ["requiresReasoningContentForToolCalls"]);
+    assert.deepEqual(internals.buildDeepSeekCompatSuggestion(["requiresReasoningContentForToolCalls"]), {
+      requiresReasoningContentForToolCalls: true,
     });
+    assert.deepEqual(
+      internals.describeMissingDeepSeekCompat(model({ requiresReasoningContentForToolCalls: true })),
+      [],
+    );
+    // Non-reasoning, non-completions and non-DeepSeek models are not applicable.
+    assert.equal(internals.isDeepSeekWireCompatApplicable(model({}, { reasoning: false })), false);
+    assert.equal(internals.isDeepSeekWireCompatApplicable(model({}, { api: "openai-responses" })), false);
+    assert.equal(internals.isDeepSeekWireCompatApplicable(model({}, { id: "gpt-5.5", name: "GPT-5.5" })), false);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(model({}, { reasoning: false })), []);
+  });
+
+  test("never lists or suggests thinkingFormat and has no generic proxy compat requirement", () => {
+    for (const thinkingFormat of [undefined, "openai", "qwen", "openrouter", "together"]) {
+      const current = model({ supportsReasoningEffort: true, ...(thinkingFormat ? { thinkingFormat } : {}) });
+      assert.equal(internals.isDeepSeekWireCompatApplicable(current), true);
+      assert.deepEqual(internals.describeMissingOpenAICompatibleProxyCompat(current), []);
+      assert.deepEqual(internals.describeMissingCacheCompatForModel(current), ["requiresReasoningContentForToolCalls"]);
+      const suggestion = internals.buildFixSuggestion(current);
+      assert.deepEqual(suggestion?.compatKeys, { requiresReasoningContentForToolCalls: true });
+      assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat/);
+    }
     assert.doesNotMatch(
-      internals.buildOpenAIProxyCompatWarningText("amd-radeon/DeepSeek-V4-Flash", ["sendSessionAffinityHeaders"]),
+      internals.buildOpenAIProxyCompatWarningText("amd-radeon/DeepSeek-V4-Flash", []),
       /thinkingFormat|requiresReasoningContent/,
     );
   });
 
-  test("keeps generic proxy diagnostics for absent and explicit non-DeepSeek formats", () => {
-    for (const thinkingFormat of [undefined, "openai", "qwen", "openrouter", "together"]) {
-      const current = model({ supportsReasoningEffort: true, ...(thinkingFormat ? { thinkingFormat } : {}) });
-      assert.equal(internals.isDeepSeekWireCompatApplicable(current), false);
-      assert.deepEqual(internals.describeMissingDeepSeekCompat(current), []);
-      assert.deepEqual(internals.describeMissingCacheCompatForModel(current), ["sendSessionAffinityHeaders"]);
-      const suggestion = internals.buildFixSuggestion(current);
-      assert.deepEqual(suggestion?.compatKeys, { sendSessionAffinityHeaders: true });
-      assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat|requiresReasoningContent/);
-    }
-  });
-
-  test("uses explicit DeepSeek format only for replay diagnostics and never lists the format itself", () => {
-    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
-    assert.equal(internals.isDeepSeekWireCompatApplicable(current), true);
-    assert.deepEqual(internals.describeMissingDeepSeekCompat(current), ["requiresReasoningContentOnAssistantMessages"]);
-    assert.deepEqual(internals.describeMissingCacheCompatForModel(current), [
-      "sendSessionAffinityHeaders",
-      "requiresReasoningContentOnAssistantMessages",
-    ]);
-    const suggestion = internals.buildFixSuggestion(current);
-    assert.deepEqual(suggestion?.compatKeys, {
-      sendSessionAffinityHeaders: true,
-      requiresReasoningContentOnAssistantMessages: true,
+  test("suggests nothing when the resolved compat already satisfies the replay check", () => {
+    const satisfied = model({ requiresReasoningContentForToolCalls: true, supportsReasoningEffort: true });
+    assert.deepEqual(internals.describeMissingCacheCompatForModel(satisfied), []);
+    assert.equal(internals.buildFixSuggestion(satisfied), undefined);
+    // compat (resolved) outranks compatConfig (user text): an explicit true that OMP resolved to false is still reported.
+    const resolvedOff = model({ requiresReasoningContentForToolCalls: false }, {
+      compatConfig: { requiresReasoningContentForToolCalls: true },
     });
-    assert.doesNotMatch(JSON.stringify(suggestion), /thinkingFormat/);
+    assert.deepEqual(internals.describeMissingDeepSeekCompat(resolvedOff), ["requiresReasoningContentForToolCalls"]);
   });
 
   test("requires explicit error evidence before proposing a model-scoped protocol repair", () => {
-    const current = model({ thinkingFormat: "deepseek", supportsReasoningEffort: true });
+    const current = model({ supportsReasoningEffort: true });
     assert.equal(internals.buildReasoningProtocolFixSuggestion(current), undefined);
+    assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(current, true)?.compatKeys, {
+      thinkingFormat: "openai",
+    });
+    assert.equal(internals.buildReasoningProtocolFixSuggestion(current, true)?.forceModelLevel, true);
+    assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(model(), true)?.compatKeys, {
+      thinkingFormat: "openai",
+      supportsReasoningEffort: true,
+    });
+    // Replay is switched off only when the user explicitly enabled it in models.yml (compatConfig).
     assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(
-      model({
-        thinkingFormat: "deepseek",
-        supportsReasoningEffort: true,
-        requiresReasoningContentOnAssistantMessages: true,
-      }),
+      model(
+        { supportsReasoningEffort: true, requiresReasoningContentForToolCalls: true },
+        { compatConfig: { requiresReasoningContentForToolCalls: true } },
+      ),
       true,
     )?.compatKeys, {
       thinkingFormat: "openai",
-      requiresReasoningContentOnAssistantMessages: false,
+      requiresReasoningContentForToolCalls: false,
     });
+    assert.deepEqual(internals.buildReasoningProtocolFixSuggestion(
+      model({ supportsReasoningEffort: true, requiresReasoningContentForToolCalls: true }),
+      true,
+    )?.compatKeys, { thinkingFormat: "openai" });
     assert.equal(internals.hasReasoningProtocolRejectionText(
       '400 Unsupported parameter: thinking. Use reasoning_effort instead.',
     ), true);
@@ -1640,23 +1042,9 @@ describe("DeepSeek protocol-first compatibility", () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-reasoning-correlation-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const config = {
-      providers: {
-        "proxy-a": {
-          baseUrl: "https://proxy-a.example/v1",
-          models: [{ id: "deepseek-a", name: "DeepSeek A" }],
-        },
-        "proxy-b": {
-          baseUrl: "https://proxy-b.example/v1",
-          models: [{ id: "deepseek-b", name: "DeepSeek B" }],
-        },
-      },
-    };
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, JSON.stringify(config), "utf8");
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
         interopDefault: false,
         moduleCache: false,
@@ -1788,6 +1176,21 @@ describe("DeepSeek protocol-first compatibility", () => {
       const interleavedNotifications = notifications.slice(beforeInterleavedMessage);
       assert.equal(interleavedNotifications.some((message) => message.includes("proxy-e/deepseek-e")), false);
 
+      // Complete E explicitly so its request record cannot make the next message ambiguous.
+      await messageEndHook(
+        {
+          message: {
+            role: "assistant",
+            provider: modelE.provider,
+            model: modelE.id,
+            api: modelE.api,
+            stopReason: "stop",
+            usage: { input: 100, cacheRead: 0, cacheWrite: 0 },
+          },
+        },
+        { ...baseContext, model: modelE },
+      );
+
       const keyModel = makeModel("proxy-key", "gpt-key", "GPT Key");
       requestHook({ payload: {} }, { ...baseContext, model: keyModel });
       await messageEndHook(
@@ -1862,7 +1265,7 @@ describe("DeepSeek protocol-first compatibility", () => {
         { status: 400, headers: { "x-error": "Unsupported parameter: prompt_cache_key" } },
         context(modelB),
       );
-      assert.equal(notifications.some((message) => message.includes("rejected prompt_cache_key")), false);
+      assert.equal(notifications.some((message) => message.includes("拒绝了 prompt_cache_key")), false);
 
       await messageEndHook({
         message: {
@@ -1875,8 +1278,8 @@ describe("DeepSeek protocol-first compatibility", () => {
           errorMessage: "Unsupported parameter: prompt_cache_key",
         },
       }, context(modelA));
-      assert.equal(notifications.some((message) => message.includes("proxy-a/gpt-a rejected prompt_cache_key")), false);
-      assert.equal(notifications.some((message) => message.includes("proxy-b/gpt-b rejected prompt_cache_key")), true);
+      assert.equal(notifications.some((message) => message.includes("proxy-a/gpt-a 拒绝了 prompt_cache_key")), false);
+      assert.equal(notifications.some((message) => message.includes("proxy-b/gpt-b 拒绝了 prompt_cache_key")), true);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1972,26 +1375,12 @@ describe("DeepSeek protocol-first compatibility", () => {
     }
   });
 
-  test("evidence-driven command fix overrides extension runtime compat at modelOverrides", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-runtime-compat-fix-test-"));
+  test("evidence-driven command fix prints a model-level models.yml snippet and writes nothing", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-runtime-compat-fix-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousRetention = process.env.PI_CACHE_RETENTION;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const original = `{
-  "providers": {
-    "runtime-shadow-proxy": {
-      "baseUrl": "https://proxy.example/v1",
-      "models": [{
-        "id": "deepseek-runtime-shadow",
-        "compat": { "thinkingFormat": "deepseek" }
-      }]
-    }
-  }
-}`;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
         interopDefault: false,
         moduleCache: false,
@@ -2007,13 +1396,14 @@ describe("DeepSeek protocol-first compatibility", () => {
           commands.set(name, command);
         },
       } as any);
-      const modelWithRuntimeCompat = {
+      const modelWithExplicitReplay = {
         provider: "runtime-shadow-proxy",
         id: "deepseek-runtime-shadow",
         name: "DeepSeek Runtime Shadow",
         api: "openai-completions",
         baseUrl: "https://proxy.example/v1",
-        compat: { thinkingFormat: "deepseek" },
+        compatConfig: { requiresReasoningContentForToolCalls: true },
+        compat: { requiresReasoningContentForToolCalls: true, supportsReasoningEffort: false },
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -2021,13 +1411,14 @@ describe("DeepSeek protocol-first compatibility", () => {
         maxTokens: 8192,
       } as any;
       const notifications: string[] = [];
+      let confirmations = 0;
       const context = {
-        model: modelWithRuntimeCompat,
+        model: modelWithExplicitReplay,
         hasUI: true,
         sessionManager: { getSessionId: () => "runtime-shadow-session" },
         modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
         ui: {
-          confirm: async () => true,
+          confirm: async () => { confirmations++; return true; },
           notify: (message: string) => notifications.push(message),
           setStatus() {},
         },
@@ -2039,70 +1430,78 @@ describe("DeepSeek protocol-first compatibility", () => {
       }, context);
       await commands.get("cache-optimizer")?.handler("fix", context);
 
-      const parsed = freshModule.__internals_for_tests.parseJsonc(await readFile(modelsPath, "utf8")) as any;
-      assert.equal(
-        parsed.providers[modelWithRuntimeCompat.provider].modelOverrides[modelWithRuntimeCompat.id].compat.thinkingFormat,
-        "openai",
-      );
-      assert.equal(
-        freshModule.__internals_for_tests.resolveEffectiveCompatFromConfig(modelWithRuntimeCompat, parsed).thinkingFormat,
-        "openai",
-      );
-      assert.ok(notifications.some((message) => message.includes("Fix applied")));
+      const guidance = notifications.at(-1) ?? "";
+      assert.match(guidance, /手动修复建议/);
+      assert.match(guidance, /modelOverrides:/);
+      assert.match(guidance, /deepseek-runtime-shadow:/);
+      assert.match(guidance, /thinkingFormat: openai/);
+      assert.match(guidance, /supportsReasoningEffort: true/);
+      // The user's explicit replay opt-in is turned off only for this model.
+      assert.match(guidance, /requiresReasoningContentForToolCalls: false/);
+      assert.match(guidance, /本扩展不会自动改写 models\.yml/);
+      assert.equal(confirmations, 0);
+      assert.deepEqual(await readdir(tempAgentDir), []);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
-      else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
 });
 
 describe("/cache-optimizer fix command", () => {
-  test("direct and menu paths repair the effective modelOverride", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-command-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousRetention = process.env.PI_CACHE_RETENTION;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const original = `{
-  "providers": {
-    "proxy": {
-      // Credential and endpoint configuration must survive the fix.
-      "apiKey": "env:PROXY_API_KEY",
-      "baseUrl": "https://proxy.example/v1",
-      "api": "openai-completions",
-      "compat": {
-        "providerOnly": "preserved"
-      },
-      "models": [
-        {
-          "id": "deepseek-v4",
-          "name": "DeepSeek V4",
-          "compat": {
-            "modelOnly": "preserved"
-          }
-        }
-      ],
-      "modelOverrides": {
-        "deepseek-v4": {
-          "compat": {
-            "supportsLongCacheRetention": false,
-            "overrideOnly": "preserved"
+  test("rejects real target swaps at the final atomic rename boundary", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-final-rename-race-test-"));
+    const targetPath = join(tempDir, "models.json");
+    const backupPath = join(tempDir, "models.json.backup-cache-optimizer-race");
+    const original = '{"providers":{"a":{}}}\n';
+    const replacement = '{"providers":{"b":{}}}\n';
+    const external = '{"providers":{"external":{}}}\n';
+    try {
+      await writeFile(targetPath, original, { encoding: "utf8", mode: 0o600 });
+      await writeFile(backupPath, original, { encoding: "utf8", mode: 0o600 });
+      // Windows does not honor POSIX modes; guard with the mode the file actually has.
+      const fileMode = (await stat(targetPath)).mode & 0o7777;
+      await assert.rejects(
+        internals.atomicReplaceTextFilePreservingMode(
+          targetPath,
+          replacement,
+          fileMode,
+          "fix-race-test",
+          { hash: internals.hashText(original), mode: fileMode },
+          async () => {
+            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
           },
-          "metadata": "keep-me"
-        }
-      },
-      "unrelatedProviderField": 42
+        ),
+        /target content changed during atomic replacement/,
+      );
+      assert.equal(await readFile(targetPath, "utf8"), external);
+
+      await writeFile(targetPath, replacement, { encoding: "utf8", mode: 0o600 });
+      await assert.rejects(
+        internals.atomicRestoreFileFromBackup(
+          backupPath,
+          targetPath,
+          fileMode,
+          { hash: internals.hashText(replacement), mode: fileMode, backupHash: internals.hashText(original) },
+          async () => {
+            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
+          },
+        ),
+        /target content changed during atomic replacement/,
+      );
+      assert.equal(await readFile(targetPath, "utf8"), external);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
     }
-  }
-}`;
+  });
+
+  test("direct and menu paths print a models.yml snippet without writing any file", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-fix-command-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, "utf8");
-      await chmod(modelsPath, 0o600);
-
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
         interopDefault: false,
         moduleCache: false,
@@ -2123,7 +1522,7 @@ describe("/cache-optimizer fix command", () => {
       const confirmations: Array<{ title: string; message: string }> = [];
       const notifications: Array<{ message: string; level: string }> = [];
       const menuPrompts: Array<{ title: string; options: string[] }> = [];
-      let menuChoice: string | undefined;
+      let menuPrefix = "";
       const model = {
         provider: "proxy",
         id: "deepseek-v4",
@@ -2151,750 +1550,48 @@ describe("/cache-optimizer fix command", () => {
           setStatus() {},
           select: async (title: string, options: string[]) => {
             menuPrompts.push({ title, options });
-            return menuChoice;
+            return options.find((option) => option.startsWith(menuPrefix));
           },
         },
       };
 
-      const assertApplied = async (expectedMode: number): Promise<string> => {
-        assert.equal(confirmations.length, 1);
-        assert.match(confirmations[0].title, /Fix/);
-        assert.match(confirmations[0].message, /modelOverrides/);
-        assert.ok(notifications.some(({ message }) => message.includes("Fix applied")));
-
-        const backupNames = (await readdir(tempAgentDir)).filter((name) =>
-          name.startsWith("models.json.backup-cache-optimizer-")
-        );
-        assert.equal(backupNames.length, 1);
-        assert.equal(await readFile(join(tempAgentDir, backupNames[0]), "utf8"), original);
-        assert.equal((await stat(join(tempAgentDir, backupNames[0]))).mode & 0o7777, expectedMode);
-        assert.equal((await stat(modelsPath)).mode & 0o7777, expectedMode);
-
-        const written = await readFile(modelsPath, "utf8");
-        const parsed = freshModule.__internals_for_tests.parseJsonc(written) as any;
-        assert.ok(parsed);
-        assert.deepEqual(
-          freshModule.__internals_for_tests.resolveExplicitCompatValue(
-            parsed,
-            "proxy",
-            "deepseek-v4",
-            "supportsLongCacheRetention",
-          ),
-          { source: "modelOverride", value: false },
-        );
-        assert.deepEqual(
-          freshModule.__internals_for_tests.resolveExplicitCompatValue(
-            parsed,
-            "proxy",
-            "deepseek-v4",
-            "sendSessionAffinityHeaders",
-          ),
-          { source: "modelOverride", value: true },
-        );
-        assert.equal(
-          freshModule.__internals_for_tests.resolveExplicitCompatValue(
-            parsed,
-            "proxy",
-            "deepseek-v4",
-            "thinkingFormat",
-          ),
-          undefined,
-        );
-        assert.match(written, /\/\/ Credential and endpoint configuration must survive the fix\./);
-        assert.equal(parsed.providers.proxy.apiKey, "env:PROXY_API_KEY");
-        assert.equal(parsed.providers.proxy.unrelatedProviderField, 42);
-        assert.equal(parsed.providers.proxy.compat.providerOnly, "preserved");
-        assert.equal(parsed.providers.proxy.models[0].compat.modelOnly, "preserved");
-        assert.equal(parsed.providers.proxy.modelOverrides["deepseek-v4"].compat.overrideOnly, "preserved");
-        assert.equal(parsed.providers.proxy.modelOverrides["deepseek-v4"].metadata, "keep-me");
-        return backupNames[0];
+      const assertSnippet = (message: string) => {
+        assert.match(message, /手动修复建议/);
+        assert.match(message, /提供方：proxy/);
+        assert.match(message, /模型：deepseek-v4/);
+        // Not an observed runtime problem, so both placements are offered.
+        assert.match(message, /Provider 级覆盖/);
+        assert.match(message, /模型级覆盖/);
+        assert.match(message, /modelOverrides:/);
+        assert.match(message, /requiresReasoningContentForToolCalls: true/);
+        assert.match(message, /本扩展不会自动改写 models\.yml/);
       };
 
       await command.handler("fix", commandContext);
       assert.equal(menuPrompts.length, 0);
-      const directBackup = await assertApplied(0o600);
+      assertSnippet(notifications.at(-1)?.message ?? "");
 
-      await rm(join(tempAgentDir, directBackup));
-      await writeFile(modelsPath, original, "utf8");
-      await chmod(modelsPath, 0o644);
-      confirmations.length = 0;
       notifications.length = 0;
-      menuChoice = "Fix — Auto-fix compat issues (writes models.json or extension config)";
-
+      menuPrefix = "修复";
       await command.handler("", commandContext);
       assert.equal(menuPrompts.length, 1);
-      assert.ok(menuPrompts[0].options.includes(menuChoice));
-      assert.ok(menuPrompts[0].options.includes("Rollback — Undo the latest confirmed fix"));
-      const menuBackup = await assertApplied(0o644);
-      assert.equal((await stat(join(tempAgentDir, menuBackup))).mode & 0o7777, 0o644);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o644);
+      assert.equal(menuPrompts[0].title, "缓存优化器");
+      assert.ok(menuPrompts[0].options.some((option) => option.startsWith("修复")));
+      assert.ok(menuPrompts[0].options.some((option) => option.startsWith("回滚")));
+      assertSnippet(notifications.at(-1)?.message ?? "");
 
-      confirmations.length = 0;
-      menuChoice = "Rollback — Undo the latest confirmed fix";
-      await command.handler("", commandContext);
-      assert.equal(confirmations.filter(({ title }) => /Rollback/.test(title)).length, 1);
-      assert.equal(await readFile(modelsPath, "utf8"), original);
+      // Neither path asks for confirmation or touches the agent directory.
+      assert.equal(confirmations.length, 0);
+      assert.deepEqual(await readdir(tempAgentDir), []);
 
+      // Without UI the help text still lists rollback and its UI requirement.
       const helpMessages: string[] = [];
       await command.handler("", {
         ...commandContext,
         hasUI: false,
         ui: { ...commandContext.ui, notify: (message: string) => helpMessages.push(message) },
       });
-      assert.match(helpMessages.at(-1) ?? "", /rollback.*requires UI confirmation/i);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
-      else process.env.PI_CACHE_RETENTION = previousRetention;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("receipt captures only scalar fix metadata and exact hash relationships", async () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "apiKey": "env:SECRET",
-      "models": [{ "id": "deepseek-v4", "compat": { "sendSessionAffinityHeaders": false } }]
-    }
-  }
-}`;
-    const modified = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
-    const receipt = internals.createModelsJsonFixReceipt(
-      original,
-      modified,
-      "proxy",
-      "deepseek-v4",
-      "model",
-      { sendSessionAffinityHeaders: true },
-      true,
-      "/tmp/models.json.backup-cache-optimizer-receipt-test",
-      1_700_000_000_000,
-    );
-    assert.ok(receipt);
-    assert.equal(receipt.beforeHash, internals.hashText(original));
-    assert.equal(receipt.afterHash, internals.hashText(modified));
-    assert.deepEqual(receipt.changedKeys, {
-      sendSessionAffinityHeaders: {
-        before: { present: true, value: false },
-        after: { present: true, value: true },
-      },
-    });
-    assert.equal("apiKey" in receipt, false);
-    assert.equal(JSON.stringify(receipt).includes("SECRET"), false);
-    assert.equal(JSON.stringify(receipt).includes("prompt"), false);
-    assert.equal(JSON.stringify(receipt).includes("payload"), false);
-    assert.equal(
-      internals.parseModelsJsonFixReceipt({
-        ...receipt,
-        changedKeys: {
-          apiKey: {
-            before: { present: false },
-            after: { present: true, value: "env:SECRET" },
-          },
-        },
-      }),
-      undefined,
-    );
-  });
-
-  test("transaction rollback restores original content and access mode", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-rollback-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const original = `{"providers": {}}\n`;
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, "utf8");
-      await chmod(modelsPath, 0o604);
-
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(
-        join(process.cwd(), "index.ts"),
-      );
-      const backupPath = `${modelsPath}.backup-cache-optimizer-${freshModule.__internals_for_tests.backupTimestamp()}`;
-      const result = await freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers": {"proxy": {}}}\n`,
-        backupPath,
-        () => "forced post-write validation failure",
-      );
-
-      assert.deepEqual(result, {
-        ok: false,
-        postCheckError: "forced post-write validation failure",
-      });
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o604);
-      assert.equal(await readFile(backupPath, "utf8"), original);
-      assert.equal((await stat(backupPath)).mode & 0o7777, 0o604);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("rollback restores receipt-owned keys surgically and preserves later changes", () => {
-    const original = `{
-  "providers": {
-    "proxy": {
-      "models": [{ "id": "deepseek-v4", "compat": { "sendSessionAffinityHeaders": false } }]
-    }
-  }
-}`;
-    const fixed = original.replace('"sendSessionAffinityHeaders": false', '"sendSessionAffinityHeaders": true');
-    const receipt = internals.createModelsJsonFixReceipt(
-      original,
-      fixed,
-      "proxy",
-      "deepseek-v4",
-      "model",
-      { sendSessionAffinityHeaders: true },
-      true,
-      "/tmp/models.json.backup-cache-optimizer-surgical-test",
-      1_700_000_000_000,
-    );
-    assert.ok(receipt);
-    const later = fixed.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": true,\n      "later": "keep"');
-    const rollback = internals.composeModelsJsonReceiptRollback(later, receipt);
-    assert.equal("error" in rollback, false);
-    if (!("error" in rollback)) {
-      assert.match(rollback.modifiedText, /"sendSessionAffinityHeaders": false/);
-      assert.match(rollback.modifiedText, /"later": "keep"/);
-      assert.equal(internals.validateModelsJsonRollback(rollback.modifiedText, receipt), null);
-    }
-
-    const changedOwnedKey = later.replace('"sendSessionAffinityHeaders": true', '"sendSessionAffinityHeaders": false');
-    assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt)
-        ? (internals.composeModelsJsonReceiptRollback(changedOwnedKey, receipt) as { error: string }).error
-        : "",
-      /changed after the fix/,
-    );
-
-    const removedTarget = later.replace('"deepseek-v4"', '"renamed-after-fix"');
-    assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(removedTarget, receipt)
-        ? (internals.composeModelsJsonReceiptRollback(removedTarget, receipt) as { error: string }).error
-        : "",
-      /(?:could not locate receipt target|target entry is missing)/i,
-    );
-
-    const createdTargetOriginal = `{
-  "providers": {
-    "proxy": { "models": [{ "id": "deepseek-v4" }] }
-  }
-}`;
-    const createdTargetFixed = `{
-  "providers": {
-    "proxy": {
-      "models": [{ "id": "deepseek-v4" }],
-      "modelOverrides": {
-        "deepseek-v4": { "compat": { "sendSessionAffinityHeaders": true } }
-      }
-    }
-  }
-}`;
-    const createdTargetReceipt = internals.createModelsJsonFixReceipt(
-      createdTargetOriginal,
-      createdTargetFixed,
-      "proxy",
-      "deepseek-v4",
-      "modelOverride",
-      { sendSessionAffinityHeaders: true },
-      false,
-      "/tmp/models.json.backup-cache-optimizer-created-target-test",
-      1_700_000_000_000,
-    );
-    assert.ok(createdTargetReceipt);
-    const createdTargetChanged = createdTargetFixed.replace('"models":', '"later": "keep",\n      "models":');
-    assert.match(
-      "error" in internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt)
-        ? (internals.composeModelsJsonReceiptRollback(createdTargetChanged, createdTargetReceipt) as { error: string }).error
-        : "",
-      /created (?:a )?new target entry/,
-    );
-  });
-
-  test("refuses to overwrite an existing backup or modify models.json", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-exclusive-backup-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-existing");
-    const original = `{"providers": {}}\n`;
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, "utf8");
-      await chmod(modelsPath, 0o600);
-      await writeFile(backupPath, "do-not-overwrite", "utf8");
-
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(
-        join(process.cwd(), "index.ts"),
-      );
-
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          `{"providers": {"proxy": {}}}\n`,
-          backupPath,
-          () => null,
-        ),
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o600);
-      assert.equal(await readFile(backupPath, "utf8"), "do-not-overwrite");
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("refuses symlinked transaction paths and expected-hash races", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-symlink-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const targetPath = join(tempAgentDir, "models-target.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-symlink");
-    const original = `{"providers": {}}\n`;
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(targetPath, original, "utf8");
-      await symlink(targetPath, modelsPath);
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(
-        join(process.cwd(), "index.ts"),
-      );
-
-      assert.equal((await lstat(modelsPath)).isSymbolicLink(), true);
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          `{"providers": {"proxy": {}}}\n`,
-          backupPath,
-          () => null,
-          { expectedCurrentHash: freshModule.__internals_for_tests.hashText(original) },
-        ),
-        /not a regular file/,
-      );
-      assert.equal(await readFile(targetPath, "utf8"), original);
-
-      await rm(modelsPath, { force: true });
-      await writeFile(modelsPath, original, "utf8");
-      const backupTarget = join(tempAgentDir, "backup-target.json");
-      await writeFile(backupTarget, original, "utf8");
-      await symlink(backupTarget, backupPath);
-      await assert.rejects(
-        freshModule.__internals_for_tests.atomicRestoreFileFromBackup(backupPath, modelsPath, 0o600),
-        /backup is not a regular file/,
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-
-      await rm(backupPath, { force: true });
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          `{"providers": {"proxy": {}}}\n`,
-          backupPath,
-          () => null,
-          { expectedCurrentHash: freshModule.__internals_for_tests.hashText("different") },
-        ),
-        /changed since the fix preview/,
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-
-      await chmod(modelsPath, 0o640);
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          `{"providers": {"proxy": {}}}\n`,
-          join(tempAgentDir, "models.json.backup-cache-optimizer-mode-race"),
-          () => null,
-          {
-            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
-            expectedCurrentMode: 0o600,
-          },
-        ),
-        /access mode changed since the fix preview/,
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("rejects real target swaps at the final atomic rename boundary", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-final-rename-race-test-"));
-    const targetPath = join(tempDir, "models.json");
-    const backupPath = join(tempDir, "models.json.backup-cache-optimizer-race");
-    const original = '{"providers":{"a":{}}}\n';
-    const replacement = '{"providers":{"b":{}}}\n';
-    const external = '{"providers":{"external":{}}}\n';
-    try {
-      await writeFile(targetPath, original, { encoding: "utf8", mode: 0o600 });
-      await writeFile(backupPath, original, { encoding: "utf8", mode: 0o600 });
-      await assert.rejects(
-        internals.atomicReplaceTextFilePreservingMode(
-          targetPath,
-          replacement,
-          0o600,
-          "fix-race-test",
-          { hash: internals.hashText(original), mode: 0o600 },
-          async () => {
-            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
-          },
-        ),
-        /target content changed during atomic replacement/,
-      );
-      assert.equal(await readFile(targetPath, "utf8"), external);
-
-      await writeFile(targetPath, replacement, { encoding: "utf8", mode: 0o600 });
-      await assert.rejects(
-        internals.atomicRestoreFileFromBackup(
-          backupPath,
-          targetPath,
-          0o600,
-          { hash: internals.hashText(replacement), mode: 0o600, backupHash: internals.hashText(original) },
-          async () => {
-            await writeFile(targetPath, external, { encoding: "utf8", mode: 0o600 });
-          },
-        ),
-        /target content changed during atomic replacement/,
-      );
-      assert.equal(await readFile(targetPath, "utf8"), external);
-    } finally {
-      await rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  test("models.json transactions serialize across concurrent Pi instances", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-transaction-lock-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const original = `{"providers":{}}\n`;
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, { encoding: "utf8", mode: 0o600 });
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      let releaseFirst!: () => void;
-      const firstCommitted = new Promise<void>((resolve) => { releaseFirst = resolve; });
-      let firstEntered!: () => void;
-      const firstStarted = new Promise<void>((resolve) => { firstEntered = resolve; });
-      const hash = freshModule.__internals_for_tests.hashText(original);
-      const first = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers":{"first":{}}}\n`,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-first"),
-        () => null,
-        {
-          expectedCurrentHash: hash,
-          onCommitted: async () => {
-            firstEntered();
-            await firstCommitted;
-          },
-        },
-      );
-      await firstStarted;
-      const second = freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-        `{"providers":{"second":{}}}\n`,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-lock-second"),
-        () => null,
-        { expectedCurrentHash: hash },
-      );
-      releaseFirst();
-      assert.deepEqual((await Promise.allSettled([first, second])).map((result) => result.status), ["fulfilled", "rejected"]);
-      assert.equal(await readFile(modelsPath, "utf8"), `{"providers":{"first":{}}}\n`);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("receipt atomic write rejects a replacement at the final rename boundary", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-final-race-test-"));
-    const receiptPath = join(tempDir, "receipt.json");
-    const originalText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{}}]}}}';
-    const modifiedText = '{"providers":{"proxy":{"models":[{"id":"deepseek-race","compat":{"sendSessionAffinityHeaders":true}}]}}}';
-    const originalReceipt = internals.createModelsJsonFixReceipt(
-      originalText,
-      modifiedText,
-      "proxy",
-      "deepseek-race",
-      "model",
-      { sendSessionAffinityHeaders: true },
-      true,
-      "models.json.backup-cache-optimizer-original",
-      10,
-    );
-    const replacementReceipt = internals.createModelsJsonFixReceipt(
-      originalText,
-      modifiedText,
-      "proxy",
-      "deepseek-race",
-      "model",
-      { sendSessionAffinityHeaders: true },
-      true,
-      "models.json.backup-cache-optimizer-replacement",
-      20,
-    );
-    assert.ok(originalReceipt && replacementReceipt);
-    try {
-      await internals.writeModelsJsonFixReceipt(originalReceipt, receiptPath);
-      const snapshot = await internals.readModelsJsonFixReceiptSnapshot(receiptPath);
-      assert.ok(snapshot);
-      await assert.rejects(
-        internals.writeModelsJsonFixReceipt(
-          { ...originalReceipt, status: "rolled_back", rolledBackAt: 30 },
-          receiptPath,
-          snapshot,
-          async () => {
-            await writeFile(receiptPath, JSON.stringify(replacementReceipt, null, 2) + "\n", "utf8");
-          },
-        ),
-        /fix receipt changed/,
-      );
-      assert.equal((await internals.readModelsJsonFixReceipt(receiptPath))?.transactionId, replacementReceipt.transactionId);
-    } finally {
-      await rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  test("receipt replacement after preview aborts rollback without changing models.json", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-receipt-cas-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const receiptPath = join(tempAgentDir, "pi-cache-optimizer-fix-receipt.json");
-    const original = `{"providers":{"proxy":{"models":[{"id":"deepseek-v4","compat":{"sendSessionAffinityHeaders":false}}]}}}\n`;
-    const fixed = original.replace("false", "true");
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, fixed, { encoding: "utf8", mode: 0o600 });
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      const receiptA = freshModule.__internals_for_tests.createModelsJsonFixReceipt(
-        original,
-        fixed,
-        "proxy",
-        "deepseek-v4",
-        "model",
-        { sendSessionAffinityHeaders: true },
-        true,
-        join(tempAgentDir, "models.json.backup-cache-optimizer-a"),
-        1,
-      );
-      assert.ok(receiptA);
-      await writeFile(join(tempAgentDir, receiptA.backupFile), original, "utf8");
-      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptA, receiptPath);
-      const snapshot = await freshModule.__internals_for_tests.readModelsJsonFixReceiptSnapshot(receiptPath);
-      assert.ok(snapshot);
-      const plan = await freshModule.__internals_for_tests.prepareModelsJsonRollback(snapshot, modelsPath);
-      assert.equal("error" in plan, false);
-      if ("error" in plan) return;
-
-      const receiptB = { ...receiptA, transactionId: "replacement", modelId: "other-model" };
-      await freshModule.__internals_for_tests.writeModelsJsonFixReceipt(receiptB, receiptPath);
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          plan.modifiedText,
-          plan.rollbackBackupPath,
-          (writtenText: string) => freshModule.__internals_for_tests.validateModelsJsonRollback(
-            writtenText,
-            plan.receipt,
-            plan.expectedResultHash,
-          ),
-          {
-            expectedCurrentHash: plan.currentHash,
-            expectedCurrentMode: plan.fileMode,
-            receiptGuard: snapshot,
-            purpose: "rollback",
-          },
-        ),
-        /fix receipt changed since the rollback preview/,
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), fixed);
-      assert.equal((await readdir(tempAgentDir)).some((name) => name.startsWith("models.json.backup-cache-optimizer-rollback-")), false);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("direct rollback command restores an unchanged fix and marks the receipt", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-command-rollback-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousRetention = process.env.PI_CACHE_RETENTION;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const original = `{
-  "providers": {
-    "proxy": {
-      // Keep credentials and comments through both transactions.
-      "apiKey": "env:SECRET",
-      "baseUrl": "https://proxy.example/v1",
-      "models": [{ "id": "deepseek-v4", "name": "DeepSeek V4" }]
-    }
-  }
-}`;
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, "utf8");
-      await chmod(modelsPath, 0o640);
-
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(
-        join(process.cwd(), "index.ts"),
-      );
-      const commands = new Map<string, { handler: (args: string, context: any) => Promise<void> }>();
-      freshModule.default({
-        on() {},
-        registerCommand(name: string, command: { handler: (args: string, context: any) => Promise<void> }) {
-          commands.set(name, command);
-        },
-      } as any);
-      const command = commands.get("cache-optimizer");
-      assert.ok(command);
-
-      const model = {
-        provider: "proxy",
-        id: "deepseek-v4",
-        name: "DeepSeek V4",
-        api: "openai-completions",
-        baseUrl: "https://proxy.example/v1",
-        compat: {},
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128_000,
-        maxTokens: 8192,
-      };
-      const confirmations: string[] = [];
-      const notifications: string[] = [];
-      const context = {
-        model,
-        hasUI: true,
-        sessionManager: { getSessionId: () => "rollback-command-test-session" },
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
-        ui: {
-          confirm: async (title: string) => {
-            confirmations.push(title);
-            return true;
-          },
-          notify: (message: string) => notifications.push(message),
-          setStatus() {},
-          select: async () => undefined,
-        },
-      };
-
-      await command.handler("fix", context);
-      const fixed = await readFile(modelsPath, "utf8");
-      assert.notEqual(fixed, original);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
-      const receiptPath = join(tempAgentDir, freshModule.__internals_for_tests.FIX_RECEIPT_FILE_NAME);
-      const receiptBeforeRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
-        JSON.parse(await readFile(receiptPath, "utf8")),
-      );
-      assert.ok(receiptBeforeRollback);
-      assert.equal(receiptBeforeRollback.status, undefined);
-      assert.equal(receiptBeforeRollback.afterHash, freshModule.__internals_for_tests.hashText(fixed));
-      assert.equal((await stat(receiptPath)).mode & 0o7777, 0o600);
-
-      await command.handler("rollback", { ...context, hasUI: false });
-      assert.equal(await readFile(modelsPath, "utf8"), fixed);
-      assert.ok(notifications.some((message) => message.includes(receiptBeforeRollback.backupFile)));
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 0);
-
-      await command.handler("rollback", context);
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-      assert.equal((await stat(modelsPath)).mode & 0o7777, 0o640);
-      assert.ok(notifications.some((message) => message.includes("Rollback completed")));
-      assert.ok(notifications.some((message) => /run \/reload/i.test(message)));
-      const receiptAfterRollback = freshModule.__internals_for_tests.parseModelsJsonFixReceipt(
-        JSON.parse(await readFile(receiptPath, "utf8")),
-      );
-      assert.equal(receiptAfterRollback?.status, "rolled_back");
-      assert.equal(receiptAfterRollback?.rolledBackAt !== undefined, true);
-      const rollbackBackups = (await readdir(tempAgentDir)).filter((name) =>
-        name.startsWith("models.json.backup-cache-optimizer-rollback-"),
-      );
-      assert.equal(rollbackBackups.length, 1);
-      assert.equal(await readFile(join(tempAgentDir, rollbackBackups[0]), "utf8"), fixed);
-      assert.equal((await stat(join(tempAgentDir, rollbackBackups[0]))).mode & 0o7777, 0o640);
-
-      const notificationCount = notifications.length;
-      await command.handler("rollback", context);
-      assert.equal(notifications.length, notificationCount + 1);
-      assert.match(notifications.at(-1) ?? "", /No unapplied \/cache-optimizer fix receipt was found/);
-      assert.equal(confirmations.filter((title) => /Rollback/.test(title)).length, 1);
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
-      else process.env.PI_CACHE_RETENTION = previousRetention;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("restores models.json atomically when receipt commit fails", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-fix-receipt-failure-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const modelsPath = join(tempAgentDir, "models.json");
-    const backupPath = join(tempAgentDir, "models.json.backup-cache-optimizer-receipt-failure");
-    const original = '{\n  "providers": { "proxy": { "models": [{ "id": "model" }] } }\n}\n';
-
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(modelsPath, original, "utf8");
-      const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), {
-        interopDefault: false,
-        moduleCache: false,
-      });
-      const freshModule = await jiti.import<typeof import("../index.ts")>(
-        join(process.cwd(), "index.ts"),
-      );
-      const modified = original.replace('"models"', '"compat": { "sendSessionAffinityHeaders": true }, "models"');
-      await assert.rejects(
-        freshModule.__internals_for_tests.applyModelsJsonFixTransaction(
-          modified,
-          backupPath,
-          () => null,
-          {
-            expectedCurrentHash: freshModule.__internals_for_tests.hashText(original),
-            onCommitted: async () => {
-              throw new Error("simulated receipt write failure");
-            },
-          },
-        ),
-        /simulated receipt write failure/,
-      );
-      assert.equal(await readFile(modelsPath, "utf8"), original);
-      assert.equal(await readFile(backupPath, "utf8"), original);
+      assert.match(helpMessages.at(-1) ?? "", /rollback.*需要 UI 确认/);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -2929,7 +1626,7 @@ describe("prompt_cache_key model opt-out", () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-chinese-evidence-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
-    const configPath = join(tempAgentDir, "pi-cache-optimizer-config.json");
+    const configPath = join(tempAgentDir, "omp-cache-optimizer-config.json");
     const originalConfig = JSON.stringify({ version: 2, footerMode: "session" }, null, 2) + "\n";
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -2987,7 +1684,7 @@ describe("prompt_cache_key model opt-out", () => {
           errorMessage: '400: {"code":"UNKNOWN_FIELD","message":"未知请求字段：prompt_cache_key","data":{"field":"prompt_cache_key"},"traceId":"trace_130aafe7-2e7b-4220-b137-27bf2b98ce22"}',
         },
       }, context);
-      assert.equal(notifications.some((message) => message.includes("jiyuanlvdong/glm-5.3-flash rejected prompt_cache_key")), true);
+      assert.equal(notifications.some((message) => message.includes("jiyuanlvdong/glm-5.3-flash 拒绝了 prompt_cache_key")), true);
       assert.equal(notifications.some((message) => message.includes("trace_130aafe7")), false);
 
       await fixCommand.handler("fix", { ...context, model: { ...targetModel, id: "glm-other" } });
@@ -3080,17 +1777,19 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("migrates v1 footer config, applies exact omit, and rolls it back", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
     try {
       await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+      // Windows ignores POSIX modes; compare against the mode the file actually has.
+      const configMode = (await stat(configPath)).mode & 0o7777;
       const applied = await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
       const parsed = internals.readPersistedCacheOptimizerConfig(configPath);
       assert.deepEqual(parsed, { version: 2, footerMode: "total", promptCacheKey: { omit: ["proxy/gpt-5.5"] } });
-      assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
+      assert.equal((await stat(configPath)).mode & 0o7777, configMode);
       assert.equal(await readFile(applied.backupPath, "utf8"), original);
-      assert.equal((await stat(applied.backupPath)).mode & 0o7777, 0o640);
+      assert.equal((await stat(applied.backupPath)).mode & 0o7777, configMode);
       const receiptSnapshot = await internals.readPromptCacheKeyConfigReceiptSnapshot(receiptPath);
       assert.ok(receiptSnapshot);
       const receipt = receiptSnapshot.receipt;
@@ -3108,8 +1807,8 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("fix and rollback keep v3 feature settings intact", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-v3-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     const original = JSON.stringify({ version: 3, footerMode: "total", features: { promptRewrite: false, toolOrder: true } }, null, 2) + "\n";
     try {
       await writeFile(configPath, original, { encoding: "utf8", mode: 0o600 });
@@ -3132,7 +1831,7 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("feature toggles refuse to overwrite an unreadable config", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-feature-config-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
     const unreadable = "{\"version\": 9, \"footerMode\": \"total\", \"promptCacheKey\": {\"omit\": [\"proxy/gpt-5.5\"]}}\n";
     try {
       await writeFile(configPath, unreadable, "utf8");
@@ -3155,11 +1854,13 @@ describe("prompt_cache_key model opt-out", () => {
   test("fix receipt failure restores both existing and absent config targets", async () => {
     for (const targetExists of [true, false]) {
       const tempDir = await mkdtemp(join(tmpdir(), `pi-cache-key-config-fix-receipt-failure-${targetExists}-`));
-      const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-      const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+      const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+      const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
       const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
       try {
         if (targetExists) await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
+        // Windows ignores POSIX modes; compare against the mode the file actually has.
+        const configMode = targetExists ? (await stat(configPath)).mode & 0o7777 : 0;
         await mkdir(receiptPath);
         await assert.rejects(
           internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath),
@@ -3167,7 +1868,7 @@ describe("prompt_cache_key model opt-out", () => {
         );
         if (targetExists) {
           assert.equal(await readFile(configPath, "utf8"), original);
-          assert.equal((await stat(configPath)).mode & 0o7777, 0o640);
+          assert.equal((await stat(configPath)).mode & 0o7777, configMode);
         } else {
           await assert.rejects(readFile(configPath, "utf8"), (error: any) => error?.code === "ENOENT");
         }
@@ -3179,8 +1880,8 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("receipt replacement after preview aborts config rollback and restores the post-fix config", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-receipt-race-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     const original = JSON.stringify({ version: 1, footerMode: "total" }, null, 2) + "\n";
     try {
       await writeFile(configPath, original, { encoding: "utf8", mode: 0o640 });
@@ -3207,7 +1908,7 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("atomic config creation never overwrites a file that appears at the final boundary", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-config-create-race-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
     try {
       await assert.rejects(
         internals.atomicCreateTextFileNoReplace(
@@ -3227,8 +1928,8 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("receipt update failure recreates a newly-created post-fix config", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-new-config-receipt-failure-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     try {
       await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
       const fixed = await readFile(configPath, "utf8");
@@ -3253,8 +1954,8 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("direct repeated fixes reject without changing config or receipt", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-repeat-config-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     try {
       await internals.applyPromptCacheKeyConfigFix(model, configPath, receiptPath);
       const configBefore = await readFile(configPath, "utf8");
@@ -3272,8 +1973,8 @@ describe("prompt_cache_key model opt-out", () => {
 
   test("multiple model fixes preserve earlier opt-outs and rollback only the latest change", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-key-multi-config-test-"));
-    const configPath = join(tempDir, "pi-cache-optimizer-config.json");
-    const receiptPath = join(tempDir, "pi-cache-optimizer-config-receipt.json");
+    const configPath = join(tempDir, "omp-cache-optimizer-config.json");
+    const receiptPath = join(tempDir, "omp-cache-optimizer-config-receipt.json");
     const otherModel = { ...model, id: "gpt-5.6", name: "GPT-5.6" };
     try {
       await writeFile(configPath, JSON.stringify({ version: 2, footerMode: "process", promptCacheKey: { omit: ["proxy/existing"] } }, null, 2) + "\n", { mode: 0o640 });
@@ -3293,13 +1994,13 @@ describe("prompt_cache_key model opt-out", () => {
     }
   });
 
-  test("active fix requires confirmation and removes a Pi-provided key after reload", async () => {
+  test("active fix requires confirmation and removes an OMP-provided key after reload", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-command-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      await writeFile(join(tempAgentDir, "pi-cache-optimizer-config.json"), JSON.stringify({ version: 1, footerMode: "process" }) + "\n");
+      await writeFile(join(tempAgentDir, "omp-cache-optimizer-config.json"), JSON.stringify({ version: 1, footerMode: "process" }) + "\n");
       const jiti = createJiti(join(process.cwd(), "tests", "review-findings.test.ts"), { interopDefault: false, moduleCache: false });
       const freshModule = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
       const handlers = new Map<string, (event: any, context: any) => unknown>();
@@ -3332,7 +2033,7 @@ describe("prompt_cache_key model opt-out", () => {
       const result = handlers.get("before_provider_request")?.({ payload }, context) as any;
       assert.deepEqual(result, { keep: true });
       await commands.get("cache-optimizer")?.handler("fix prompt-cache-key", context);
-      assert.match(notifications.at(-1) ?? "", /already omitted/);
+      assert.match(notifications.at(-1) ?? "", /已经关闭 prompt_cache_key/);
       await commands.get("cache-optimizer")?.handler("rollback", context);
       assert.deepEqual(freshModule.__internals_for_tests.readPersistedCacheOptimizerConfig(), { version: 2, footerMode: "process" });
     } finally {

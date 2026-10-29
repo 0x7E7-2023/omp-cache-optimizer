@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -225,89 +224,7 @@ describe("issue #28 archive F: lock heartbeat", () => {
   });
 });
 
-/** Load the released 2.9.0 stats modules (git tag v2.9.0) as another Pi process would run them. */
-async function load290(): Promise<{ I: any; cleanup: () => Promise<void> } | undefined> {
-  let files: Record<string, string>;
-  try {
-    files = Object.fromEntries(["common.ts", "paths.ts", "stats-store.ts", "stats-archive.ts"].map((name) => [
-      name,
-      execFileSync("git", ["show", `v2.9.0:src/${name}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }),
-    ]));
-  } catch {
-    return undefined;
-  }
-  const root = await mkdtemp(join(tmpdir(), "pi-cache-optimizer-2.9.0-"));
-  await mkdir(join(root, "src"));
-  for (const [name, text] of Object.entries(files)) await writeFile(join(root, "src", name), text);
-  await symlink(join(process.cwd(), "node_modules"), join(root, "node_modules"), "dir");
-  const jiti = createJiti(join(root, "loader.ts"), { interopDefault: false, moduleCache: false });
-  const archive = await jiti.import<any>(join(root, "src", "stats-archive.ts"));
-  const store = await jiti.import<any>(join(root, "src", "stats-store.ts"));
-  return { I: { ...store, ...archive }, cleanup: () => rm(root, { recursive: true, force: true }) };
-}
-
 describe("issue #28 archive: 2.9.0 compatibility", () => {
-  test("2.9.0's archive.json is read, migrated to a generation, and 2.9.0 is locked out of writing it", async (t) => {
-    await withAgentDir(async () => {
-      // Loaded inside the agent dir: its paths are resolved at import time.
-      const old = await load290();
-      if (!old) {
-        t.skip("git tag v2.9.0 is not available");
-        return;
-      }
-      try {
-        const v290 = old.I;
-        const now = Date.now();
-        const I = await load("compat");
-        await writeClosedShard(I, now - 4 * DAY, 3);
-        await writeClosedShard(I, now - 3 * DAY, 4);
-        // 2.9.0 compacts first: archive.json.
-        const first = await v290.compactStatsShardsV7(now);
-        assert.equal(first.absorbed, 2);
-        assert.equal((await lstat(I.SHARD_ARCHIVE_PATH)).isFile(), true);
-        // A crash leftover next to it: absorbed, so never counted twice.
-        const leftover = await writeClosedShard(I, now - 3 * DAY, 4);
-        const legacy = JSON.parse(await readFile(I.SHARD_ARCHIVE_PATH, "utf8"));
-        legacy.absorbed[leftover] = now;
-        legacy.buckets[legacy.buckets.length - 1].stats.totalRequests += 4;
-        legacy.buckets[legacy.buckets.length - 1].stats.hitRequests += 4;
-        legacy.buckets[legacy.buckets.length - 1].stats.cachedInputTokens += 40;
-        legacy.buckets[legacy.buckets.length - 1].stats.totalInputTokens += 80;
-        await writeFile(I.SHARD_ARCHIVE_PATH, JSON.stringify(legacy));
-        await writeClosedShard(I, now - 2 * DAY, 5);
-
-        // This version reads it as is.
-        assert.equal(await sessionRequests(I), 3 + 4 + 4 + 5);
-        const view = await I.readStatsArchiveView();
-        assert.equal(view.generation, 0);
-        assert.equal((await I.aggregateStatsWithArchiveV7((await I.readValidStatsShardsV7()).filter((s: any) => !view.absorbedIds.has(s.instanceId)), view, [], null)).bySession.s[KEY].totalRequests, 16);
-
-        // and migrates it on its next pass.
-        const migrated = await I.compactStatsShardsV7(now);
-        assert.equal(migrated.generation, 1);
-        assert.equal(migrated.absorbed, 1);
-        assert.deepEqual(await I.listStatsArchiveGenerations(), [1]);
-        assert.equal((await lstat(I.SHARD_ARCHIVE_PATH)).isDirectory(), true, "archive.json is now a directory");
-        assert.deepEqual(await readdir(I.SHARD_FILES_DIR), []);
-        assert.equal(await sessionRequests(await load("compat-reader")), 16);
-
-        // 2.9.0 still running: it sees an unreadable archive, so it neither
-        // compacts nor deletes anything, and cannot write archive.json.
-        const late = await writeClosedShard(I, now - 2 * DAY, 6);
-        const blocked = await v290.compactStatsShardsV7(now);
-        assert.equal(blocked.skippedCorrupt, true);
-        assert.ok((await readdir(I.SHARD_FILES_DIR)).includes(`${late}.json`), "2.9.0 deleted nothing");
-        assert.equal((await lstat(I.SHARD_ARCHIVE_PATH)).isDirectory(), true);
-        assert.equal((await v290.readStatsArchive()).absorbedIds.size, 0, "2.9.0 falls back to raw shards only");
-        assert.equal(await sessionRequests(await load("compat-reader-2")), 22);
-        await I.compactStatsShardsV7(now);
-        assert.equal(await sessionRequests(await load("compat-reader-3")), 22);
-      } finally {
-        await old.cleanup();
-      }
-    });
-  });
-
   test("an archive.json that 2.9.0 writes after the migration is set aside, never merged", async () => {
     await withAgentDir(async () => {
       const I = await load("orphan");

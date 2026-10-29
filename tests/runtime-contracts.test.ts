@@ -4,9 +4,9 @@ import { afterEach, describe, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-import { __internals_for_tests as internals } from "#extension";
+import extension, { __internals_for_tests as internals } from "#extension";
 import { derivePromptCacheKey } from "../src/request-payload.ts";
 
 type PiModel = NonNullable<ExtensionContext["model"]>;
@@ -21,14 +21,14 @@ function model(overrides: Partial<PiModel> = {}): PiModel {
     name: "GPT-5.5",
     api: "openai-completions",
     baseUrl: "https://proxy.example/v1",
-    compat: {},
+    compat: {} as any,
     reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128_000,
     maxTokens: 8192,
     ...overrides,
-  };
+  } as unknown as PiModel;
 }
 
 function stats(totalRequests: number, day = "2026-08-17") {
@@ -59,99 +59,6 @@ afterEach(() => {
 });
 
 describe("OpenAI-compatible request contracts", () => {
-  test("bridges provider-level session-affinity compat dropped from extension models", () => {
-    const extensionModel = model({
-      provider: "Opencode-Go",
-      id: "mimo-v2.5",
-      name: "MiMo V2.5",
-      compat: {},
-    });
-    const effective = internals.resolveEffectiveCompatFromConfig(extensionModel, {
-      providers: {
-        "Opencode-Go": {
-          compat: { sendSessionAffinityHeaders: true },
-        },
-      },
-    });
-    const headers: Record<string, string | null | undefined> = {};
-
-    assert.equal(
-      internals.addEffectiveSessionAffinityHeaders(headers, extensionModel, "session-123", effective, true, "provider"),
-      true,
-    );
-    assert.deepEqual(headers, {
-      session_id: derivePromptCacheKey("session-123"),
-      "x-client-request-id": derivePromptCacheKey("session-123"),
-      "x-session-affinity": derivePromptCacheKey("session-123"),
-    });
-    assert.deepEqual(internals.describeMissingOpenAICompatibleProxyCompat({ ...extensionModel, compat: effective }), []);
-    assert.equal(internals.buildFixSuggestion({ ...extensionModel, compat: effective }), undefined);
-  });
-
-  test("preserves explicit false, existing headers, and OpenRouter header format", () => {
-    const extensionModel = model({ provider: "router-proxy", id: "gpt-5.5", compat: {} });
-    const existing: Record<string, string | null | undefined> = {
-      "X-Client-Request-Id": "provider-value",
-    };
-    assert.equal(
-      internals.addEffectiveSessionAffinityHeaders(
-        existing,
-        extensionModel,
-        "session-123",
-        { sendSessionAffinityHeaders: true },
-        true,
-        "provider",
-      ),
-      true,
-    );
-    assert.deepEqual(existing, {
-      "X-Client-Request-Id": "provider-value",
-      session_id: derivePromptCacheKey("session-123"),
-      "x-session-affinity": derivePromptCacheKey("session-123"),
-    });
-
-    const openRouterHeaders: Record<string, string | null | undefined> = {};
-    assert.equal(
-      internals.addEffectiveSessionAffinityHeaders(
-        openRouterHeaders,
-        model({ provider: "openrouter-custom", baseUrl: "https://openrouter.ai/api/v1", compat: {} }),
-        "session-456",
-        { sendSessionAffinityHeaders: true, sessionAffinityFormat: "openrouter" },
-        true,
-        "provider",
-      ),
-      true,
-    );
-    assert.deepEqual(openRouterHeaders, { "x-session-id": derivePromptCacheKey("session-456") });
-
-    for (const [candidate, compat, enabled, sessionId] of [
-      [extensionModel, { sendSessionAffinityHeaders: false }, true, "session-123"],
-      [model({ baseUrl: "https://api.openai.com/v1", compat: {} }), { sendSessionAffinityHeaders: true }, true, "session-123"],
-      [model({ api: "openai-responses", compat: {} }), { sendSessionAffinityHeaders: true }, true, "session-123"],
-      [model({ api: "kiro-api", compat: {} }), { sendSessionAffinityHeaders: true }, true, "session-123"],
-      [extensionModel, { sendSessionAffinityHeaders: true }, false, "session-123"],
-      [extensionModel, { sendSessionAffinityHeaders: true }, true, ""],
-      [model({ compat: { sendSessionAffinityHeaders: true } }), { sendSessionAffinityHeaders: true }, true, "session-123"],
-      [model({ compat: { sendSessionAffinityHeaders: false } }), { sendSessionAffinityHeaders: true }, true, "session-123"],
-    ] as const) {
-      const headers: Record<string, string | null | undefined> = {};
-      assert.equal(
-        internals.addEffectiveSessionAffinityHeaders(
-          headers,
-          candidate,
-          sessionId,
-          compat,
-          enabled,
-          (candidate.compat as { sendSessionAffinityHeaders?: boolean } | undefined)?.sendSessionAffinityHeaders !== undefined
-            ? "runtime"
-            : "provider",
-        ),
-        false,
-      );
-      assert.deepEqual(headers, {});
-    }
-  });
-
   test("route fallback does not inherit compat across provider/model identity changes", () => {
     const snapshot = {
       virtualProvider: "router",
@@ -164,464 +71,82 @@ describe("OpenAI-compatible request contracts", () => {
     const routed = internals.routeSnapshotToPiModel(snapshot as any, model({
       provider: "router",
       id: "smart",
-      compat: { sendSessionAffinityHeaders: false },
+      compat: { supportsLongPromptCacheRetention: false } as any,
     }));
     assert.equal(routed.provider, "upstream-proxy");
     assert.equal(routed.id, "gpt-5.5");
     assert.equal(routed.compat, undefined);
   });
 
-  test("schema validation agrees with installed Pi for reviewed edge cases", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-schema-parity-test-"));
-    try {
-      const piRuntimeModule = await createJiti(join(process.cwd(), "tests", "pi-schema-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/model-config.js")>(
-        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "model-config.js"),
-      );
-      for (const [name, config] of Object.entries({
-        invalidThinkingLevel: {
-          providers: {
-            proxy: {
-              compat: { sendSessionAffinityHeaders: true },
-              models: [{ id: "gpt-5.5", thinkingLevelMap: { high: 4 } }],
-            },
-          },
-        },
-        validExtraOverrideCostKey: {
-          providers: {
-            proxy: {
-              compat: { sendSessionAffinityHeaders: true },
-              modelOverrides: { "gpt-5.5": { cost: { input: 1, extra: 2 } } },
-            },
-          },
-        },
-      })) {
-        const modelsPath = join(tempAgentDir, `${name}.json`);
-        await writeFile(modelsPath, JSON.stringify(config));
-        const piConfig = await piRuntimeModule.ModelConfig.load(modelsPath);
-        assert.equal(
-          internals.isValidModelsConfigForEffectiveCompat(config),
-          (piConfig as unknown as { error?: string }).error === undefined,
-          name,
-        );
-      }
-    } finally {
-      await rm(tempAgentDir, { recursive: true, force: true });
+  test("does not register Pi-only hooks that OMP replaced or removed", () => {
+    const handlers = new Map<string, Handler>();
+    extension({ on(name: string, handler: Handler) { handlers.set(name, handler); }, registerCommand() {} } as any);
+    for (const removed of ["model_select", "agent_settled", "before_provider_headers"]) {
+      assert.equal(handlers.has(removed), false, removed);
+    }
+    for (const kept of ["session_start", "session_switch", "turn_start", "agent_end", "before_provider_request", "message_end"]) {
+      assert.equal(handlers.has(kept), true, kept);
     }
   });
 
-  test("installed Pi built-in llama.cpp models match the untouched fingerprint exemption", async () => {
-    // Hermetic agent dir: a developer's real models.json must not change the
-    // effective compat seen by the fingerprint.
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-llama-fingerprint-test-"));
+  test("turn_start publishes the routed footer without a compat warning or marker", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-turn-start-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "llama-fingerprint-test.ts"), { interopDefault: false, moduleCache: false });
-      const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
-      const llamaModule = await jiti.import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/extensions/llama/provider.js")>(
-        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "extensions", "llama", "provider.js"),
-      );
-      const t = fresh.__internals_for_tests;
-      const controller = llamaModule.createLlamaProvider();
-      controller.setCatalog([{ id: "qwen-local", status: { value: "loaded" }, meta: { n_ctx: 32_768 } }], llamaModule.DEFAULT_LLAMA_SERVER_URL);
-      const [builtIn] = controller.provider.getModels();
-      assert.ok(builtIn);
-      assert.equal(builtIn.provider, "llama.cpp");
-      assert.equal(builtIn.api, "openai-completions");
-
-      // The real provider shape from the installed Pi is exempt from generic
-      // proxy routing/session-affinity advice, even on a non-official base URL.
-      assert.equal(t.isPiBuiltInLlamaCppModel(builtIn), true);
-      assert.deepEqual(t.describeMissingOpenAICompatibleProxyCompat(builtIn), []);
-
-      // Pi 0.82.x reported supportsUsageInStreaming: false; Pi 0.83+ reports
-      // true. Streaming usage is not routing configuration, so both host
-      // shapes inside the supported peer range must stay recognized.
-      for (const supportsUsageInStreaming of [false, true]) {
-        assert.equal(
-          t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, supportsUsageInStreaming } }),
-          true,
-          `supportsUsageInStreaming: ${supportsUsageInStreaming}`,
-        );
-      }
-
-      // Same-id providers with routing/cache overrides or a different
-      // transport fingerprint remain ordinary OpenAI-compatible channels.
-      for (const [name, compat] of Object.entries({
-        sessionAffinity: { sendSessionAffinityHeaders: true },
-        sessionAffinityFormat: { sessionAffinityFormat: "openai" },
-        longRetention: { supportsLongCacheRetention: true },
-        developerRole: { supportsDeveloperRole: true },
-      })) {
-        assert.equal(t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, ...compat } } as PiModel), false, name);
-      }
-      assert.deepEqual(
-        t.describeMissingOpenAICompatibleProxyCompat({ ...builtIn, compat: { ...builtIn.compat, supportsDeveloperRole: true } }),
-        ["sendSessionAffinityHeaders"],
-      );
-    } finally {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("skill compression anchors on the installed Pi skills formatter", async () => {
-    // compressSkillsInSystemPrompt only substitutes an exact copy of Pi's
-    // verbose skills block. Drift would silently disable compression.
-    const piSkills = await createJiti(join(process.cwd(), "tests", "skills-format-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js")>(
-      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "skills.js"),
-    );
-    const sourceInfo = { path: "/skills/alpha/SKILL.md", source: "local", scope: "user", origin: "top-level" };
-    const skills = [
-      { name: "alpha", description: "Alpha <xml> & \"quotes\"", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", sourceInfo, disableModelInvocation: false },
-      { name: "beta", description: "Beta", filePath: "/project/.pi/skills/beta/SKILL.md", baseDir: "/project/.pi/skills/beta", sourceInfo, disableModelInvocation: false },
-      { name: "hidden", description: "Hidden", filePath: "/skills/hidden/SKILL.md", baseDir: "/skills/hidden", sourceInfo, disableModelInvocation: true },
-    ] as any;
-    assert.equal(internals.formatSkillsForPrompt(skills), piSkills.formatSkillsForPrompt(skills));
-    assert.equal(internals.formatSkillsForPrompt(skills, "bash"), piSkills.formatSkillsForPrompt(skills, "bash"));
-    assert.equal(internals.formatSkillsForPrompt(skills, "indirect"), piSkills.formatSkillsForPrompt(skills, "indirect"));
-  });
-
-  describe("skill compression on Pi's real system prompt", () => {
-    const sourceInfo = { path: "", source: "local", scope: "user", origin: "top-level" };
-    const skill = (name: string, description: string, filePath: string, disableModelInvocation = false) =>
-      ({ name, description, filePath, baseDir: filePath, sourceInfo, disableModelInvocation }) as any;
-    const skills = [
-      skill("zeta", "Zeta does things.\n  Use when zeta.", "/home/u/.agents/skills/zeta/SKILL.md"),
-      skill("alpha", "Alpha with <xml> & \"quotes\" and $& replacement tokens", "/home/u/.agents/skills/alpha/SKILL.md"),
-      skill("beta", "Beta project skill", "/work/.pi/skills/beta/SKILL.md"),
-      skill("odd", "Directory name differs from skill name", "/home/u/.agents/skills/other-dir/SKILL.md"),
-      skill("win", "Windows style path", "C:\\Users\\u\\skills\\win\\SKILL.md"),
-      skill("hidden", "Must never be listed", "/home/u/.agents/skills/hidden/SKILL.md", true),
-    ];
-    const loadPiPrompt = async () => {
-      const mod = await createJiti(join(process.cwd(), "tests", "system-prompt-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js")>(
-        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "system-prompt.js"),
-      );
-      return (selectedTools: string[], hiddenTools: string[] = []) =>
-        mod.buildSystemPrompt({ cwd: "/work", selectedTools, hiddenTools, skills, contextFiles: [] } as any);
-    };
-
-    test("fires on the prompt Pi actually assembles, keeping every name and description", async () => {
-      const build = await loadPiPrompt();
-      const prompt = build(["read", "bash"]);
-      assert.ok(prompt.includes("<available_skills>"), "Pi should emit the verbose block");
-      const out = internals.compressSkillsInSystemPrompt(prompt, { skills } as any);
-      assert.notEqual(out, prompt, "compression must fire against Pi's real output");
-      assert.ok(out.length < prompt.length);
-      assert.ok(!out.includes("<available_skills>"));
-      assert.match(out, /<skills>\nThe following skills provide specialized instructions/);
-      assert.match(out, /<\/skills>/);
-      for (const s of skills.filter((entry: any) => !entry.disableModelInvocation)) {
-        assert.ok(out.includes(s.name), `${s.name} listed`);
-        assert.ok(out.includes(s.description.replace(/\s+/g, " ").trim()), `${s.name} description kept verbatim`);
-      }
-      assert.ok(!out.includes("Must never be listed"));
-    });
-
-    test("states each root once and gives explicit paths where the convention does not hold", async () => {
-      const build = await loadPiPrompt();
-      const out = internals.compressSkillsInSystemPrompt(build(["read"]), { skills } as any);
-      assert.equal(out.split("## Skills in /home/u/.agents/skills/").length, 2);
-      assert.ok(out.includes("Each skill file is at /home/u/.agents/skills/<name>/SKILL.md"));
-      assert.ok(out.includes("## Skills in /work/.pi/skills/"));
-      assert.ok(out.includes("- odd (file: /home/u/.agents/skills/other-dir/SKILL.md): Directory name differs"));
-      assert.ok(out.includes("- win (file: C:\\Users\\u\\skills\\win\\SKILL.md): Windows style path"));
-      // Conventional skills must not repeat their path.
-      assert.ok(!out.includes("/home/u/.agents/skills/alpha/SKILL.md"));
-      // Dollar patterns in descriptions must not be interpreted as replacement tokens.
-      assert.ok(out.includes("$& replacement tokens"));
-    });
-
-    test("is deterministic, idempotent and independent of skill order", async () => {
-      const build = await loadPiPrompt();
-      const prompt = build(["read"]);
-      const once = internals.compressSkillsInSystemPrompt(prompt, { skills } as any);
-      assert.equal(internals.compressSkillsInSystemPrompt(once, { skills } as any), once);
-      const reversed = [...skills].reverse();
-      assert.equal(internals.formatSkillsForPromptCompressed(reversed), internals.formatSkillsForPromptCompressed(skills));
-    });
-
-    test("also matches the pre-0.86 layout where the block was appended with leading newlines", () => {
-      const legacy = `base prompt${internals.formatSkillsForPrompt(skills)}\n\nCurrent working directory: /work`;
-      const out = internals.compressSkillsInSystemPrompt(legacy, { skills } as any);
-      assert.notEqual(out, legacy);
-      assert.ok(out.startsWith("base prompt\n\nThe following skills"));
-      assert.ok(out.endsWith("\n\nCurrent working directory: /work"));
-    });
-
-    test("no-ops below the minimum count, when Pi's text differs, and when opted out", async () => {
-      const build = await loadPiPrompt();
-      const prompt = build(["read"]);
-      assert.equal(internals.compressSkillsInSystemPrompt(prompt, { skills: skills.slice(0, 2) } as any), prompt);
-      // `bash`-only tool sets make Pi say "Use bash to load…"; compression must recognise that wording too.
-      const bashOnly = build(["bash"]);
-      const bashOut = internals.compressSkillsInSystemPrompt(bashOnly, { skills, selectedTools: ["bash"] } as any);
-      assert.ok(!bashOut.includes("<available_skills>"), "bash-only prompt is compressed");
-      assert.ok(bashOut.includes("Use bash to load a skill's file when the task matches its description."), "Pi's bash wording is kept");
-      // Hidden readers (reachable only through another tool, e.g. a code-mode wrapper) make Pi name no tool.
-      const hidden = build(["codemode", "read", "bash"], ["read", "bash"]);
-      const hiddenOut = internals.compressSkillsInSystemPrompt(hidden, { skills, selectedTools: ["codemode", "read", "bash"], hiddenTools: ["read", "bash"] } as any);
-      assert.ok(!hiddenOut.includes("<available_skills>"), "hidden-reader prompt is compressed");
-      assert.ok(hiddenOut.includes("Load a skill's file when the task matches its description."), "Pi's tool-less wording is kept");
-      const previous = process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION;
-      process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION = "1";
-      try {
-        assert.equal(internals.compressSkillsInSystemPrompt(prompt, { skills } as any), prompt);
-      } finally {
-        if (previous === undefined) delete process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION;
-        else process.env.PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION = previous;
-      }
-    });
-  });
-
-  test("installed Pi registerProvider drops lower provider compat for extension-owned models", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-extension-provider-model-test-"));
-    try {
-      const modelsPath = join(tempAgentDir, "models.json");
-      await writeFile(modelsPath, JSON.stringify({
-        providers: {
-          "Opencode-Go": {
-            compat: { sendSessionAffinityHeaders: true },
-          },
-        },
-      }));
-      const piRuntimeModule = await createJiti(join(process.cwd(), "tests", "pi-runtime-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/model-runtime.js")>(
-        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "model-runtime.js"),
-      );
-      const runtime = await piRuntimeModule.ModelRuntime.create({
-        modelsPath,
-        authPath: join(tempAgentDir, "auth.json"),
-        modelsStorePath: join(tempAgentDir, "models-store.json"),
-        allowModelNetwork: false,
-        refreshOnCreate: false,
-      });
-      runtime.registerProvider("Opencode-Go", {
-        name: "Opencode Go",
-        baseUrl: "https://proxy.example/v1",
-        apiKey: "test-only-placeholder",
-        api: "openai-completions",
-        models: [{
-          id: "mimo-v2.5",
-          name: "MiMo V2.5",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128_000,
-          maxTokens: 8192,
-        }],
-      });
-      const registered = runtime.getModel("Opencode-Go", "mimo-v2.5");
-      assert.ok(registered);
-      assert.equal((registered.compat as { sendSessionAffinityHeaders?: boolean } | undefined)?.sendSessionAffinityHeaders, undefined);
-      assert.equal(
-        internals.resolveEffectiveCompatFromConfig(registered as PiModel, JSON.parse(await readFile(modelsPath, "utf8"))).sendSessionAffinityHeaders,
-        true,
-      );
-    } finally {
-      await rm(tempAgentDir, { recursive: true, force: true });
-    }
-  });
-
-  test("extension hook honors provider-level affinity and explicit modelOverride false", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-affinity-hook-test-"));
-    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-    const previousRetention = process.env.PI_CACHE_RETENTION;
-    try {
-      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-      const jiti = createJiti(join(process.cwd(), "tests", "affinity-hook-test.ts"), { interopDefault: false, moduleCache: false });
+      const jiti = createJiti(join(process.cwd(), "tests", "turn-start-test.ts"), { interopDefault: false, moduleCache: false });
       const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
       const handlers = new Map<string, Handler>();
       fresh.default({ on(name: string, handler: Handler) { handlers.set(name, handler); }, registerCommand() {} } as any);
-      const requestHeaders = handlers.get("before_provider_headers");
-      assert.ok(requestHeaders);
-      const runtimeModel = model({ provider: "Opencode-Go", id: "mimo-v2.5", name: "MiMo V2.5", compat: {} });
       const notifications: string[] = [];
       const statuses: Array<string | undefined> = [];
-      const context = {
-        model: runtimeModel,
-        sessionManager: { getSessionId: () => "hook-session" },
+      const makeContext = (current: PiModel) => ({
+        model: current,
+        mode: "json",
+        sessionManager: { getSessionId: () => "turn-start-session" },
         modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
         ui: {
           notify(message: string) { notifications.push(message); },
           setStatus(_key: string, value: string | undefined) { statuses.push(value); },
         },
-      };
-
-      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-        providers: { "Opencode-Go": { compat: { sendSessionAffinityHeaders: true } } },
-      }));
-      const enabledHeaders: Record<string, string | null> = {};
-      requestHeaders({ headers: enabledHeaders }, context);
-      assert.deepEqual(enabledHeaders, {
-        session_id: derivePromptCacheKey("hook-session"),
-        "x-client-request-id": derivePromptCacheKey("hook-session"),
-        "x-session-affinity": derivePromptCacheKey("hook-session"),
       });
-      assert.deepEqual(fresh.__internals_for_tests.describeMissingOpenAICompatibleProxyCompat(runtimeModel), []);
-      assert.equal(fresh.__internals_for_tests.buildFixSuggestion(runtimeModel), undefined);
-      assert.match(fresh.__internals_for_tests.buildDoctorDiagnosis(runtimeModel), /✅ Compat fully configured\./);
-      assert.equal(fresh.__internals_for_tests.buildCompatDiagnosis(runtimeModel)?.includes("Missing compat"), false);
-      await handlers.get("model_select")?.({ model: runtimeModel, previousModel: undefined, source: "set" }, context);
-      assert.equal(notifications.some((message) => message.includes("merged compat lacks")), false);
-      assert.equal(statuses.some((status) => status?.includes("⚠️ compat")), false);
 
-      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-        providers: {
-          "Opencode-Go": {
-            compat: { sendSessionAffinityHeaders: true },
-            modelOverrides: {
-              "mimo-v2.5": { compat: { sendSessionAffinityHeaders: false } },
-            },
-          },
-        },
-      }));
-      const disabledHeaders: Record<string, string | null> = {};
-      requestHeaders({ headers: disabledHeaders }, context);
-      assert.deepEqual(disabledHeaders, {});
-      assert.deepEqual(fresh.__internals_for_tests.describeMissingOpenAICompatibleProxyCompat(runtimeModel), []);
-      assert.equal(fresh.__internals_for_tests.buildFixSuggestion(runtimeModel), undefined);
+      // Compat that is already complete never warns.
+      const complete = model({ provider: "Opencode-Go", id: "deepseek-v4", reasoning: true, compat: { requiresReasoningContentForToolCalls: true } as any });
+      await handlers.get("turn_start")?.({}, makeContext(complete));
+      assert.equal(notifications.length, 0);
+      assert.equal(statuses.some((status) => status?.includes("⚠️ 配置")), false);
 
+      // A routed fallback with unknown endpoint metadata must not emit a
+      // warning or add the compat footer marker.
       const routeSnapshot = {
         virtualProvider: "router",
         virtualModelId: "smart",
-        provider: "openai-alias",
-        modelId: "gpt-5.5",
-        api: "openai-completions",
+        provider: "anthropic",
+        modelId: "claude-opus-5",
+        api: "anthropic-messages",
         timestamp: Date.now(),
       };
-      const routeContext = {
-        ...context,
-        model: model({ provider: "router", id: "smart", api: "router-api", baseUrl: "https://router.example", compat: {} }),
-        modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
-      };
+      const routeContext = makeContext(model({ provider: "router", id: "smart", api: "router-api", baseUrl: "https://router.example", compat: {} as any }));
       const unregisterRouter = fresh.__internals_for_tests.ensureRoutingRegistry().registerRouter({
         virtualProvider: "router",
         resolveActiveRoute: () => routeSnapshot,
       });
       try {
-        await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-          providers: {
-            "openai-alias": {
-              compat: { sendSessionAffinityHeaders: true },
-            },
-          },
-        }));
-        const unknownEndpointHeaders: Record<string, string | null> = {};
-        requestHeaders({ headers: unknownEndpointHeaders }, routeContext);
-        assert.deepEqual(unknownEndpointHeaders, {});
-        const unknownResolved = fresh.__internals_for_tests.resolveRouteModel(routeContext.model, routeContext as any);
-        assert.ok(unknownResolved);
-        assert.equal(fresh.__internals_for_tests.isCompatCheckApplicable(unknownResolved), false);
-        assert.equal(fresh.__internals_for_tests.isDeepSeekCompatCheckApplicable({ ...unknownResolved, id: "deepseek-chat", name: "DeepSeek" }), false);
-        assert.equal(
-          fresh.__internals_for_tests.isAdaptiveThinkingCompatApplicable({
-            ...unknownResolved,
-            provider: "kimi-coding",
-            id: "k3",
-            name: "Kimi K3",
-            api: "anthropic-messages",
-          }),
-          false,
-        );
-        assert.deepEqual(fresh.__internals_for_tests.describeMissingOpenAICompatibleProxyCompat(unknownResolved), []);
-        const unknownKimi = {
-          ...unknownResolved,
-          provider: "kimi-coding",
-          id: "k3",
-          name: "Kimi K3",
-          api: "anthropic-messages",
-        };
-        assert.deepEqual(
-          fresh.__internals_for_tests.describeMissingCacheCompatForModel({ ...unknownResolved, id: "deepseek-chat", name: "DeepSeek" }),
-          [],
-        );
-        assert.deepEqual(fresh.__internals_for_tests.describeMissingCacheCompatForModel(unknownKimi), []);
-        assert.equal(fresh.__internals_for_tests.buildFixSuggestion(unknownKimi), undefined);
-        assert.match(
-          fresh.__internals_for_tests.buildDoctorDiagnosis(unknownKimi),
-          /ℹ️ Compat check not applicable for this model\./,
-        );
-
-        // Exercise the lifecycle paths as well as the pure diagnostics: a
-        // routed fallback with unknown endpoint metadata must not emit an
-        // adaptive-thinking warning or add a compat footer marker.
-        const originalRouteSnapshot = { ...routeSnapshot };
-        Object.assign(routeSnapshot, {
-          provider: "anthropic",
-          modelId: "claude-opus-5",
-          api: "anthropic-messages",
-        });
-        const notificationCountBeforeUnknownRoute = notifications.length;
-        const statusCountBeforeUnknownRoute = statuses.length;
-        try {
-          await handlers.get("model_select")?.(
-            { model: routeContext.model, previousModel: undefined, source: "set" },
-            routeContext,
-          );
-          assert.equal(notifications.length, notificationCountBeforeUnknownRoute);
-          const unknownRouteStatuses = statuses.slice(statusCountBeforeUnknownRoute);
-          assert.ok(unknownRouteStatuses.length > 0, "model_select should publish the routed footer status");
-          assert.match(unknownRouteStatuses.at(-1) ?? "", /Claude cache/);
-          assert.equal(
-            unknownRouteStatuses.some((status) => status?.includes("⚠️ compat")),
-            false,
-          );
-        } finally {
-          Object.assign(routeSnapshot, originalRouteSnapshot);
-        }
-
-        assert.equal(fresh.__internals_for_tests.buildFixSuggestion(unknownResolved), undefined);
-        assert.match(
-          fresh.__internals_for_tests.buildDoctorDiagnosis(unknownResolved),
-          /Upstream endpoint metadata is unavailable; session-affinity header injection is disabled\./,
-        );
-        assert.equal(fresh.__internals_for_tests.describeRouterChannelDiagnostics(unknownResolved).length, 0);
-
-        await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-          providers: {
-            "openai-alias": {
-              baseUrl: "https://api.openai.com/v1",
-              compat: { sendSessionAffinityHeaders: true },
-            },
-          },
-        }));
-        const officialHeaders: Record<string, string | null> = {};
-        requestHeaders({ headers: officialHeaders }, routeContext);
-        assert.deepEqual(officialHeaders, {});
-
-        await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-          providers: {
-            "openai-alias": {
-              baseUrl: "https://third-party.example/v1",
-              compat: { sendSessionAffinityHeaders: true },
-            },
-          },
-        }));
-        const routedProxyHeaders: Record<string, string | null> = {};
-        requestHeaders({ headers: routedProxyHeaders }, routeContext);
-        assert.equal(routedProxyHeaders["x-session-affinity"], derivePromptCacheKey("hook-session"));
+        const notificationCount = notifications.length;
+        const statusCount = statuses.length;
+        await handlers.get("turn_start")?.({}, routeContext);
+        assert.equal(notifications.length, notificationCount);
+        const routedStatuses = statuses.slice(statusCount);
+        assert.ok(routedStatuses.length > 0, "turn_start should publish the routed footer status");
+        assert.match(routedStatuses.at(-1) ?? "", /Claude/);
+        assert.equal(routedStatuses.some((status) => status?.includes("⚠️ 配置")), false);
       } finally {
         unregisterRouter();
       }
-
-      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-        providers: {
-          "Opencode-Go": {
-            baseUrl: 123,
-            compat: { sendSessionAffinityHeaders: true },
-          },
-        },
-      }));
-      const invalidConfigHeaders: Record<string, string | null> = {};
-      requestHeaders({ headers: invalidConfigHeaders }, context);
-      assert.deepEqual(invalidConfigHeaders, {});
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      if (previousRetention === undefined) delete process.env.PI_CACHE_RETENTION;
-      else process.env.PI_CACHE_RETENTION = previousRetention;
       await rm(tempAgentDir, { recursive: true, force: true });
     }
   });
@@ -646,8 +171,8 @@ describe("OpenAI-compatible request contracts", () => {
     assert.equal(internals.addOpenAIPromptCacheKey(null, "session-key"), undefined);
   });
 
-  test("does not use the unsupported Pi supportsPromptCacheKey compat field", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-key-compat-test-"));
+  test("does not use the unsupported supportsPromptCacheKey compat field", async () => {
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-key-compat-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -657,7 +182,7 @@ describe("OpenAI-compatible request contracts", () => {
       fresh.default({ on(name: string, handler: Handler) { handlers.set(name, handler); }, registerCommand() {} } as any);
       const request = handlers.get("before_provider_request");
       assert.ok(request);
-      const runtimeModel = model({ provider: "cache-key-proxy", id: "cache-key-model", compat: {} });
+      const runtimeModel = model({ provider: "cache-key-proxy", id: "cache-key-model", compat: { supportsPromptCacheKey: false } as any });
       const context = {
         model: runtimeModel,
         sessionManager: { getSessionId: () => "cache-key-session" },
@@ -665,31 +190,30 @@ describe("OpenAI-compatible request contracts", () => {
         ui: { notify() {}, setStatus() {} },
       };
 
-      await writeFile(join(tempAgentDir, "models.json"), JSON.stringify({
-        providers: { "cache-key-proxy": { compat: { supportsPromptCacheKey: false } } },
-      }));
+      // The compat field is ignored; every OpenAI-compatible API gets a key.
       assert.equal(fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel(runtimeModel), true);
       assert.equal(
         fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel({ ...runtimeModel, api: "openai-responses" } as any),
-        false,
+        true,
       );
+      assert.equal(fresh.__internals_for_tests.shouldInjectOpenAIPromptCacheKeyForModel({ ...runtimeModel, api: "anthropic-messages" } as any), false);
+      // Chat Completions: session-hash key.
       assert.deepEqual(
         request({ payload: { messages: [] } }, context),
         { messages: [], prompt_cache_key: derivePromptCacheKey("cache-key-session") },
       );
-      assert.equal(
-        request({ payload: { input: [] } }, { ...context, model: { ...runtimeModel, api: "openai-responses" } }),
-        undefined,
-      );
+      // Responses family: project-level stable key instead of the session key.
+      const responses = request({ payload: { input: [] } }, { ...context, model: { ...runtimeModel, api: "openai-responses" } }) as Record<string, unknown>;
+      assert.match(String(responses.prompt_cache_key), /^omp-cache-v1-[0-9a-f]{48}$/);
 
       // The extension-owned config is the only per-model opt-out. It removes
-      // both spellings after Pi/core request mutations have already run.
+      // both spellings after host request mutations have already run.
       fresh.__internals_for_tests.setPersistedCacheOptimizerConfig({
         version: 2,
         promptCacheKey: { omit: ["cache-key-proxy/cache-key-model"] },
       });
       assert.deepEqual(
-        request({ payload: { messages: [], prompt_cache_key: "pi", promptCacheKey: "caller" } }, context),
+        request({ payload: { messages: [], prompt_cache_key: "omp", promptCacheKey: "caller" } }, context),
         { messages: [] },
       );
     } finally {
@@ -928,7 +452,7 @@ describe("assistant response identity", () => {
 
 describe("v7 shard persistence and aggregation", () => {
   test("aggregates exact provider/model shards by session and totals", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-shards-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-shards-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -996,7 +520,7 @@ describe("v7 shard persistence and aggregation", () => {
   });
 
   test("uses the newest shard metadata for an exact model key", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-model-ref-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-model-ref-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -1034,7 +558,7 @@ describe("v7 shard persistence and aggregation", () => {
         makeShard("99999999-9999-4999-8999-999999999999", 10),
       ], day);
       assert.equal(aggregate.modelRefsByKey[key].name, "Kimi K3");
-      assert.match(I.buildAllStatsOutput(aggregate), /Adapter: Kimi cache/);
+      assert.match(I.buildAllStatsOutput(aggregate), /适配器：Kimi Cache/);
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1043,7 +567,7 @@ describe("v7 shard persistence and aggregation", () => {
   });
 
   test("independent extension instances create non-overwriting shards", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-multi-instance-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-multi-instance-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -1058,12 +582,12 @@ describe("v7 shard persistence and aggregation", () => {
           sessionManager: { getSessionId: () => sessionId },
           ui: { notify() {}, setStatus() {} }, hasUI: false,
         };
-        await handlers.get("session_start")?.({ reason: "startup" }, context);
+        await handlers.get("session_start")?.({}, context);
         await handlers.get("message_end")?.({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 50, cacheWrite: 0 } } }, context);
         await handlers.get("session_shutdown")?.({ reason: "quit" }, context);
       };
       await Promise.all([createInstance("multi-a"), createInstance("multi-b")]);
-      const shardDir = join(tempAgentDir, "pi-cache-optimizer-stats.d", "shards");
+      const shardDir = join(tempAgentDir, "omp-cache-optimizer-stats.d", "shards");
       const shardNames = (await readdir(shardDir)).filter((name) => name.endsWith(".json"));
       assert.equal(shardNames.length, 2);
       const shards = await Promise.all(shardNames.map(async (name) => JSON.parse(await readFile(join(shardDir, name), "utf8"))));
@@ -1080,7 +604,7 @@ describe("v7 shard persistence and aggregation", () => {
   });
 
   test("an external model reset is adopted before shutdown can rewrite stale counters", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-cross-process-reset-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-cross-process-reset-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -1094,12 +618,12 @@ describe("v7 shard persistence and aggregation", () => {
         sessionManager: { getSessionId: () => "cross-process-reset" },
         ui: { notify() {}, setStatus() {} }, hasUI: false,
       };
-      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await handlers.get("session_start")?.({}, context);
       await handlers.get("message_end")?.({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 50, cacheWrite: 0 } } }, context);
       await fresh.__internals_for_tests.advanceModelStatsEpoch("proxy/gpt-5.5");
       // Lifecycle refresh must clear the stale process-local bucket before the
       // final closed write, even when no new assistant message arrives.
-      await handlers.get("agent_settled")?.({}, context);
+      await handlers.get("agent_end")?.({}, context);
       await fresh.__internals_for_tests.statsRefreshSettled();
       await handlers.get("session_shutdown")?.({ reason: "quit" }, context);
       const shardDir = fresh.__internals_for_tests.SHARD_FILES_DIR;
@@ -1115,7 +639,7 @@ describe("v7 shard persistence and aggregation", () => {
   });
 
   test("model reset epochs hide old shard counters", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-epoch-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-epoch-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -1144,7 +668,7 @@ describe("v7 shard persistence and aggregation", () => {
   });
 
   test("cleanup removes old shards and retains current-day files", async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "pi-cache-shard-cleanup-test-"));
+    const tempDir = await mkdtemp(join(tmpdir(), "omp-cache-shard-cleanup-test-"));
     try {
       const I = internals;
       const today = new Date();
@@ -1197,10 +721,10 @@ describe("v7 shard persistence and aggregation", () => {
       },
     };
     const sessionOutput = internals.buildSessionStatsOutput(current, model());
-    assert.match(sessionOutput, /Scope: current session/);
+    assert.match(sessionOutput, /范围：当前 session/);
     assert.match(sessionOutput, /proxy\/gpt-5\.5/);
     assert.match(sessionOutput, /anthropic\/claude-opus-5/);
-    assert.match(sessionOutput, /4\/5·0\.66M\/0\.84M 78\.7%/);
+    assert.match(sessionOutput, /汇总：4\/5 次 · 660\.0k\/839\.0k tok · 79%/);
 
     const aggregate = {
       bySession: { current: current, other: { "proxy/gpt-5.5": stats(3, "2026-08-20") } },
@@ -1216,15 +740,15 @@ describe("v7 shard persistence and aggregation", () => {
       },
     };
     const allOutput = internals.buildAllStatsOutput(aggregate);
-    assert.match(allOutput, /Scope: all local sessions/);
-    assert.match(allOutput, /Sessions: 2 · Instances: 2/);
-    assert.match(allOutput, /4\/5·0\.66M\/0\.84M 78\.7%/);
+    assert.match(allOutput, /范围：本机所有 session/);
+    assert.match(allOutput, /Session：2 · 实例：2/);
+    assert.match(allOutput, /汇总：4\/5 次 · 660\.0k\/839\.0k tok · 79%/);
   });
 });
 
 describe("lifecycle persistence", () => {
   test("session_shutdown flushes a pending message_end update immediately", async () => {
-    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-shutdown-test-"));
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "omp-cache-shutdown-test-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     const previousRetention = process.env.PI_CACHE_RETENTION;
 
@@ -1252,7 +776,7 @@ describe("lifecycle persistence", () => {
         ui: { notify() {}, setStatus() {}, confirm: async () => false, select: async () => undefined },
         hasUI: true,
       };
-      await handlers.get("session_start")?.({ reason: "startup" }, context);
+      await handlers.get("session_start")?.({}, context);
       await handlers.get("message_end")?.({
         message: {
           role: "assistant",
@@ -1265,7 +789,7 @@ describe("lifecycle persistence", () => {
       }, context);
       await handlers.get("session_shutdown")?.({ reason: "quit" }, context);
 
-      const shardDir = join(tempAgentDir, "pi-cache-optimizer-stats.d", "shards");
+      const shardDir = join(tempAgentDir, "omp-cache-optimizer-stats.d", "shards");
       const shardNames = (await readdir(shardDir)).filter((name) => name.endsWith(".json"));
       assert.equal(shardNames.length, 1);
       const persisted = JSON.parse(await readFile(join(shardDir, shardNames[0]), "utf8"));

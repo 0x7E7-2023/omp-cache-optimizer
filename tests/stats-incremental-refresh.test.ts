@@ -171,7 +171,7 @@ function within<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
 }
 
 const requestsOf = (status: string | undefined): number | undefined => {
-  const match = /cache (\d+)\/(\d+)/.exec(status ?? "");
+  const match = /缓存请求命中次数：(\d+)\/(\d+) 次/.exec(status ?? "");
   return match ? Number(match[2]) : undefined;
 };
 
@@ -360,7 +360,7 @@ describe("tiered shard index", () => {
       const id = await writeShard(h.I, { session: "other", updatedAt: now - 3 * HOUR, requests: 3 });
       // A filesystem without inodes and with coarse timestamps: the identity never changes.
       h.I.setStatsFsTestHooks({ shardStat: (_path: string, info: any) => { info.ino = 0; info.mtimeMs = 2000; info.ctimeMs = 2000; info.birthtimeMs = 2000; return info; } });
-      const total = () => { const match = /cache (\d+)\/(\d+)/.exec(h.statuses.at(-1) ?? ""); return match ? Number(match[2]) : -1; };
+      const total = () => { const match = /缓存请求命中次数：(\d+)\/(\d+) 次/.exec(h.statuses.at(-1) ?? ""); return match ? Number(match[2]) : -1; };
       try {
         await withEnv({ [h.I.STATS_VERIFY_ENV]: "1" }, async () => {
           const { warnings } = await captureWarnings(async () => {
@@ -652,7 +652,7 @@ describe("non-awaited lifecycle refreshes", () => {
         const other = await load("epoch-overtaken-other");
         await other.advanceGlobalStatsEpoch();
         const globalAfter = await h.I.readGlobalStatsEpoch();
-        await h.handlers.get("model_select")!({ model: h.ctx.model }, h.ctx);
+        await h.handlers.get("turn_start")!({}, h.ctx);
         release.resolve();
         await within(Promise.resolve(ended), 2_000, "message_end");
         await h.I.statsRefreshSettled();
@@ -790,7 +790,7 @@ describe("non-awaited lifecycle refreshes", () => {
           await h.handlers.get("message_end")!(usageMessage(), h.ctx);
           stale = true;
           await h.handlers.get("tool_execution_end")!({ toolCallId: "t1" }, h.ctx);
-          await h.handlers.get("agent_settled")!({}, h.ctx);
+          await h.handlers.get("agent_end")!({}, h.ctx);
           await h.I.statsRefreshSettled();
           await sleep(20);
         });
@@ -835,7 +835,7 @@ describe("non-awaited lifecycle refreshes", () => {
     });
   });
 
-  test("lifecycle handlers return before the refresh; session_shutdown drains it, and model_select still awaits one", async () => {
+  test("lifecycle handlers return before the refresh; session_shutdown drains it, and a model change at turn_start awaits one", async () => {
     await withAgentDir(async () => {
       let armed = false;
       const release = deferred();
@@ -844,7 +844,7 @@ describe("non-awaited lifecycle refreshes", () => {
       await h.I.waitForStatsRestore();
       armed = true;
       await within(h.handlers.get("tool_execution_end")!({ toolCallId: "t1" }, h.ctx), 2_000, "tool_execution_end");
-      await within(h.handlers.get("agent_settled")!({}, h.ctx), 2_000, "agent_settled");
+      await within(h.handlers.get("agent_end")!({}, h.ctx), 2_000, "agent_end");
       await within(h.handlers.get("message_end")!(usageMessage(), h.ctx), 2_000, "message_end");
       const shutdown = h.handlers.get("session_shutdown")!({}, h.ctx);
       let done = false;
@@ -1167,7 +1167,7 @@ describe("archive pairing in the incremental path", () => {
       // Call order through the read facade: the archive listing comes after every shard read.
       const counting = h.I.countingStatsReadFs();
       h.I.setStatsReadFsForTests(counting.fs);
-      await h.handlers.get("model_select")!({ model: h.ctx.model }, h.ctx);
+      await h.handlers.get("turn_start")!({}, h.ctx);
       h.I.setStatsReadFsForTests(undefined);
       const archiveDir = join(h.I.SHARD_ARCHIVE_PATH, "..");
       const firstArchive = counting.counts.paths.findIndex((path: string) => path.includes(archiveDir));
@@ -1203,7 +1203,7 @@ describe("archive pairing in the incremental path", () => {
 
   test("steady-state refresh: readdir x2, lstat = hot set, readFile = epochs only; the kill switch stats every shard", async () => {
     for (const incremental of [true, false]) {
-      await withEnv({ PI_CACHE_OPTIMIZER_STATS_INCREMENTAL: incremental ? undefined : "0" }, async () => {
+      await withEnv({ OMP_CACHE_OPTIMIZER_STATS_INCREMENTAL: incremental ? undefined : "0" }, async () => {
         await withAgentDir(async () => {
           const h = await harness(`counts-${incremental}`);
           const now = Date.now();
@@ -1214,13 +1214,15 @@ describe("archive pairing in the incremental path", () => {
           for (let i = 0; i < 2; i++) await writeShard(h.I, { session: "live", state: "active", updatedAt: now - HOUR, requests: 1 });
           await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
           await h.I.waitForStatsRestore();
-          await h.handlers.get("model_select")!({ model: h.ctx.model }, h.ctx);
+          await h.handlers.get("turn_start")!({}, h.ctx);
           const counting = h.I.countingStatsReadFs();
           let shardStats = 0;
           h.I.setStatsFsTestHooks({ shardStat: (_path: string, info: any) => { shardStats++; return info; } });
           h.I.setStatsReadFsForTests(counting.fs);
           try {
-            await h.handlers.get("model_select")!({ model: h.ctx.model }, h.ctx);
+            // turn_start only refreshes on a model change, so measure the background refresh a tool end triggers.
+            await h.handlers.get("tool_execution_end")!({ toolCallId: "t1" }, h.ctx);
+            await h.I.statsRefreshSettled();
           } finally {
             h.I.setStatsReadFsForTests(undefined);
             h.I.setStatsFsTestHooks(undefined);
@@ -1253,7 +1255,7 @@ describe("kill switch and timing log", () => {
     assert.equal(I.getCacheOptimizerArgumentCompletions("config ").some((item: { label: string }) => item.label === "stats-incremental"), true);
     assert.equal(I.statsTimingLogPath({}), undefined);
     assert.equal(I.statsTimingLogPath({ [I.STATS_TIMING_ENV]: "0" }), undefined);
-    assert.match(I.statsTimingLogPath({ [I.STATS_TIMING_ENV]: "1" }), /pi-cache-optimizer-stats-timing\.jsonl$/);
+    assert.match(I.statsTimingLogPath({ [I.STATS_TIMING_ENV]: "1" }), /omp-cache-optimizer-stats-timing\.jsonl$/);
     assert.equal(I.statsTimingLogPath({ [I.STATS_TIMING_ENV]: "/tmp/x.jsonl" }), "/tmp/x.jsonl");
 
     await withAgentDir(async (dir) => {
@@ -1262,7 +1264,7 @@ describe("kill switch and timing log", () => {
         const h = await harness("timing");
         await h.handlers.get("session_start")!({ reason: "startup" }, h.ctx);
         await h.I.waitForStatsRestore();
-        await h.handlers.get("model_select")!({ model: h.ctx.model }, h.ctx);
+        await h.handlers.get("turn_start")!({}, h.ctx);
         await h.handlers.get("session_shutdown")!({}, h.ctx);
         // The log is appended in the background (never awaited by a handler).
         let text = "";

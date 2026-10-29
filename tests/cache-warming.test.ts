@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import { buildCacheWarmingDiagnosis, cacheWarmingRefreshDelayMs, decideZeroPriceWarming, isOpenRouterRouterModel, isZeroPriced, readCacheWarmingMode, suggestedPromptCacheLifetimes } from "../src/cache-warming.ts";
 
@@ -18,22 +18,23 @@ function model(overrides: Record<string, unknown> = {}): PiModel {
     cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
     contextWindow: 200_000,
     maxTokens: 32_000,
-    compat: { forceAdaptiveThinking: true },
+    thinking: { mode: "anthropic-adaptive" },
     ...overrides,
   } as unknown as PiModel;
 }
 
 describe("cache warming diagnostics", () => {
-  test("reads the mode from Pi settings and defaults to streaming", () => {
-    assert.equal(readCacheWarmingMode(undefined), "unsupported");
-    assert.equal(readCacheWarmingMode(() => { throw new Error("boom"); }), "unsupported");
-    assert.equal(readCacheWarmingMode(() => ({})), "streaming");
-    assert.equal(readCacheWarmingMode(() => ({ cacheWarming: "idle" })), "idle");
-    assert.equal(readCacheWarmingMode(() => ({ cacheWarming: "off" })), "off");
-    assert.equal(readCacheWarmingMode(() => ({ cacheWarming: "bogus" })), "streaming");
+  test("reads providers.cacheWarming from the OMP config and defaults to idle", () => {
+    assert.equal(readCacheWarmingMode(() => { throw new Error("boom"); }), "idle");
+    assert.equal(readCacheWarmingMode(() => undefined), "idle");
+    assert.equal(readCacheWarmingMode(() => ({})), "idle");
+    assert.equal(readCacheWarmingMode(() => ({ providers: { cacheWarming: "streaming" } })), "streaming");
+    assert.equal(readCacheWarmingMode(() => ({ providers: { cacheWarming: "off" } })), "off");
+    assert.equal(readCacheWarmingMode(() => ({ "providers.cacheWarming": "streaming" })), "streaming");
+    assert.equal(readCacheWarmingMode(() => ({ providers: { cacheWarming: "bogus" } })), "idle");
   });
 
-  test("matches Pi's refresh schedule", () => {
+  test("matches OMP's refresh schedule", () => {
     assert.equal(cacheWarmingRefreshDelayMs(300_000), 270_000);
     assert.equal(cacheWarmingRefreshDelayMs(3_600_000), 3_240_000);
     assert.equal(cacheWarmingRefreshDelayMs(10_000), undefined);
@@ -43,7 +44,7 @@ describe("cache warming diagnostics", () => {
     const result = buildCacheWarmingDiagnosis(model(), { mode: "streaming", tier: "long" });
     assert.equal(result.eligible, false);
     assert.deepEqual(result.issues, ["prompt_cache_missing"]);
-    assert.ok(result.lines.some((line) => line.includes('"promptCache": {"short":300,"long":3600}')));
+    assert.ok(result.lines.some((line) => line.includes("promptCache: { short: 300, long: 3600 }")));
   });
 
   test("suggests only the short lifetime outside anthropic-messages", () => {
@@ -54,12 +55,12 @@ describe("cache warming diagnostics", () => {
     const result = buildCacheWarmingDiagnosis(model({ promptCache: { short: 300, long: 3600 } }), { mode: "streaming", tier: "long" });
     assert.equal(result.eligible, true);
     assert.deepEqual(result.issues, []);
-    assert.ok(result.lines.some((line) => line.includes("promptCache.long: 1h")));
+    assert.ok(result.lines.some((line) => line.includes("promptCache.long：1h")));
   });
 
   test("flags missing pricing and non-replayable budget thinking", () => {
     const result = buildCacheWarmingDiagnosis(
-      model({ promptCache: { short: 300 }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: {} }),
+      model({ promptCache: { short: 300 }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinking: undefined }),
       { mode: "streaming", tier: "short" },
     );
     assert.deepEqual(result.issues, ["pricing_missing", "not_replayable"]);
@@ -68,9 +69,9 @@ describe("cache warming diagnostics", () => {
 
   test("explains that idle mode cannot refresh a one-hour entry", () => {
     const result = buildCacheWarmingDiagnosis(model({ promptCache: { short: 300, long: 3600 } }), { mode: "idle", tier: "long" });
-    assert.ok(result.lines.some((line) => line.includes("idle warming stops after 30m") && line.includes("54m")));
+    assert.ok(result.lines.some((line) => line.includes("idle 预热在 30 分钟后停止") && line.includes("54 分钟")));
     const short = buildCacheWarmingDiagnosis(model({ promptCache: { short: 300, long: 3600 } }), { mode: "idle", tier: "short" });
-    assert.ok(!short.lines.some((line) => line.includes("idle warming stops after 30m")));
+    assert.ok(!short.lines.some((line) => line.includes("idle 预热在 30 分钟后停止")));
   });
 
   test("off mode and unsupported hosts are not eligible", () => {
@@ -82,7 +83,7 @@ describe("cache warming diagnostics", () => {
 describe("zero-price warming override", () => {
   const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-  test("turns Pi's unpriced stop into warm for zero-price models", () => {
+  test("turns OMP's unpriced stop into warm for zero-price models", () => {
     assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, model({ cost: zero })), "warm");
   });
 
@@ -93,7 +94,7 @@ describe("zero-price warming override", () => {
     assert.deepEqual(buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: true }).issues, ["pricing_missing"]);
   });
 
-  test("respects Pi when the model has prices or Pi already warms", () => {
+  test("respects OMP when the model has prices or OMP already warms", () => {
     assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, model()), undefined);
     assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0.01, missCost: 0.02 }, model({ cost: zero })), undefined);
     assert.equal(decideZeroPriceWarming({ action: "warm", warmCost: 0, missCost: 0 }, model({ cost: zero })), undefined);
@@ -104,19 +105,19 @@ describe("zero-price warming override", () => {
     const m = model({ promptCache: { short: 300, long: 3600 }, cost: zero });
     const on = buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: true });
     assert.equal(on.eligible, true);
-    assert.ok(on.lines.some((line) => line.includes("overrides")));
+    assert.ok(on.lines.some((line) => line.includes("本扩展会覆盖这一判断")));
     const off = buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: false });
     assert.deepEqual(off.issues, ["pricing_missing"]);
   });
 
-  test("OpenRouter router models are not free just because Pi shows 0 (Pi 1.2.0 normalises -1 to 0)", () => {
+  test("OpenRouter router models are not free just because OMP shows 0", () => {
     const router = model({ provider: "openrouter", id: "openrouter/auto", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1", cost: zero, promptCache: { short: 300 } });
     assert.equal(isOpenRouterRouterModel(router), true);
     assert.equal(isZeroPriced(router), false);
     assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, router), undefined);
     const diagnosis = buildCacheWarmingDiagnosis(router, { mode: "streaming", tier: "short", zeroPriceWarming: true });
     assert.deepEqual(diagnosis.issues, ["pricing_unknown"]);
-    assert.ok(diagnosis.lines.some((line) => line.includes("OpenRouter router")));
+    assert.ok(diagnosis.lines.some((line) => line.includes("OpenRouter 路由模型")));
     // A routed id reached through another provider entry is still a router.
     assert.equal(isZeroPriced(model({ provider: "proxy", id: "openrouter/free", cost: zero })), false);
     // Ordinary free OpenRouter models stay zero-priced.
@@ -130,7 +131,7 @@ describe("zero-price warming override", () => {
     assert.equal(decideZeroPriceWarming({ action: "stop", warmCost: 0, missCost: 0 }, m), undefined);
     const diagnosis = buildCacheWarmingDiagnosis(m, { mode: "streaming", tier: "long", zeroPriceWarming: true });
     assert.deepEqual(diagnosis.issues, ["pricing_missing"]);
-    assert.ok(diagnosis.lines.some((line) => line.includes("price tiers")));
+    assert.ok(diagnosis.lines.some((line) => line.includes("按 prompt 长度分档")));
     const allZeroTiers = model({ cost: { ...zero, tiers: [{ ...zero, inputTokensAbove: 200_000 }] } });
     assert.equal(isZeroPriced(allZeroTiers), true);
   });

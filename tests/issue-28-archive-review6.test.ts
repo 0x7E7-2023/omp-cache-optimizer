@@ -200,7 +200,7 @@ describe("R6: undoing a move aside never overwrites a newer archive.json", () =>
 });
 
 describe("R7: an awaited retry holds the process open", () => {
-  // Pi's print mode exits by letting the event loop drain (main() is not
+  // OMP's print mode exits by letting the event loop drain (main() is not
   // awaited). An unref'd retry delay inside an awaited handler lets the
   // process exit mid-handler: session_shutdown never runs and the last usage
   // is lost (2.9.3 review). The delays must stay ref'd.
@@ -254,7 +254,7 @@ describe("R7: an awaited retry holds the process open", () => {
     });
   });
 
-  test("print mode: a transient archive read retry in agent_settled does not end the process before session_shutdown", async () => {
+  test("print mode: a transient archive read retry in agent_end does not end the process before session_shutdown", async () => {
     await withAgentDir(async (dir) => {
       const script = `
         const loaded = await import(${JSON.stringify(join(process.cwd(), "index.ts"))});
@@ -292,13 +292,13 @@ describe("R7: an awaited retry holds the process open", () => {
         await I.waitForStatsRestore();
         await handlers.get("message_end")({ message: { role: "assistant", provider: "proxy", model: "gpt-5.5", api: "openai-completions", stopReason: "stop", usage: { input: 100, cacheRead: 0, cacheWrite: 0 } } }, context);
         let failures = 0;
-        // 2.10: agent_settled's refresh runs in the background, and an
+        // 2.10: agent_end's refresh runs in the background, and an
         // unchanged clean generation is confirmed by its listing alone (no
         // lstat), so the fault is injected at the listing. The retry must
         // still finish (its timers keep the process alive) and
         // session_shutdown must drain it before flushing.
         I.setStatsArchiveTestHooks({ afterList: async () => { if (failures < 2) { failures++; throw Object.assign(new Error("EBUSY"), { code: "EBUSY" }); } } });
-        await handlers.get("agent_settled")({}, context);
+        await handlers.get("agent_end")({}, context);
         await handlers.get("session_shutdown")({ reason: "quit" }, context);
         I.setStatsArchiveTestHooks(undefined);
         const [name] = readdirSync(I.SHARD_FILES_DIR).filter((file) => file.endsWith(".json"));
@@ -313,14 +313,14 @@ describe("R7: an awaited retry holds the process open", () => {
         child.on("exit", (code) => { clearTimeout(kill); resolve(code); });
       });
       const flushed = await readFile(join(dir, "flushed"), "utf8").then((text) => JSON.parse(text), () => undefined);
-      assert.deepEqual(flushed, { failures: 2, state: "closed", requests: 1 }, "agent_settled finished and session_shutdown flushed");
+      assert.deepEqual(flushed, { failures: 2, state: "closed", requests: 1 }, "agent_end finished and session_shutdown flushed");
       assert.equal(exit, 0, "no unsettled top-level await (exit 13)");
     });
   });
 });
 
 describe("R7: the shutdown flush is not abandoned", () => {
-  test("Pi's print mode (exit by draining the event loop) still completes a final flush whose rename is being retried", async () => {
+  test("OMP's print mode (exit by draining the event loop) still completes a final flush whose rename is being retried", async () => {
     await withAgentDir(async (dir) => {
       const script = `
         const loaded = await import(${JSON.stringify(join(process.cwd(), "index.ts"))});

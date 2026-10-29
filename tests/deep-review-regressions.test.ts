@@ -5,28 +5,50 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createJiti } from "jiti";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { derivePromptCacheKey } from "../src/request-payload.ts";
 
 function model(id = "gpt-a", provider = "proxy", baseUrl = "https://example.invalid/v1") {
   return {
     provider, id, name: id, api: "openai-completions", baseUrl,
-    compat: { sendSessionAffinityHeaders: false }, reasoning: false,
+    compat: {}, reasoning: false,
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 128_000, maxTokens: 8192,
   };
 }
 
+// A routed (virtual) selection: OMP resolves it through a routing registry
+// adapter registered under Symbol.for("omp.routing.registry.v1").
 function virtualModel(id = "auto", provider = "router") {
-  return { ...model(id, provider, ""), api: "pi-virtual" };
+  return model(id, provider, "");
+}
+
+const ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
+
+function installRouter(target: { provider: string; modelId: string }, virtualProvider = "router") {
+  const global = globalThis as Record<symbol, unknown>;
+  const previous = global[ROUTING_REGISTRY_SYMBOL];
+  const adapter = {
+    virtualProvider,
+    resolveActiveRoute: (virtualModelId: string) => ({ virtualProvider, virtualModelId, ...target, timestamp: Date.now() }),
+  };
+  global[ROUTING_REGISTRY_SYMBOL] = {
+    version: 1,
+    registerRouter: () => () => undefined,
+    getRouter: (name: string) => (name === virtualProvider ? adapter : undefined),
+  };
+  return () => {
+    if (previous === undefined) delete global[ROUTING_REGISTRY_SYMBOL];
+    else global[ROUTING_REGISTRY_SYMBOL] = previous;
+  };
 }
 
 type Hook = (event: unknown, ctx: ExtensionContext) => unknown;
 
 async function withExtension(run: (h: Awaited<ReturnType<typeof loadHarness>>) => Promise<void>) {
-  const dir = await mkdtemp(join(tmpdir(), "pi-cache-deep-review-"));
-  const envNames = ["PI_CODING_AGENT_DIR", "PI_CACHE_RETENTION", "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY", "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY", "PI_CACHE_OPTIMIZER_FOOTER_MODE"];
+  const dir = await mkdtemp(join(tmpdir(), "omp-cache-deep-review-"));
+  const envNames = ["PI_CODING_AGENT_DIR", "PI_CACHE_RETENTION", "OMP_CACHE_RETENTION", "OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY", "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY", "OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY", "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY", "OMP_CACHE_OPTIMIZER_FOOTER_MODE", "PI_CACHE_OPTIMIZER_FOOTER_MODE"];
   const saved = new Map(envNames.map((name) => [name, process.env[name]]));
   for (const name of envNames) delete process.env[name];
   process.env.PI_CODING_AGENT_DIR = dir;
@@ -73,7 +95,7 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
     const result = await handler(event, ctx as unknown as ExtensionContext);
     // 2.10: these hooks refresh the footer in the background; the
     // assertions below are about what that refresh publishes.
-    if (name === "message_end" || name === "tool_execution_end" || name === "agent_settled") {
+    if (name === "message_end" || name === "tool_execution_end" || name === "agent_end") {
       await loaded.__internals_for_tests.statsRefreshSettled();
     }
     return result;
@@ -85,7 +107,7 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
   };
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await hook("session_shutdown"); } };
-  await hook("session_start", { reason: "startup" });
+  await hook("session_start", {});
   await loaded.__internals_for_tests.waitForStatsRestore();
   const persistedModels = async () => {
     await close();
@@ -93,7 +115,7 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
     assert.equal(shards.length, 1);
     return shards[0].models;
   };
-  return { dir, configPath: join(dir, "pi-cache-optimizer-config.json"), jiti, loaded, I: loaded.__internals_for_tests, ctx, catalog, notices, statuses, hook, command, close, persistedModels };
+  return { dir, configPath: join(dir, "omp-cache-optimizer-config.json"), jiti, loaded, I: loaded.__internals_for_tests, ctx, catalog, notices, statuses, hook, command, close, persistedModels };
 }
 
 function assistant(provider: string, id: string, input = 100, responseModel?: string) {
@@ -108,14 +130,14 @@ test("session footer retains yesterday across reload while daily commands stay d
     t.mock.timers.setTime(new Date(2026, 8, 21, 12).getTime());
     const next = await loadHarness(h.dir);
     try {
-      assert.match(next.statuses.at(-1) ?? "", /0\/1·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
       await next.hook("message_end", { message: assistant("proxy", "gpt-a") });
-      assert.match(next.statuses.at(-1) ?? "", /0\/2·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/2 次/);
       await next.command("config footer-mode total");
       await next.command("stats all");
-      assert.match(next.statuses.at(-1) ?? "", /0\/1·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
       await next.command("config footer-mode session");
-      assert.match(next.statuses.at(-1) ?? "", /0\/2·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/2 次/);
       await next.close();
       const aggregate = await next.I.loadStatsShardAggregateV7();
       assert.equal(aggregate.totalsByModel["proxy/gpt-a"]?.totalRequests, 1);
@@ -130,24 +152,24 @@ for (const startingMode of ["session", "total", "process"]) test(`midnight rotat
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
     t.mock.timers.setTime(new Date(2026, 8, 21, 12).getTime());
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
-    assert.match(h.statuses.at(-1) ?? "", startingMode === "session" ? /0\/2·/ : /0\/1·/);
+    assert.match(h.statuses.at(-1) ?? "", startingMode === "session" ? /命中次数：0\/2 次/ : /命中次数：0\/1 次/);
     await h.command("config footer-mode total");
-    assert.match(h.statuses.at(-1) ?? "", /0\/1·/);
+    assert.match(h.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
     await h.command("config footer-mode process");
-    assert.match(h.statuses.at(-1) ?? "", /0\/1·/);
+    assert.match(h.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
     await h.command("config footer-mode session");
-    assert.match(h.statuses.at(-1) ?? "", /0\/2·/);
+    assert.match(h.statuses.at(-1) ?? "", /命中次数：0\/2 次/);
     await h.close();
     const shards = await h.I.readValidStatsShardsV7();
     assert.equal(shards.length, 2);
     assert.deepEqual(shards.map((s) => s.models["proxy/gpt-a"].stats.totalRequests), [1, 1]);
     const next = await loadHarness(h.dir);
     try {
-      assert.match(next.statuses.at(-1) ?? "", /0\/2·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/2 次/);
       await next.command("reset");
-      assert.match(next.statuses.at(-1) ?? "", /0\/0·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/0 次/);
       await next.hook("message_end", { message: assistant("proxy", "gpt-a") });
-      assert.match(next.statuses.at(-1) ?? "", /0\/1·/);
+      assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
     } finally { await next.close(); }
   });
 });
@@ -160,10 +182,10 @@ test("idle midnight shutdown preserves yesterday and does not attribute it to to
     await h.close();
     assert.equal((await h.I.loadStatsShardAggregateV7()).totalsByModel["proxy/gpt-a"], undefined);
     const other = await loadHarness(h.dir, "different-review-session");
-    try { assert.match(other.statuses.at(-1) ?? "", /0\/0·/); }
+    try { assert.match(other.statuses.at(-1) ?? "", /命中次数：0\/0 次/); }
     finally { await other.close(); }
     const next = await loadHarness(h.dir);
-    try { assert.match(next.statuses.at(-1) ?? "", /0\/1·/); }
+    try { assert.match(next.statuses.at(-1) ?? "", /命中次数：0\/1 次/); }
     finally { await next.close(); }
   });
 });
@@ -173,19 +195,22 @@ test("failed midnight archive keeps session counters in memory and does not fail
   await withExtension(async (h) => {
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
     const shards = await h.I.readValidStatsShardsV7();
-    const path = join(h.dir, "pi-cache-optimizer-stats.d", "shards", `${shards[0].instanceId}.json`);
+    const path = join(h.dir, "omp-cache-optimizer-stats.d", "shards", `${shards[0].instanceId}.json`);
     await rm(path);
     await mkdir(path); // A directory refuses atomic replacement on all platforms.
     const warn = console.warn;
     console.warn = () => undefined;
+    // Windows reports EPERM (retried) for a rename onto a directory; the retry
+    // budget is Date-based, so let the mocked clock advance on every attempt.
+    h.I.setStatsFsTestHooks({ beforeRename: () => { t.mock.timers.tick(1000); } });
     try {
       t.mock.timers.setTime(new Date(2026, 8, 21, 12).getTime());
       await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
-      assert.match(h.statuses.at(-1) ?? "", /0\/2·/);
+      assert.match(h.statuses.at(-1) ?? "", /命中次数：0\/2 次/);
       await h.command("config footer-mode total");
-      assert.match(h.statuses.at(-1) ?? "", /0\/1·/);
+      assert.match(h.statuses.at(-1) ?? "", /命中次数：0\/1 次/);
       assert.ok(h.notices.some((text) => /failed to persist/.test(text)));
-    } finally { console.warn = warn; }
+    } finally { await h.close(); console.warn = warn; h.I.setStatsFsTestHooks(undefined); }
   });
 });
 
@@ -197,7 +222,7 @@ test("config reset preserves the latest disk footer/key policies, file mode, and
     await h.command("config reset");
     assert.deepEqual(JSON.parse(await readFile(h.configPath, "utf8")), { version: 2, footerMode: "total", promptCacheKey: { omit: ["proxy/gpt-a"] } });
     if (process.platform !== "win32") assert.equal((await lstat(h.configPath)).mode & 0o777, 0o640);
-    assert.equal(h.I.isPromptCacheKeyOmittedForModel(h.ctx.model), true);
+    assert.equal(h.I.isPromptCacheKeyOmittedForModel(h.ctx.model as any), true);
     assert.equal(h.I.footerStatsMode(), "total");
     assert.equal((await h.persistedModels())["proxy/gpt-a"].stats.totalRequests, 1);
   });
@@ -209,7 +234,7 @@ for (const [label, text] of [["invalid JSON", "{incomplete"], ["invalid schema",
       await writeFile(h.configPath, text);
       await h.command("config reset");
       assert.equal(await readFile(h.configPath, "utf8"), text);
-      assert.match(h.notices.at(-1) ?? "", /Could not reset/);
+      assert.match(h.notices.at(-1) ?? "", /无法重置特性配置/);
     });
   });
 }
@@ -219,7 +244,7 @@ test("config reset refuses directory targets", async () => {
     await mkdir(h.configPath);
     await h.command("config reset");
     assert.equal((await lstat(h.configPath)).isDirectory(), true);
-    assert.match(h.notices.at(-1) ?? "", /Could not reset/);
+    assert.match(h.notices.at(-1) ?? "", /无法重置特性配置/);
   });
 });
 
@@ -232,7 +257,7 @@ test("config reset refuses symlinks without changing their targets", { skip: pro
     await h.command("config reset");
     assert.equal((await lstat(h.configPath)).isSymbolicLink(), true);
     assert.equal(await readFile(target, "utf8"), text);
-    assert.match(h.notices.at(-1) ?? "", /Could not reset/);
+    assert.match(h.notices.at(-1) ?? "", /无法重置特性配置/);
   });
 });
 
@@ -256,7 +281,7 @@ test("config reset reads after acquiring the shared transaction lease", async ()
     const writer = atomic.withModelsJsonTransactionLock(async () => {
       entered();
       await pending;
-      await writeFile(h.configPath, JSON.stringify({ version: 3, footerMode: "process", promptCacheKey: { omit: ["proxy/gpt-a"] }, features: { skillCompression: false } }));
+      await writeFile(h.configPath, JSON.stringify({ version: 3, footerMode: "process", promptCacheKey: { omit: ["proxy/gpt-a"] }, features: { promptRewrite: false } }));
     });
     await ready;
     const resetting = h.command("config reset");
@@ -284,7 +309,7 @@ test("feature updates refuse manual content/replacement/mode/existence races aft
         guard = { identity: info, mode: info.mode & 0o7777, hash: atomic.hashText(original) };
       }
       if (kind === "content" || kind === "created") await writeFile(h.configPath, changed);
-      else if (kind === "replacement") await atomic.atomicReplaceTextFilePreservingMode(h.configPath, original, 0o600, "fixture-replace");
+      else if (kind === "replacement") await atomic.atomicReplaceTextFilePreservingMode(h.configPath, original, guard?.mode ?? 0o600, "fixture-replace");
       else if (kind === "mode") await chmod(h.configPath, 0o640);
       else await rm(h.configPath);
       await assert.rejects(config.writePersistedCacheOptimizerConfigUnlocked({ version: 2 }, h.configPath, guard));
@@ -305,19 +330,19 @@ for (const value of [
       h.ctx.model = model("gpt-a", "proxy", value);
       await h.command("doctor");
       const diagnosis = h.notices.at(-1) ?? "";
-      assert.ok(diagnosis.includes("Base URL:"));
+      assert.ok(diagnosis.includes("Base URL："));
       for (const secret of ["fixture-user", "FAKE_PASSWORD", "FAKE_TOKEN", "FAKE_FRAGMENT"]) assert.equal(diagnosis.includes(secret), false);
       assert.equal(h.ctx.model.baseUrl, value);
-      if (value.startsWith("https://fixture")) assert.match(diagnosis, /Base URL: https:\/\/example\.invalid\/v1/);
+      if (value.startsWith("https://fixture")) assert.match(diagnosis, /Base URL：https:\/\/example\.invalid\/v1/);
     });
   });
 }
 
 test("doctor preserves safe endpoints and distinguishes missing from invalid URLs", async () => {
   await withExtension(async (h) => {
-    assert.match(h.I.buildDoctorDiagnosis(model()), /Base URL: https:\/\/example\.invalid\/v1/);
-    assert.match(h.I.buildDoctorDiagnosis(model("gpt-a", "proxy", "")), /Base URL: \(default\)/);
-    assert.match(h.I.buildDoctorDiagnosis(model("gpt-a", "proxy", "not a URL")), /Base URL: \(unavailable\)/);
+    assert.match(h.I.buildDoctorDiagnosis(model() as any), /Base URL：https:\/\/example\.invalid\/v1/);
+    assert.match(h.I.buildDoctorDiagnosis(model("gpt-a", "proxy", "") as any), /Base URL：（默认）/);
+    assert.match(h.I.buildDoctorDiagnosis(model("gpt-a", "proxy", "not a URL") as any), /Base URL：（不可用）/);
   });
 });
 
@@ -326,7 +351,7 @@ test("a same-provider same-family model switch cannot retarget response stats or
     const requested = h.ctx.model;
     await h.hook("before_provider_request", { payload: { model: requested.id } });
     h.ctx.model = model("gpt-b");
-    await h.hook("model_select", { model: h.ctx.model });
+    await h.hook("turn_start", {});
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
     assert.match(h.statuses.at(-1) ?? "", /0\/0/);
     const stored = await h.persistedModels();
@@ -335,7 +360,7 @@ test("a same-provider same-family model switch cannot retarget response stats or
     const reloaded = await loadHarness(h.dir);
     try {
       reloaded.ctx.model = model("gpt-b");
-      await reloaded.hook("model_select", { model: reloaded.ctx.model });
+      await reloaded.hook("turn_start", {});
       await reloaded.command("stats");
       assert.match(reloaded.notices.at(-1) ?? "", /proxy\/gpt-a/);
       assert.match(reloaded.statuses.at(-1) ?? "", /0\/0/);
@@ -344,28 +369,30 @@ test("a same-provider same-family model switch cannot retarget response stats or
 });
 
 test("a late direct response cannot become the routed model after switching to a virtual selection", async () => {
+  const restoreRouter = installRouter({ provider: "proxy", modelId: "gpt-b" });
   await withExtension(async (h) => {
     const requested = h.ctx.model;
     await h.hook("before_provider_request", { payload: { model: requested.id } });
     h.ctx.model = virtualModel();
-    await h.hook("model_select", { model: h.ctx.model });
+    await h.hook("turn_start", {});
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
     await h.close();
     const shards = await h.I.readValidStatsShardsV7();
     assert.equal(shards.length, 1);
     assert.equal(shards[0].models["proxy/gpt-a"]?.stats.totalRequests, 1);
     assert.equal(shards[0].lastRoutedModel, undefined);
-  });
+  }).finally(restoreRouter);
 });
 
 test("a late routed response cannot replace a direct model selected afterwards", async () => {
+  const restoreRouter = installRouter({ provider: "proxy", modelId: "gpt-a" });
   await withExtension(async (h) => {
     const routed = model("gpt-a", "proxy");
     h.catalog.set("proxy/gpt-a", routed);
     h.ctx.model = virtualModel();
     await h.hook("before_provider_request", { payload: { model: "gpt-a" } });
     h.ctx.model = model("gpt-b", "proxy");
-    await h.hook("model_select", { model: h.ctx.model });
+    await h.hook("turn_start", {});
     const before = h.statuses.at(-1);
     await h.hook("message_end", { message: assistant("proxy", "gpt-a") });
     assert.equal(h.statuses.at(-1), before);
@@ -374,7 +401,7 @@ test("a late routed response cannot replace a direct model selected afterwards",
     assert.equal(shards.length, 1);
     assert.equal(shards[0].models["proxy/gpt-a"]?.stats.totalRequests, 1);
     assert.deepEqual(shards[0].lastRoutedModel, { provider: "proxy", id: "gpt-a", name: "gpt-a" });
-  });
+  }).finally(restoreRouter);
 });
 
 test("catalog identity stays authoritative without a request hook or after a provider switch", async () => {
@@ -432,13 +459,13 @@ test("unknown response aliases across concurrent requests never use the selected
 
 test("persistent cache-key on overrides both environment opt-outs in settings, diagnostics and requests", async () => {
   await withExtension(async (h) => {
-    process.env.PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "0";
-    process.env.PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY = "1";
+    process.env.OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "0";
+    process.env.OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY = "1";
     await h.command("config openai-cache-key on");
     await h.command("config");
-    assert.match(h.notices.at(-1) ?? "", /OpenAI cache key: on \(config\)/);
+    assert.match(h.notices.at(-1) ?? "", /OpenAI cache key：开启（配置）/);
     assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), true);
-    assert.match(h.I.getOptimizerRuntimeModeLines().join("\n"), /fallback: on/);
+    assert.match(h.I.getOptimizerRuntimeModeLines().join("\n"), /prompt_cache_key 兜底：开启/);
     const payload = await h.hook("before_provider_request", { payload: { model: "gpt-a" } });
     assert.equal((payload as Record<string, unknown>)?.prompt_cache_key, derivePromptCacheKey("fixture-review-session"));
     await h.command("disable");
@@ -446,8 +473,8 @@ test("persistent cache-key on overrides both environment opt-outs in settings, d
     assert.equal(await h.hook("before_provider_request", { payload: { model: "gpt-a" } }), undefined);
     await h.command("enable");
     await h.command("config openai-cache-key off");
-    process.env.PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "1";
-    delete process.env.PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY;
+    process.env.OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "1";
+    delete process.env.OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY;
     assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), false);
     assert.equal(await h.hook("before_provider_request", { payload: { model: "gpt-a" } }), undefined);
   });
@@ -456,17 +483,17 @@ test("persistent cache-key on overrides both environment opt-outs in settings, d
 test("legacy cache-key env-only opt-out agrees with config and runtime diagnostics", async () => {
   await withExtension(async (h) => {
     for (const value of ["0", "false", "no", "off", " OFF "]) {
-      process.env.PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = value;
+      process.env.OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = value;
       await h.command("config");
-      assert.match(h.notices.at(-1) ?? "", /OpenAI cache key: off \(env\)/);
-      assert.equal(h.I.featureEnabled("openAICacheKey", "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY", true), false);
+      assert.match(h.notices.at(-1) ?? "", /OpenAI cache key：关闭（环境变量）/);
+      assert.equal(h.I.featureEnabled("openAICacheKey", "OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY", true), false);
       assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), false);
     }
-    delete process.env.PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY;
+    delete process.env.OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY;
     assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), true);
-    process.env.PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY = "yes";
+    process.env.OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY = "yes";
     assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), false);
-    process.env.PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "1";
+    process.env.OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY = "1";
     assert.equal(h.I.shouldInjectOpenAIPromptCacheKey(), false);
   });
 });
