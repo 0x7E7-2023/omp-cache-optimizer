@@ -1,36 +1,36 @@
 import { type AtomicTargetGuard, atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, hashText, withModelsJsonTransactionLock } from "./atomic-fs.ts";
-import { LOG_PREFIX, type MutableEnv, asRecord, getErrorCode, isNonEmptyString } from "./common.ts";
+import { LOG_PREFIX, type MutableEnv, asRecord, getErrorCode, hasEnv, isNonEmptyString, readEnv } from "./common.ts";
 import { STATE_DIR } from "./paths.ts";
-import { PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, requestLongCacheRetention, restoreCacheRetentionEnv } from "./retention.ts";
+import { OMP_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, readCacheRetentionValue, requestLongCacheRetention, restoreCacheRetentionEnv } from "./retention.ts";
 import { type Stats, readFileSync } from "node:fs";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
 
-export const CONFIG_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-config.json");
+export const CONFIG_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-config.json");
 
-export const OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY";
+export const OPENAI_CACHE_KEY_ENV = "OMP_CACHE_OPTIMIZER_OPENAI_CACHE_KEY";
 
-export const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
+export const NO_OPENAI_CACHE_KEY_ENV = "OMP_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 
-export const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
+export const TOOL_ORDER_ENV = "OMP_CACHE_OPTIMIZER_TOOL_ORDER";
 
-export const NO_ZERO_PRICE_WARMING_ENV = "PI_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMING";
+export const NO_ZERO_PRICE_WARMING_ENV = "OMP_CACHE_OPTIMIZER_NO_ZERO_PRICE_WARMING";
 
-export const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
+export const FOOTER_MODE_ENV = "OMP_CACHE_OPTIMIZER_FOOTER_MODE";
 
-/** Kill switch for the incremental footer refresh (2.10): 0/false/off/no restores the 2.9.3 full scan per refresh. */
-export const STATS_INCREMENTAL_ENV = "PI_CACHE_OPTIMIZER_STATS_INCREMENTAL";
+/** Kill switch for the incremental footer refresh: 0/false/off/no restores a full scan per refresh. */
+export const STATS_INCREMENTAL_ENV = "OMP_CACHE_OPTIMIZER_STATS_INCREMENTAL";
 
 /** Opt-in check (1/true/on/yes) that the footer's shard cache never misses a change the file identity hides (see TieredShardIndex.verifyCachedContents). */
-export const STATS_VERIFY_ENV = "PI_CACHE_OPTIMIZER_STATS_VERIFY";
+export const STATS_VERIFY_ENV = "OMP_CACHE_OPTIMIZER_STATS_VERIFY";
 
 export function isStatsVerifyEnabled(env: MutableEnv = process.env): boolean {
-  return isEnabledEnv(env[STATS_VERIFY_ENV]);
+  return isEnabledEnv(readEnv(env, STATS_VERIFY_ENV));
 }
 
 /** Opt-in footer refresh timing log: 1/true/on/yes writes JSON lines to STATS_TIMING_LOG_PATH; an absolute path writes there. */
-export const STATS_TIMING_ENV = "PI_CACHE_OPTIMIZER_STATS_TIMING";
+export const STATS_TIMING_ENV = "OMP_CACHE_OPTIMIZER_STATS_TIMING";
 
 export type FooterStatsMode = "session" | "total" | "process";
 
@@ -41,7 +41,13 @@ export type PersistedCacheOptimizerConfigV1 = {
   footerMode?: FooterStatsMode;
 };
 
-export type PersistedCacheOptimizerFeature = "promptRewrite" | "virtualRewrite" | "skillCompression" | "openAICacheKey" | "toolOrder" | "zeroPriceWarming" | "statsIncremental";
+/**
+ * OMP 版可持久化的特性开关。上游的 virtualRewrite（Pi 原生虚拟模型）与
+ * skillCompression（Pi systemPromptOptions.skills）在 OMP 上没有对应宿主能力，已移除。
+ */
+export type PersistedCacheOptimizerFeature = "promptRewrite" | "openAICacheKey" | "toolOrder" | "zeroPriceWarming" | "statsIncremental";
+
+export const PERSISTED_CACHE_OPTIMIZER_FEATURES: readonly PersistedCacheOptimizerFeature[] = ["promptRewrite", "openAICacheKey", "toolOrder", "zeroPriceWarming", "statsIncremental"];
 
 export type PersistedCacheOptimizerConfigV2 = {
   version: 2;
@@ -77,20 +83,26 @@ export function featureEnabled(
 ): boolean {
   const configured = config.features?.[feature];
   if (configured !== undefined) return configured;
-  if (feature === "virtualRewrite") return isEnabledEnv(env[envName]);
+  // OMP fork：prompt 改写默认关闭，仅 OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1（或持久化配置）开启。
+  if (feature === "promptRewrite") return isEnabledEnv(readEnv(env, envName));
   if (feature === "openAICacheKey") {
-    return !isEnabledEnv(env[envName]) && !isDisabledEnv(env[OPENAI_CACHE_KEY_ENV]);
+    return !isEnabledEnv(readEnv(env, envName)) && !isDisabledEnv(readEnv(env, OPENAI_CACHE_KEY_ENV));
   }
-  if (feature === "promptRewrite" || feature === "skillCompression" || feature === "zeroPriceWarming") {
-    return !isEnabledEnv(env[envName]);
+  if (feature === "zeroPriceWarming") {
+    return !isEnabledEnv(readEnv(env, envName));
   }
-  if (feature === "statsIncremental") return !isDisabledEnv(env[envName]);
-  return isEnabledEnv(env[envName]) || defaultValue;
+  if (feature === "statsIncremental") return !isDisabledEnv(readEnv(env, envName));
+  return isEnabledEnv(readEnv(env, envName)) || defaultValue;
 }
 
-/** Keep Pi's cache warming running for models whose prices are unknown (all zero). */
+/** Keep OMP's cache warming running for models whose prices are unknown (all zero). */
 export function isZeroPriceWarmingEnabled(): boolean {
   return runtimeOptimizerEnabled && featureEnabled("zeroPriceWarming", NO_ZERO_PRICE_WARMING_ENV, true);
+}
+
+/** Prompt 改写（session-overview churn strip）当前是否生效。 */
+export function isPromptRewriteEnabled(): boolean {
+  return runtimeOptimizerEnabled && featureEnabled("promptRewrite", PROMPT_REWRITE_ENV, false);
 }
 
 /**
@@ -100,10 +112,7 @@ export function isZeroPriceWarmingEnabled(): boolean {
  *
  * Kill switch: `/cache-optimizer config stats-incremental off` (persisted,
  * wins over the environment like every feature setting) or
- * PI_CACHE_OPTIMIZER_STATS_INCREMENTAL=0. Note: versions before 2.10 reject a
- * config file with a feature key they do not know, so while this key is
- * persisted an older Pi sharing the agent directory falls back to its
- * defaults; the README says so.
+ * OMP_CACHE_OPTIMIZER_STATS_INCREMENTAL=0.
  */
 export function isStatsIncrementalEnabled(
   env: MutableEnv = process.env,
@@ -112,11 +121,11 @@ export function isStatsIncrementalEnabled(
   return featureEnabled("statsIncremental", STATS_INCREMENTAL_ENV, true, env, config);
 }
 
-export const STATS_TIMING_LOG_PATH = join(STATE_DIR, "pi-cache-optimizer-stats-timing.jsonl");
+export const STATS_TIMING_LOG_PATH = join(STATE_DIR, "omp-cache-optimizer-stats-timing.jsonl");
 
 /** Where the opt-in refresh timing log goes, or undefined when it is off. */
 export function statsTimingLogPath(env: MutableEnv = process.env): string | undefined {
-  const value = env[STATS_TIMING_ENV]?.trim();
+  const value = readEnv(env, STATS_TIMING_ENV)?.trim();
   if (!value || isDisabledEnv(value)) return undefined;
   if (isEnabledEnv(value)) return STATS_TIMING_LOG_PATH;
   return isAbsolute(value) ? value : undefined;
@@ -144,7 +153,7 @@ export function parsePersistedCacheOptimizerConfig(value: unknown): PersistedCac
   const rawFeatures = record.version === 3 ? record.features : undefined;
   if (rawFeatures !== undefined && !asRecord(rawFeatures)) return undefined;
   const featuresRecord = asRecord(rawFeatures);
-  const featureNames = new Set<PersistedCacheOptimizerFeature>(["promptRewrite", "virtualRewrite", "skillCompression", "openAICacheKey", "toolOrder", "zeroPriceWarming", "statsIncremental"]);
+  const featureNames = new Set<PersistedCacheOptimizerFeature>(PERSISTED_CACHE_OPTIMIZER_FEATURES);
   if (featuresRecord && Object.keys(featuresRecord).some((key) => !featureNames.has(key as PersistedCacheOptimizerFeature) || typeof featuresRecord[key] !== "boolean")) return undefined;
 
   const rawPromptCacheKey = record.promptCacheKey;
@@ -324,7 +333,7 @@ export function resolveFooterStatsMode(
   env: MutableEnv = process.env,
 ): { mode: FooterStatsMode; source: FooterStatsModeSource } {
   if (configuredMode) return { mode: configuredMode, source: "config" };
-  const envMode = parseFooterStatsMode(env[FOOTER_MODE_ENV]);
+  const envMode = parseFooterStatsMode(readEnv(env, FOOTER_MODE_ENV));
   return envMode ? { mode: envMode, source: "env" } : { mode: "session", source: "default" };
 }
 
@@ -372,45 +381,38 @@ export function readPersistedFooterMode(configPath: string = CONFIG_FILE_PATH): 
 }
 
 export function getOptimizerRuntimeModeLines(): string[] {
-  const state = runtimeOptimizerEnabled ? "enabled" : "disabled";
+  const state = runtimeOptimizerEnabled ? "已启用" : "已关闭";
   const lines: string[] = [];
-  lines.push(`Runtime state: ${state}`);
-  const promptRewriteActive = runtimeOptimizerEnabled && featureEnabled("promptRewrite", NO_PROMPT_REWRITE_ENV, true);
-  lines.push(`• Prompt rewrite: ${promptRewriteActive ? "on" : "off"} (in-place: session-overview churn strip, skill list compression; never reorders the prompt)`);
-  lines.push(`• Native virtual rewrite: ${featureEnabled("virtualRewrite", VIRTUAL_REWRITE_ENV, false) ? "opt-in" : "off"}`);
-  const skillCompressionSetting = featureEnabled("skillCompression", NO_SKILL_COMPRESSION_ENV, true);
-  // Compression runs inside prompt rewrite, so its own switch is not enough to make it active.
-  lines.push(`• Skill compression: ${!skillCompressionSetting ? "off" : promptRewriteActive ? "on" : "on (inactive: prompt rewrite is off)"}`);
-  lines.push(`• Deterministic tool ordering: ${isToolOrderEnabled() ? "on (verified built-in payloads, opt-in)" : "off"}`);
-  lines.push(`• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`);
-  lines.push(`• Footer cache stats: on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}`);
-  lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
-  lines.push(`• ${PI_CACHE_RETENTION_ENV}: ${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`);
-  lines.push(`• Persistent feature overrides: ${Object.keys(persistedCacheOptimizerConfig.features ?? {}).length > 0 ? "configured" : "none"}`);
+  lines.push(`运行状态：${state}`);
+  lines.push(`• Prompt 重写：${isPromptRewriteEnabled() ? "开启" : "关闭"}（默认关闭；只原地清理 <session-overview> 易变字段，不压缩、不重排）`);
+  lines.push(`• 内置工具确定性排序：${isToolOrderEnabled() ? "开启（仅已验证的内置 payload，需显式开启）" : "关闭"}`);
+  lines.push(`• OpenAI prompt_cache_key 兜底：${shouldInjectOpenAIPromptCacheKey() ? "开启" : "关闭"}`);
+  lines.push(`• Footer 缓存统计：开启${runtimeOptimizerEnabled ? "" : "（对比模式）"}`);
+  lines.push(`• Compat 提醒：${runtimeOptimizerEnabled ? "开启" : "关闭"}`);
+  lines.push(`• ${OMP_CACHE_RETENTION_ENV}：${readCacheRetentionValue(process.env) ?? "（未设置）"}`);
+  lines.push(`• 持久化特性覆盖：${Object.keys(persistedCacheOptimizerConfig.features ?? {}).length > 0 ? "已配置" : "无"}`);
   if (!runtimeOptimizerEnabled) {
-    lines.push("This is a current-process switch. Run /reload or restart Pi to return to startup behavior.");
-  } else if (!featureEnabled("promptRewrite", NO_PROMPT_REWRITE_ENV, true) || !shouldInjectOpenAIPromptCacheKey()) {
-    lines.push("Some features are disabled by persistent configuration or environment variables.");
+    lines.push("这是当前进程开关。运行 /reload 或重启 OMP 可恢复启动时的行为。");
+  } else if (!shouldInjectOpenAIPromptCacheKey()) {
+    lines.push("部分特性被持久化配置或环境变量关闭。");
   }
   return lines;
 }
 
 export function formatPersistentFeatureConfig(): string {
   const features = persistedCacheOptimizerConfig.features ?? {};
-  const lines = ["Persistent feature configuration:"];
+  const lines = ["持久化特性配置："];
   const entries: Array<[string, PersistedCacheOptimizerFeature, string, boolean]> = [
-    ["Prompt rewrite", "promptRewrite", NO_PROMPT_REWRITE_ENV, true],
-    ["Native virtual rewrite", "virtualRewrite", VIRTUAL_REWRITE_ENV, false],
-    ["Skill compression", "skillCompression", NO_SKILL_COMPRESSION_ENV, true],
+    ["Prompt 重写", "promptRewrite", PROMPT_REWRITE_ENV, false],
     ["OpenAI cache key", "openAICacheKey", NO_OPENAI_CACHE_KEY_ENV, true],
-    ["Tool ordering", "toolOrder", TOOL_ORDER_ENV, false],
-    ["Zero-price cache warming", "zeroPriceWarming", NO_ZERO_PRICE_WARMING_ENV, true],
-    ["Incremental footer refresh", "statsIncremental", STATS_INCREMENTAL_ENV, true],
+    ["工具排序", "toolOrder", TOOL_ORDER_ENV, false],
+    ["零价格模型缓存预热", "zeroPriceWarming", NO_ZERO_PRICE_WARMING_ENV, true],
+    ["增量 footer 刷新", "statsIncremental", STATS_INCREMENTAL_ENV, true],
   ];
   for (const [label, feature, envName, defaultValue] of entries) {
-    const hasEnv = process.env[envName] !== undefined || (feature === "openAICacheKey" && process.env[OPENAI_CACHE_KEY_ENV] !== undefined);
-    const source = features[feature] !== undefined ? "config" : hasEnv ? "env" : "default";
-    lines.push(`• ${label}: ${featureEnabled(feature, envName, defaultValue) ? "on" : "off"} (${source})`);
+    const envSet = hasEnv(process.env, envName) || (feature === "openAICacheKey" && hasEnv(process.env, OPENAI_CACHE_KEY_ENV));
+    const source = features[feature] !== undefined ? "配置" : envSet ? "环境变量" : "默认";
+    lines.push(`• ${label}：${featureEnabled(feature, envName, defaultValue) ? "开启" : "关闭"}（${source}）`);
   }
   return lines.join("\n");
 }
@@ -419,8 +421,8 @@ export function formatOptimizerRuntimeMode(): string {
   return getOptimizerRuntimeModeLines().join("\n");
 }
 
-export const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
-
-export const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
-
-export const VIRTUAL_REWRITE_ENV = "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE";
+/**
+ * OMP fork：显式开启 prompt 改写（session-overview churn strip）。
+ * 旧的 OMP_/PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE 不再受支持：OMP 上默认就是关闭。
+ */
+export const PROMPT_REWRITE_ENV = "OMP_CACHE_OPTIMIZER_PROMPT_REWRITE";

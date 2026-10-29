@@ -1,228 +1,11 @@
-import { type BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
-import { basename, dirname } from "node:path";
-import { NO_SKILL_COMPRESSION_ENV, featureEnabled } from "./config.ts";
+import { createHash } from "node:crypto";
+import { asRecord } from "./common.ts";
 
-
-// Minimum count of skills before compression is worth applying.
-// Below this, pi's verbose XML block is small enough that the overhead of
-// an additional one-line index isn't worth the loss of per-skill
-// description hints. The 31-skill snapshot in this repo was 13.3 KB; one
-// or two skills is well under 1 KB and not worth touching.
-export const SKILL_COMPRESSION_MIN_COUNT = 4;
-
-export function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-/**
- * The tool Pi tells the model to load skill files with: the first declared of `read`/`bash`;
- * `indirect` when they are selected but hidden (reachable only through another tool); undefined when neither.
- */
-export type SkillFileReadTool = "read" | "bash" | "indirect";
-
-export function skillFileReadTool(opts: Pick<BuildSystemPromptOptions, "selectedTools" | "hiddenTools">): SkillFileReadTool | undefined {
-  const selected = opts.selectedTools ?? ["read", "bash", "edit", "write"];
-  const hidden = opts.hiddenTools ?? [];
-  const readers = ["read", "bash"] as const;
-  return readers.find((tool) => selected.includes(tool) && !hidden.includes(tool)) ??
-    (readers.some((tool) => selected.includes(tool)) ? "indirect" : undefined);
-}
-
-/** Byte-for-byte copy of Pi's formatter (contract-tested against the installed Pi for every tool wording). */
-export function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["skills"]>, fileReadTool: SkillFileReadTool = "read"): string {
-  const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
-  if (visibleSkills.length === 0) return "";
-
-  const lines = [
-    "\n\nThe following skills provide specialized instructions for specific tasks.",
-    fileReadTool === "read"
-      ? "Use the read tool to load a skill's file when the task matches its description."
-      : fileReadTool === "bash"
-        ? "Use bash to load a skill's file when the task matches its description."
-        : "Load a skill's file when the task matches its description.",
-    "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-    "",
-    "<available_skills>",
-  ];
-
-  for (const skill of visibleSkills) {
-    lines.push("  <skill>");
-    lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-    lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-    lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
-    lines.push("  </skill>");
-  }
-
-  lines.push("</available_skills>");
-  return lines.join("\n");
-}
-
-/**
- * Compressed alternative to `formatSkillsForPrompt`.
- *
- * Pi emits one four-line XML element per skill (`<skill>`, `<name>`,
- * `<description>`, `<location>`). In a 54-skill setup that block was
- * ~24.6 KB, of which the descriptions are 54 % and the rest is XML tags
- * plus a repeated absolute path per skill.
- *
- * This form keeps everything the model needs to choose and load a skill —
- * every skill's name and its full description — and removes the repetition:
- *   - Skills are grouped by skills root directory; the root and the
- *     `<name>/SKILL.md` convention are stated once per group instead of one
- *     `<location>` per skill. agentskills.io requires `location` so file-read
- *     activation can find SKILL.md; the rule gives the model the same path.
- *   - Skills that do not follow `<root>/<name>/SKILL.md` (different file or
- *     directory name, Windows-style paths) are listed with their explicit
- *     file path, so no path is ever guessed.
- *   - The XML envelope is replaced by Markdown headings and bullets.
- *
- * Descriptions are kept verbatim except that whitespace runs (including
- * newlines from folded YAML) collapse to one space so each skill is one
- * bullet. Groups and skills are sorted for determinism (cache stability).
- */
-export function formatSkillsForPromptCompressed(
-  skills: NonNullable<BuildSystemPromptOptions["skills"]>,
-  fileReadTool: SkillFileReadTool = "read",
-): string {
-  const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
-  if (visibleSkills.length === 0) return "";
-
-  const byRoot = new Map<string, Array<{ name: string; description: string }>>();
-  const explicit: Array<{ name: string; description: string; filePath: string }> = [];
-  for (const skill of visibleSkills) {
-    const description = skill.description.replace(/\s+/g, " ").trim();
-    const skillDir = dirname(skill.filePath);
-    const conventional =
-      !skill.filePath.includes("\\") &&
-      basename(skill.filePath) === "SKILL.md" &&
-      basename(skillDir) === skill.name;
-    if (!conventional) {
-      explicit.push({ name: skill.name, description, filePath: skill.filePath });
-      continue;
-    }
-    const root = dirname(skillDir);
-    const list = byRoot.get(root) ?? [];
-    list.push({ name: skill.name, description });
-    byRoot.set(root, list);
-  }
-
-  const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
-  const header = formatSkillsForPrompt(skills, fileReadTool);
-  const preamble = header.slice(0, header.indexOf("<available_skills>")).trim();
-
-  const lines: string[] = [preamble];
-  for (const [root, entries] of [...byRoot.entries()].sort(([a], [b]) => compare(a, b))) {
-    lines.push("", `## Skills in ${root}/`, `Each skill file is at ${root}/<name>/SKILL.md`, "");
-    for (const entry of entries.sort((a, b) => compare(a.name, b.name))) {
-      lines.push(`- ${entry.name}: ${entry.description}`);
-    }
-  }
-  if (explicit.length > 0) {
-    lines.push("", "## Skills with explicit file paths", "");
-    for (const entry of explicit.sort((a, b) => compare(a.filePath, b.filePath))) {
-      lines.push(`- ${entry.name} (file: ${entry.filePath}): ${entry.description}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Replace pi's verbose `<available_skills>` block in `prompt` with the
- * compressed grouped form. Idempotent: if the verbose form is not
- * present (compression already applied, or skill count below threshold),
- * the prompt is returned unchanged.
- *
- * Opt-out: set `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1`.
- *
- * Pre-conditions for compression to fire:
- *   - opts.skills present and visible-skill count >= SKILL_COMPRESSION_MIN_COUNT
- *   - Verbose block (built from the same `opts.skills`) is found in
- *     `prompt` (substring match, no regex). This anchors the substitution
- *     to pi's own emitter; if pi changes the format, we no-op rather
- *     than mangle.
- *
- * Both sides are compared trimmed: since Pi 0.86 the skills block is trimmed
- * and wrapped in a `<skills>` section, older Pi appended it with leading
- * newlines. Matching the untrimmed text silently disabled compression on
- * every Pi >= 0.86.
- */
-export function compressSkillsInSystemPrompt(
-  prompt: string,
-  opts: BuildSystemPromptOptions,
-): string {
-  if (!featureEnabled("skillCompression", NO_SKILL_COMPRESSION_ENV, true)) return prompt;
-  if (!opts.skills || opts.skills.length === 0) return prompt;
-
-  const visible = opts.skills.filter((skill) => !skill.disableModelInvocation);
-  if (visible.length < SKILL_COMPRESSION_MIN_COUNT) return prompt;
-
-  const verbose = formatSkillsForPrompt(opts.skills, skillFileReadTool(opts) ?? "read").trim();
-  if (!verbose || !prompt.includes(verbose)) return prompt;
-
-  const compressed = formatSkillsForPromptCompressed(opts.skills, skillFileReadTool(opts) ?? "read").trim();
-  if (!compressed || compressed.length >= verbose.length) return prompt;
-
-  return prompt.replace(verbose, () => compressed);
-}
-
-/**
- * Preferred way to apply skill compression on Pi >= 0.86: set the structured
- * `skills` prompt section instead of returning a whole replacement prompt.
- *
- * Returning `systemPrompt` makes Pi treat it as a forced prompt that replaces the
- * entire leading system message, which silently discards section edits made by
- * handlers that run later and stops Pi from recording/sending only the changed
- * sections. A custom section named `skills` overrides Pi's own and keeps its
- * position and `<skills>` wrapper. Returns true only when Pi's re-rendered prompt
- * really contains the compressed list; otherwise the section is restored and the
- * caller falls back to the string substitution.
- *
- * A custom base prompt (`customPrompt`) can hold its own copy of the verbose
- * list: pi-subagents passes the parent's rendered prompt there, and an idle
- * parent renders its unedited base options. That copy is compressed in place
- * too; otherwise the re-render still contains the verbose list, the section edit
- * is rolled back, and the string fallback forces the prompt.
- */
-export function compressSkillsViaSection(event: {
-  readonly systemPrompt: string;
-  systemPromptOptions: BuildSystemPromptOptions;
-}): boolean {
-  if (!featureEnabled("skillCompression", NO_SKILL_COMPRESSION_ENV, true)) return false;
-  const options = event.systemPromptOptions;
-  const sections = options?.sections;
-  // Pi < 0.86 has no sections; a forced prompt (set by an earlier handler) ignores them.
-  if (!sections || typeof sections !== "object" || options.forceSystemPrompt !== undefined) return false;
-  if (!options.skills || options.skills.filter((skill) => !skill.disableModelInvocation).length < SKILL_COMPRESSION_MIN_COUNT) return false;
-
-  const verbose = formatSkillsForPrompt(options.skills, skillFileReadTool(options) ?? "read").trim();
-  if (!verbose || !event.systemPrompt.includes(verbose)) return false;
-  const compressed = formatSkillsForPromptCompressed(options.skills, skillFileReadTool(options) ?? "read").trim();
-  if (!compressed || compressed.length >= verbose.length) return false;
-
-  const previousCustom = options.customPrompt;
-  const customHasVerbose = typeof previousCustom === "string" && previousCustom.includes(verbose);
-  if (customHasVerbose) options.customPrompt = previousCustom.split(verbose).join(compressed);
-  // Only the custom prompt held the list (Pi renders no skills section of its own, e.g. no
-  // read/bash tool): done, and no `<skills>` section is added where Pi renders none.
-  if (customHasVerbose && !event.systemPrompt.includes(verbose)) {
-    if (event.systemPrompt.includes(compressed)) return true;
-    options.customPrompt = previousCustom;
-    return false;
-  }
-
-  const previous = sections.skills;
-  sections.skills = compressed;
-  if (event.systemPrompt.includes(compressed) && !event.systemPrompt.includes(verbose)) return true;
-  if (previous === undefined) delete sections.skills;
-  else sections.skills = previous;
-  options.customPrompt = previousCustom;
-  return false;
+/** Non-reversible diagnostic fingerprint of a prompt (16 hex chars); never persist the prompt text. */
+export function fingerprintPrompt(prompt: string | undefined): string | undefined {
+  return typeof prompt === "string"
+    ? createHash("sha256").update(prompt).digest("hex").slice(0, 16)
+    : undefined;
 }
 
 /**
@@ -272,49 +55,196 @@ export function stripSessionOverviewChurn(prompt: string): string {
   return before + cleaned + after;
 }
 
+// ── OMP system prompt 块数组工具 ──────────────────────────────
+// before_agent_start 给出 `systemPrompt: string[]`（有序块），返回 `{ systemPrompt: string[] }`
+// 整段替换。块顺序与 skill 描述逐字保留；join 只用于 cache hint 展示，不用于再拆分。
+
+/** 规范化 event.systemPrompt：OMP 为 string[]；兼容旧宿主的 string。 */
+export function normalizeSystemPromptBlocks(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((block): block is string => typeof block === "string");
+  return typeof value === "string" ? [value] : [];
+}
+
+export function joinSystemPromptBlocks(blocks: string[]): string {
+  return blocks.filter((block) => typeof block === "string" && block.length > 0).join("\n\n");
+}
+
+export function mapSystemPromptBlocks(blocks: string[], mapFn: (block: string, index: number) => string): string[] {
+  return blocks.map((block, index) => {
+    if (typeof block !== "string") return block;
+    const next = mapFn(block, index);
+    // 防止整块被 map 成空串后误删。
+    if (typeof next !== "string" || next.trim().length === 0) return block;
+    return next;
+  });
+}
+
+export function systemPromptBlocksEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 /**
- * What happened to the skill list on the most recent prompt build. Compression no-ops silently by design when
- * Pi's text is not recognised, which once hid a regression for two weeks (Pi 0.86 changed how the block is
- * assembled); `/cache-optimizer doctor` shows this so that state is visible.
+ * What happened to the prompt on the most recent `before_agent_start`. The
+ * rewrite no-ops silently when there is nothing to strip, so
+ * `/cache-optimizer doctor` shows this to make the state visible.
  */
-export type SkillCompressionOutcome = {
-  applied: "section" | "string" | false;
-  /** Why compression did not apply, when it did not. */
+export type PromptRewriteOutcome = {
+  /** true: at least one block changed; false: prompt kept byte-for-byte. */
+  applied: boolean;
+  /** Why the prompt was kept unchanged (only when applied is false). */
   reason?: string;
-  visibleSkills: number;
+  /** Number of system prompt blocks OMP handed to the extension. */
+  blocks: number;
   at: number;
 };
 
-let lastSkillCompressionOutcome: SkillCompressionOutcome | undefined;
+let lastPromptRewriteOutcome: PromptRewriteOutcome | undefined;
 
-export function recordSkillCompressionOutcome(outcome: SkillCompressionOutcome): void {
-  lastSkillCompressionOutcome = outcome;
+export function recordPromptRewriteOutcome(outcome: PromptRewriteOutcome): void {
+  lastPromptRewriteOutcome = { ...outcome };
 }
 
-export function getLastSkillCompressionOutcome(): SkillCompressionOutcome | undefined {
-  return lastSkillCompressionOutcome;
+export function getLastPromptRewriteOutcome(): PromptRewriteOutcome | undefined {
+  return lastPromptRewriteOutcome ? { ...lastPromptRewriteOutcome } : undefined;
 }
 
-/** The reason the skill list in `prompt` is left unchanged; call only when neither compression path applied. */
-export function explainSkillCompressionSkip(prompt: string, opts: BuildSystemPromptOptions): string {
-  if (!featureEnabled("skillCompression", NO_SKILL_COMPRESSION_ENV, true)) return "skill compression is turned off";
-  const visible = (opts.skills ?? []).filter((skill) => !skill.disableModelInvocation);
-  if (visible.length < SKILL_COMPRESSION_MIN_COUNT) {
-    return `only ${visible.length} visible skill(s); compression starts at ${SKILL_COMPRESSION_MIN_COUNT}`;
-  }
-  if (!prompt.includes("<available_skills>")) {
-    return "the prompt has no skill list (no read tool selected, or another extension replaced it)";
-  }
-  if (!prompt.includes(formatSkillsForPrompt(opts.skills ?? [], skillFileReadTool(opts) ?? "read").trim())) {
-    return "Pi's skill list format was not recognised; Pi may have changed it (please report this)";
-  }
-  return "the compressed list would not be shorter";
+export function describePromptRewriteOutcome(outcome: PromptRewriteOutcome | undefined = lastPromptRewriteOutcome): string {
+  if (!outcome) return "Prompt 重写：本进程还没有构建过 prompt。";
+  const when = new Date(outcome.at).toLocaleTimeString();
+  if (outcome.applied) return `Prompt 重写：已清理 <session-overview> 易变字段（${outcome.blocks} 个块，${when}）。`;
+  return `Prompt 重写：未改动（${outcome.reason ?? "没有可清理的内容"}；${outcome.blocks} 个块，${when}）。`;
 }
 
-export function describeSkillCompressionOutcome(outcome: SkillCompressionOutcome | undefined = lastSkillCompressionOutcome): string {
-  if (!outcome) return "Skill compression: no prompt built yet in this process";
-  const skills = `${outcome.visibleSkills} visible skill(s)`;
-  if (outcome.applied === "section") return `Skill compression: applied (structured skills section, ${skills})`;
-  if (outcome.applied === "string") return `Skill compression: applied (prompt text substitution, ${skills})`;
-  return `Skill compression: not applied — ${outcome.reason ?? "unknown reason"}`;
+// ── 系统 prompt 提取/写回（before_provider_request 安全网） ──
+//
+// 主重写在 before_agent_start（string[] 块）。extractSystemPrompt / withSystemPrompt
+// 用于 payload 级 session-overview 兜底 strip 与请求级诊断指纹。payload 形态：
+//   - openai-responses / codex / azure: payload.instructions（仅诊断指纹）
+//   - openai-completions / openai-responses: payload.messages[] role=system/developer
+//   - anthropic-messages: payload.system（字符串或块数组）
+//   - google-generative-ai: payload.systemInstruction
+
+export function extractSystemPrompt(payload: unknown): string | undefined {
+  const record = asRecord(payload);
+  if (!record) return undefined;
+
+  // openai-responses / codex / azure-openai-responses: top-level instructions
+  if (typeof record.instructions === "string" && record.instructions.trim().length > 0) {
+    return record.instructions;
+  }
+
+  // anthropic-messages: payload.system (string or content blocks array)
+  const systemField = record.system;
+  if (typeof systemField === "string") return systemField;
+  if (Array.isArray(systemField)) {
+    return systemField
+      .map((block) => {
+        const r = asRecord(block);
+        return typeof r?.text === "string" ? r.text : "";
+      })
+      .join("\n")
+      .trim() || undefined;
+  }
+
+  // google-generative-ai: payload.systemInstruction
+  const systemInstruction = asRecord(record.systemInstruction);
+  if (systemInstruction && Array.isArray(systemInstruction.parts)) {
+    const text = systemInstruction.parts
+      .map((p) => {
+        const r = asRecord(p);
+        return typeof r?.text === "string" ? r.text : "";
+      })
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+
+  // openai-completions / openai-responses: payload.messages[] first system message
+  if (Array.isArray(record.messages)) {
+    for (const msg of record.messages) {
+      const r = asRecord(msg);
+      if (!r || (r.role !== "system" && r.role !== "developer")) continue;
+      if (typeof r.content === "string") return r.content;
+      if (Array.isArray(r.content)) {
+        const text = r.content
+          .map((c) => {
+            const cr = asRecord(c);
+            return typeof cr?.text === "string" ? cr.text : "";
+          })
+          .join("\n")
+          .trim();
+        if (text) return text;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Apply `mapText` to every text block of the payload's system prompt and
+ * return a copy, or undefined when nothing changed. Unlike a whole-prompt
+ * replacement this keeps block boundaries, non-text blocks and metadata
+ * (cache_control and friends) exactly where the transport put them. The
+ * caller's payload is never mutated.
+ */
+export function mapSystemPromptText(payload: unknown, mapText: (text: string) => string): unknown | undefined {
+  const record = asRecord(payload);
+  if (!record) return undefined;
+
+  const mapBlocks = (items: unknown[]): unknown[] | undefined => {
+    let changed = false;
+    const next = items.map((item) => {
+      const block = asRecord(item);
+      if (typeof block?.text !== "string") return item;
+      const text = mapText(block.text);
+      if (text === block.text) return item;
+      changed = true;
+      return { ...block, text };
+    });
+    return changed ? next : undefined;
+  };
+
+  if (typeof record.system === "string") {
+    const text = mapText(record.system);
+    return text === record.system ? undefined : { ...record, system: text };
+  }
+  if (Array.isArray(record.system)) {
+    const system = mapBlocks(record.system);
+    return system ? { ...record, system } : undefined;
+  }
+
+  const systemInstruction = asRecord(record.systemInstruction);
+  if (systemInstruction && Array.isArray(systemInstruction.parts)) {
+    const parts = mapBlocks(systemInstruction.parts);
+    return parts ? { ...record, systemInstruction: { ...systemInstruction, parts } } : undefined;
+  }
+
+  if (Array.isArray(record.messages)) {
+    let changed = false;
+    const messages = record.messages.map((msg) => {
+      const r = asRecord(msg);
+      if (!r || (r.role !== "system" && r.role !== "developer")) return msg;
+      if (typeof r.content === "string") {
+        const content = mapText(r.content);
+        if (content === r.content) return msg;
+        changed = true;
+        return { ...r, content };
+      }
+      if (Array.isArray(r.content)) {
+        const content = mapBlocks(r.content);
+        if (!content) return msg;
+        changed = true;
+        return { ...r, content };
+      }
+      return msg;
+    });
+    return changed ? { ...record, messages } : undefined;
+  }
+
+  return undefined;
 }

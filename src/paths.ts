@@ -1,18 +1,21 @@
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
-/** Use Pi core's resolver so rebranded config names and env semantics stay aligned. */
-export const STATE_DIR = getAgentDir();
+/**
+ * OMP 的 agent 目录：与宿主 `@oh-my-pi/pi-utils` 的 getAgentDir() 一致，
+ * `PI_CODING_AGENT_DIR` 覆盖（宿主切换 profile 时也会写它），否则为 `~/.omp/agent`。
+ * 扩展只从宿主 import type，不在运行时依赖宿主包，所以这里自行解析。
+ */
+export function resolveAgentDir(env: Record<string, string | undefined> = process.env): string {
+  const override = env.PI_CODING_AGENT_DIR?.trim();
+  return override ? resolve(override) : join(homedir(), ".omp", "agent");
+}
 
-export const FIX_RECEIPT_FILE_NAME = "pi-cache-optimizer-fix-receipt.json";
+export const STATE_DIR = resolveAgentDir();
 
-export const FIX_RECEIPT_PATH = join(STATE_DIR, FIX_RECEIPT_FILE_NAME);
-
-export const MODELS_TRANSACTION_LOCK_PATH = join(STATE_DIR, "pi-cache-optimizer-models-transaction.lock");
+/** 串行化本扩展配置文件（omp-cache-optimizer-config.json）写入的锁。 */
+export const MODELS_TRANSACTION_LOCK_PATH = join(STATE_DIR, "omp-cache-optimizer-config-transaction.lock");
 
 export const MODELS_TRANSACTION_LOCK_STALE_MS = 60_000;
 
 export const MODELS_TRANSACTION_LOCK_WAIT_MS = 5_000;
-
-/** The real models.json path used for I/O. */
-export const MODELS_JSON_PATH = join(STATE_DIR, "models.json");

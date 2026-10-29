@@ -1,15 +1,14 @@
 import { LOG_PREFIX, type PiModel, asRecord, getNumber, isNonEmptyString, lower } from "./common.ts";
-import { findLastExactModelDefinition } from "./compat-config.ts";
-import { VIRTUAL_REWRITE_ENV, featureEnabled } from "./config.ts";
-import { ROUTED_FALLBACK_MODEL_SYMBOL, getAssistantRecord, isNativeVirtualModel, isResponsesPromptRewriteBypassApi, modelKey, readEffectiveCompatConfig } from "./model-identity.ts";
-import { derivePromptCacheKey } from "./request-payload.ts";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ROUTED_FALLBACK_MODEL_SYMBOL, isOpenAICompatibleApi, isOpenAICompatibleProxyApi } from "./model-identity.ts";
+import { derivePromptCacheKey, normalizePromptCacheKeyForWire } from "./request-payload.ts";
+import { type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 
-export const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
+export const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
 
-export const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
+export const PI_CACHE_HINTS_SYMBOL = Symbol.for("omp.cache.hints.v1");
 
 export type PiRouteSnapshot = {
   virtualProvider: string;
@@ -67,8 +66,8 @@ export type PiCacheHintsV1 = {
 };
 
 export type ProtocolGlobal = typeof globalThis & Record<symbol, unknown> & {
-  __piCacheOptimizerRouter?: unknown;
-  __piCacheOptimizerCacheKey__?: unknown;
+  __ompCacheOptimizerRouter?: unknown;
+  __ompCacheOptimizerCacheKey__?: unknown;
 };
 
 export type ModelRegistryLike = {
@@ -188,7 +187,7 @@ export function resolveActiveRouteSnapshot(
   model: PiModel | undefined,
   ctx?: Pick<ExtensionContext, "sessionManager">,
 ): PiRouteSnapshot | undefined {
-  if (!model || isNativeVirtualModel(model)) return undefined;
+  if (!model) return undefined;
   const hint: PiRouteResolveHint | undefined = ctx ? { sessionIdHash: sessionHashFromContext(ctx) } : undefined;
 
   const adapter = getRoutingRegistry()?.getRouter(model.provider);
@@ -206,8 +205,8 @@ export function resolveActiveRouteSnapshot(
   }
 
   // Temporary migration shim for the prototype global used by early router PRs.
-  // New integrations should use Symbol.for("pi.routing.registry.v1") instead.
-  const legacy = getProtocolGlobal().__piCacheOptimizerRouter;
+  // New integrations should use Symbol.for("omp.routing.registry.v1") instead.
+  const legacy = getProtocolGlobal().__ompCacheOptimizerRouter;
   if (!legacy || !lower(model.provider).includes("router")) return undefined;
   try {
     if (typeof legacy === "function") {
@@ -223,43 +222,6 @@ export function resolveActiveRouteSnapshot(
     console.warn(`${LOG_PREFIX}: legacy routing global failed`, error);
     return undefined;
   }
-}
-
-export function resolveNativeVirtualCandidateModels(
-  model: PiModel | undefined,
-  ctx?: ContextWithOptionalModelRegistry,
-): PiModel[] | undefined {
-  if (!model || !isNativeVirtualModel(model)) return undefined;
-  const adapter = getRoutingRegistry()?.getRouter(model.provider);
-  if (!adapter?.resolveCandidateRoutes) return undefined;
-
-  try {
-    const rawSnapshots = adapter.resolveCandidateRoutes(model.id);
-    if (!Array.isArray(rawSnapshots) || rawSnapshots.length === 0) return undefined;
-    const candidates: PiModel[] = [];
-    for (const rawSnapshot of rawSnapshots) {
-      const snapshot = parseRouteSnapshot(rawSnapshot, model.provider, model.id);
-      if (!snapshot) return undefined;
-      const candidate = findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
-        ?? routeSnapshotToPiModel(snapshot, model);
-      if (!isNonEmptyString(candidate.api)) return undefined;
-      candidates.push(candidate);
-    }
-    return candidates;
-  } catch {
-    return undefined;
-  }
-}
-
-export function canRewriteNativeVirtualPrompt(
-  model: PiModel | undefined,
-  ctx?: ContextWithOptionalModelRegistry,
-): boolean {
-  if (!isNativeVirtualModel(model) || !featureEnabled("virtualRewrite", VIRTUAL_REWRITE_ENV, false)) return false;
-  const candidates = resolveNativeVirtualCandidateModels(model, ctx);
-  return !!candidates?.length && candidates.every((candidate) =>
-    candidate.api === "openai-completions" || candidate.api === "anthropic-messages",
-  ) && candidates.every((candidate) => !isResponsesPromptRewriteBypassApi(candidate.api));
 }
 
 export function routeSnapshotToPiModel(snapshot: PiRouteSnapshot, fallback?: PiModel): PiModel {
@@ -296,205 +258,20 @@ export function findModelInRegistry(registry: ModelRegistryLike | undefined, pro
     return all.find((candidate) => candidate.provider === provider && candidate.id === id);
   } catch {
     // Registry extensions are optional input; a malformed/throwing registry
-    // must not turn a provider error hook into a Pi session failure.
+    // must not turn a provider error hook into an OMP session failure.
     return undefined;
   }
-}
-
-export function applyConfiguredTransportToModel(model: PiModel, config: unknown): PiModel {
-  const providers = asRecord(asRecord(config)?.providers);
-  const provider = asRecord(providers?.[model.provider]);
-  const customModel = findLastExactModelDefinition(
-    Array.isArray(provider?.models) ? provider.models : undefined,
-    model.id,
-  );
-  const configuredApi = customModel?.api ?? provider?.api;
-  const configuredBaseUrl = customModel?.baseUrl ?? provider?.baseUrl;
-  const api = isNonEmptyString(model.api)
-    ? model.api
-    : (isNonEmptyString(configuredApi) ? configuredApi : model.api);
-  const baseUrl = isNonEmptyString(model.baseUrl)
-    ? model.baseUrl
-    : (isNonEmptyString(configuredBaseUrl) ? configuredBaseUrl : model.baseUrl);
-  return api === model.api && baseUrl === model.baseUrl ? model : { ...model, api, baseUrl };
 }
 
 export function resolveRouteModel(
   model: PiModel | undefined,
   ctx?: ContextWithOptionalModelRegistry,
 ): PiModel | undefined {
-  const nativeVirtualRoute = resolveNativeVirtualRouteModel(model, ctx);
-  if (nativeVirtualRoute) return nativeVirtualRoute;
-
   const snapshot = resolveActiveRouteSnapshot(model, ctx);
   if (!snapshot) return undefined;
 
-  const resolved = findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
+  return findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
     ?? routeSnapshotToPiModel(snapshot, model);
-  return applyConfiguredTransportToModel(resolved, readEffectiveCompatConfig());
-}
-
-// Pi 0.99+ native virtual models (`pi.registerVirtualModel()`). `ctx.model`
-// stays the virtual selection while Pi dispatches every request to a physical
-// model; only assistant messages and the provider payload name that model.
-// Older Pi hosts never produce this API, so every native-virtual path is inert.
-export type NativeVirtualDispatch = { provider: string; id: string; api: string };
-
-export function readSessionBranch(ctx: Pick<ExtensionContext, "sessionManager"> | undefined): unknown[] {
-  try {
-    const manager = ctx?.sessionManager as { getBranch?: () => unknown } | undefined;
-    if (typeof manager?.getBranch !== "function") return [];
-    const branch = manager.getBranch();
-    return Array.isArray(branch) ? branch : [];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Physical models that answered on the current session branch, newest first:
- * the latest successful response (Pi's `request.previous`) and the latest
- * response of any outcome (a failed attempt that a retry may reuse). The
- * catalog id in `message.model` is preferred over the echoed `responseModel`
- * because it is the id Pi dispatched and the registry knows.
- */
-export function findNativeVirtualDispatches(ctx: Pick<ExtensionContext, "sessionManager"> | undefined): {
-  latestSuccessful?: NativeVirtualDispatch;
-  latestAny?: NativeVirtualDispatch;
-} {
-  const branch = readSessionBranch(ctx);
-  let latestSuccessful: NativeVirtualDispatch | undefined;
-  let latestAny: NativeVirtualDispatch | undefined;
-  for (let index = branch.length - 1; index >= 0 && !latestSuccessful; index--) {
-    const entry = asRecord(branch[index]);
-    if (entry?.type !== "message") continue;
-    const message = getAssistantRecord(entry.message);
-    if (!message || isNativeVirtualModel(message)) continue;
-    const dispatch = nativeVirtualDispatchFromMessage(message);
-    if (!dispatch) continue;
-    latestAny ??= dispatch;
-    if (message.stopReason !== "error" && message.stopReason !== "aborted") latestSuccessful = dispatch;
-  }
-  return { latestSuccessful, latestAny };
-}
-
-export function nativeVirtualDispatchFromMessage(message: unknown): NativeVirtualDispatch | undefined {
-  const record = getAssistantRecord(message);
-  if (!record || isNativeVirtualModel(record)) return undefined;
-  const provider = firstNonEmptyString(record.provider);
-  const id = firstNonEmptyString(record.model, record.responseModel);
-  return provider && id ? { provider, id, api: firstNonEmptyString(record.api) ?? "" } : undefined;
-}
-
-export function nativeVirtualDispatchToModel(
-  dispatch: NativeVirtualDispatch,
-  ctx?: ContextWithOptionalModelRegistry,
-): PiModel {
-  // A virtual model hides a same-id physical model in the catalog, so a
-  // registry hit that is itself virtual is not physical metadata.
-  const registered = findModelInRegistry(ctx?.modelRegistry, dispatch.provider, dispatch.id);
-  const model = registered && !isNativeVirtualModel(registered)
-    ? registered
-    : ({
-      provider: dispatch.provider,
-      id: dispatch.id,
-      name: dispatch.id,
-      api: dispatch.api,
-      baseUrl: "",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 0,
-      maxTokens: 0,
-      [ROUTED_FALLBACK_MODEL_SYMBOL]: true,
-    } as PiModel);
-  return applyConfiguredTransportToModel(model, readEffectiveCompatConfig());
-}
-
-/**
- * Physical model behind a native virtual selection for pre-request UX (footer,
- * doctor, compat, stats, reset, fix): the model that answered last on this
- * session branch, matching Pi's own routed-model display and context limits.
- */
-export function resolveNativeVirtualRouteModel(
-  model: PiModel | undefined,
-  ctx?: ContextWithOptionalModelRegistry,
-): PiModel | undefined {
-  if (!isNativeVirtualModel(model)) return undefined;
-  const { latestSuccessful, latestAny } = findNativeVirtualDispatches(ctx);
-  const dispatch = latestSuccessful ?? latestAny;
-  return dispatch ? nativeVirtualDispatchToModel(dispatch, ctx) : undefined;
-}
-
-export function getProviderPayloadModelId(payload: unknown): string | undefined {
-  const record = asRecord(payload);
-  // Pi's built-in transports put the dispatched catalog id in `model`
-  // (OpenAI, Anthropic, Google, Mistral) or `modelId` (Bedrock Converse).
-  return firstNonEmptyString(record?.model, record?.modelId);
-}
-
-export function physicalModelsWithId(candidates: readonly PiModel[] | undefined, id: string): PiModel[] {
-  return (candidates ?? []).filter((candidate) => candidate.id === id
-    && !isNativeVirtualModel(candidate)
-    && !isRouterModel(candidate)
-    && !getRoutingRegistry()?.getRouter(candidate.provider));
-}
-
-/**
- * Physical model of one native-virtual request. `before_provider_request`
- * carries only the payload and `ctx.model` stays virtual, so the payload's
- * dispatched model id is matched against credentialed physical models (a
- * router may only route to those). A unique provider match wins. An id shared
- * by several credentialed providers is used only when every candidate gets the
- * same request treatment (`requestPolicyKey`); the identity then stays
- * ambiguous so response evidence is never pinned to a guessed provider.
- * Differing policies return undefined so identity-dependent request mutations
- * fail closed. Without a credentialed match, the sticky branch candidates and
- * then the full catalog are consulted.
- */
-export function resolveNativeVirtualRequestModel(
-  model: PiModel | undefined,
-  payload: unknown,
-  ctx?: ContextWithOptionalModelRegistry,
-  requestPolicyKey?: (candidate: PiModel) => string,
-): { model: PiModel; identityAmbiguous: boolean } | undefined {
-  if (!isNativeVirtualModel(model)) return undefined;
-  const payloadModelId = getProviderPayloadModelId(payload);
-  if (!payloadModelId) return undefined;
-  const config = readEffectiveCompatConfig();
-  // null: no candidate; undefined: ambiguous with differing request policies.
-  const pick = (matches: PiModel[]): { model: PiModel; identityAmbiguous: boolean } | undefined | null => {
-    if (matches.length === 0) return null;
-    const configured = matches.map((candidate) => applyConfiguredTransportToModel(candidate, config));
-    if (new Set(configured.map((candidate) => candidate.provider)).size === 1) {
-      return { model: configured[0], identityAmbiguous: false };
-    }
-    const policies = requestPolicyKey ? new Set(configured.map(requestPolicyKey)) : undefined;
-    return policies?.size === 1 ? { model: configured[0], identityAmbiguous: true } : undefined;
-  };
-  try {
-    const credentialed = pick(physicalModelsWithId(ctx?.modelRegistry?.getAvailable?.(), payloadModelId));
-    if (credentialed !== null) return credentialed;
-
-    const { latestSuccessful, latestAny } = findNativeVirtualDispatches(ctx);
-    for (const dispatch of [latestSuccessful, latestAny]) {
-      if (dispatch?.id === payloadModelId) {
-        return { model: nativeVirtualDispatchToModel(dispatch, ctx), identityAmbiguous: false };
-      }
-    }
-
-    return pick(physicalModelsWithId(ctx?.modelRegistry?.getAll?.(), payloadModelId)) ?? undefined;
-  } catch {
-    // Registry access is optional input; never fail the provider request hook.
-    return undefined;
-  }
-}
-
-export function describeNativeVirtualRouteNote(selected: PiModel | undefined, effective: PiModel | undefined): string | undefined {
-  if (!selected || !isNativeVirtualModel(selected)) return undefined;
-  // Without a routed response, the not-applicable text explains the state.
-  if (!effective || isNativeVirtualModel(effective)) return undefined;
-  return `🔀 Native virtual model ${modelKey(selected)} → latest routed physical model ${modelKey(effective)}. The diagnostics below apply to that physical model; Pi may route later requests elsewhere.`;
 }
 
 export function installCacheHintsService(
@@ -520,14 +297,127 @@ export function isRouterModel(model: PiModel | undefined): boolean {
   return lower(model?.provider) === "router";
 }
 
-export const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for("pi.cache.optimizer.hints-owner.v1");
+export const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for("omp.cache.optimizer.hints-owner.v1");
 
 export type PiCacheHintSnapshot = PiCacheHintsInput & PiCacheHintsOutput & {
   timestamp: number;
 };
 
-export function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
-  return derivePromptCacheKey(ctx.sessionManager.getSessionId());
+// ── OMP prompt_cache_key 身份解析（fork 逻辑） ─────────────────────
+//
+// OMP 核心对 Responses 族默认发送 `providerPromptCacheKey ?? sessionId`，
+// Chat Completions 只在 compat.supportsPromptCacheKey 时发送。本扩展：
+// - 会话头里用户/fork 固定的 providerPromptCacheKey 一律优先；
+// - Responses 族（含 openrouter）用"项目级稳定 key"替换每会话默认 key，让同一项目的
+//   不同会话共享缓存路由；
+// - 第三方 Chat Completions 没有 header key 时按会话隔离（单向哈希的会话 key，原始
+//   sessionId 不离开本进程），避免不同会话互相覆盖同一缓存分桶。
+
+export type PromptCacheKeySource = "header" | "project" | "session";
+
+export type ResolvedPromptCacheKey = {
+  key: string;
+  source: PromptCacheKeySource;
+};
+
+export function normalizePromptCacheEndpoint(baseUrl: unknown): string {
+  const raw = typeof baseUrl === "string" ? baseUrl.trim() : "";
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    let pathname = url.pathname;
+    if (pathname.length > 1 && pathname.endsWith("/")) {
+      pathname = pathname.slice(0, -1);
+    }
+    return `${url.protocol}//${url.host}${pathname === "/" ? "" : pathname}`;
+  } catch {
+    return raw.replace(/\/+$/, "");
+  }
+}
+
+/** 优先 sessionManager.getCwd()，空则回退 ctx.cwd（兼容旧宿主）。 */
+export function resolveProjectCwd(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">): string | undefined {
+  const manager = ctx.sessionManager as { getCwd?: () => string };
+  const sessionCwd = firstNonEmptyString(typeof manager.getCwd === "function" ? manager.getCwd() : undefined);
+  if (sessionCwd) return sessionCwd;
+  return firstNonEmptyString(ctx.cwd);
+}
+
+export function buildProjectPromptCacheKey(cwd: string | undefined, model: PiModel | undefined): string | undefined {
+  if (!model || !isOpenAICompatibleApi(model.api)) return undefined;
+  const provider = lower(model.provider).trim();
+  const modelId = typeof model.id === "string" ? model.id.trim() : "";
+  if (!provider || !modelId) return undefined;
+  const projectPath = resolve(firstNonEmptyString(cwd, process.cwd())!);
+  const api = lower(model.api);
+  const endpoint = normalizePromptCacheEndpoint(model.baseUrl);
+  const input = JSON.stringify([1, projectPath, api, provider, modelId, endpoint]);
+  return `omp-cache-v1-${createHash("sha256").update(input).digest("hex").slice(0, 48)}`;
+}
+
+/** 会话头里由用户（--provider-prompt-cache-key）或完整 fork 固定的 key。 */
+export function getHeaderPromptCacheKey(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
+  try {
+    const header = asRecord((ctx.sessionManager as { getHeader?: () => unknown }).getHeader?.());
+    return firstNonEmptyString(header?.providerPromptCacheKey);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 解析本扩展要使用的 prompt_cache_key 身份：header key 一律优先；
+ * 否则按 API 族选择项目级稳定 key（Responses 族）或会话级哈希 key（Chat Completions）。
+ */
+export function resolvePromptCacheKey(
+  ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
+  model: PiModel | undefined,
+  options: { allowProjectKey: boolean; allowSessionFallback: boolean },
+): ResolvedPromptCacheKey | undefined {
+  const headerKey = getHeaderPromptCacheKey(ctx);
+  if (headerKey) return { key: headerKey, source: "header" };
+  if (options.allowProjectKey) {
+    const projectKey = buildProjectPromptCacheKey(resolveProjectCwd(ctx), model);
+    if (projectKey) return { key: projectKey, source: "project" };
+  }
+  if (options.allowSessionFallback) {
+    const sessionKey = derivePromptCacheKey(ctx.sessionManager.getSessionId());
+    if (sessionKey) return { key: sessionKey, source: "session" };
+  }
+  return undefined;
+}
+
+/** 该 API 用哪种 key：Chat Completions 按会话隔离，其余 OpenAI 兼容 API 用项目级 key。 */
+export function promptCacheKeyOptionsForApi(api: unknown): { allowProjectKey: boolean; allowSessionFallback: boolean } {
+  const completions = isOpenAICompatibleProxyApi(api);
+  return { allowProjectKey: !completions, allowSessionFallback: completions };
+}
+
+/**
+ * 只把"会话级默认 key"视为可替换：OMP 核心发出的原始 sessionId（含其 pc_ 归一化形式），
+ * 以及本扩展自己派生的会话哈希 key。用户自定义 key 一律保留。
+ */
+export function isSessionScopedPromptCacheKey(key: string | undefined, sessionId: string | undefined): boolean {
+  const normalizedKey = key?.trim();
+  const normalizedSessionId = sessionId?.trim();
+  if (!normalizedKey || !normalizedSessionId) return false;
+  return normalizedKey === normalizedSessionId
+    || normalizedKey === normalizePromptCacheKeyForWire(normalizedSessionId)
+    || normalizedKey === derivePromptCacheKey(normalizedSessionId);
+}
+
+/** cache hint 与旧全局里发布的会话 key（不做 wire 归一化，保留完整 host key）。 */
+export function getSessionPromptCacheKey(
+  ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
+  model?: PiModel,
+): string | undefined {
+  return resolvePromptCacheKey(ctx, model, model ? promptCacheKeyOptionsForApi(model.api) : { allowProjectKey: false, allowSessionFallback: true })?.key;
 }
 
 export function isCacheHintsServiceV1(value: unknown): value is PiCacheHintsV1 {

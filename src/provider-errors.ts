@@ -2,14 +2,13 @@ import { LOG_PREFIX, type PiModel, lower } from "./common.ts";
 import { isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { getOptionalAssistantHttpStatus } from "./diagnostics.ts";
 import { type FixSuggestion } from "./fix-types.ts";
-import { getAssistantRecord, getCompat, isDeepSeekLikeModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isPiBuiltInLlamaCppModel, modelKey } from "./model-identity.ts";
-import { isActionableModelsJsonFixReceipt, readModelsJsonFixReceipt } from "./models-json-fix.ts";
+import { getAssistantRecord, getCompat, getExplicitCompat, isDeepSeekLikeModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, modelKey } from "./model-identity.ts";
 import { firstNonEmptyString } from "./routing.ts";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-export const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.anthropic-ttl-fallback.v1");
+export const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for("omp.cache.optimizer.anthropic-ttl-fallback.v1");
 
-export const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.reasoning-protocol-fallback.v1");
+export const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for("omp.cache.optimizer.reasoning-protocol-fallback.v1");
 
 export type AnthropicTtlFallbackStateV1 = {
   version: 1;
@@ -197,10 +196,9 @@ export function hasReasoningProtocolRejectionText(value: unknown): boolean {
 export function hasReasoningProtocolRejectionErrorMessage(message: unknown): boolean {
   const record = getAssistantRecord(message);
   if (!record || record.stopReason !== "error") return false;
-  // Finalized assistant messages do not expose a separate status field in the
-  // normal Pi path, so recover it only from structured diagnostics or the
-  // adapter's status-shaped error prefix. A text-only 400-looking parameter
-  // message is not enough evidence for a protocol repair.
+  // Recover the status from OMP's structured `errorStatus`, other structured
+  // diagnostics, or the adapter's status-shaped error prefix. A text-only
+  // 400-looking parameter message is not enough evidence for a protocol repair.
   return getOptionalAssistantHttpStatus(record) === 400 &&
     hasReasoningProtocolRejectionText(record.errorMessage);
 }
@@ -237,16 +235,9 @@ export async function notifyReasoningProtocolObservation(
   if (warnedModelKeys.has(key)) return;
   warnedModelKeys.add(key);
 
-  const receipt = await readModelsJsonFixReceipt();
-  const matchingReceipt = isActionableModelsJsonFixReceipt(receipt) &&
-    receipt.provider === model.provider &&
-    receipt.modelId === model.id;
-  const recovery = matchingReceipt
-    ? "A matching confirmed fix receipt exists; run /cache-optimizer rollback to undo it safely."
-    : "Run /cache-optimizer fix to review a model-scoped repair.";
   ctx.ui.notify(
-    `⚠️ ${LOG_PREFIX}: ${key} rejected the configured reasoning format. ${recovery} ` +
-    "No configuration was changed automatically.",
+    `⚠️ ${LOG_PREFIX}：${key} 拒绝了当前配置的 reasoning 参数格式。运行 /cache-optimizer fix 查看按模型生效的 compat 修复片段。` +
+    "未自动修改任何配置。",
     "warning",
   );
 }
@@ -281,14 +272,13 @@ export function buildReasoningProtocolFixSuggestion(
 
   const compat = getCompat(model);
   // Explicit provider-specific formats are user/provider evidence in their own
-  // right. Do not replace qwen/openrouter/together/etc. merely because a
+  // right. Do not replace qwen/openrouter/zai/kimi/etc. merely because a
   // generic error happened to mention both reasoning parameter names. The
-  // evidence-driven repair is limited to the old DeepSeek `thinking` format,
-  // an explicit standard OpenAI format, or an absent format that needs to be
-  // made unambiguous after the provider's rejection.
+  // evidence-driven repair is limited to an explicit standard OpenAI format
+  // or an absent format that needs to be made unambiguous after the
+  // provider's rejection. (OMP has no Pi-style `thinkingFormat: "deepseek"`.)
   if (
     compat.thinkingFormat !== undefined &&
-    compat.thinkingFormat !== "deepseek" &&
     compat.thinkingFormat !== "openai"
   ) {
     return undefined;
@@ -303,11 +293,12 @@ export function buildReasoningProtocolFixSuggestion(
     compatKeys.supportsReasoningEffort = true;
   }
 
-  // Replay behavior is changed only when the current effective configuration
-  // actually enabled it. Never invent a false value merely because the model
-  // family is named DeepSeek or because a provider supports reasoning effort.
-  if (compat.requiresReasoningContentOnAssistantMessages === true) {
-    compatKeys.requiresReasoningContentOnAssistantMessages = false;
+  // Replay behavior is changed only when the user explicitly enabled it in
+  // models.yml. OMP enables requiresReasoningContentForToolCalls by itself for
+  // reasoning-capable DeepSeek models; never turn that catalog decision off
+  // merely because the model family is named DeepSeek.
+  if (getExplicitCompat(model).requiresReasoningContentForToolCalls === true) {
+    compatKeys.requiresReasoningContentForToolCalls = false;
   }
   if (Object.keys(compatKeys).length === 0) return undefined;
 
@@ -331,8 +322,7 @@ export function isExplicitPromptCacheRetentionUnsupportedApplicable(model: PiMod
   // require compat inherited from the active fallback model: router shells may
   // have no upstream compat metadata when no live routing registry is present.
   return isOpenAICompatibleApi(model.api) &&
-    !isOfficialOpenAIBaseUrl(model) &&
-    !isPiBuiltInLlamaCppModel(model);
+    !isOfficialOpenAIBaseUrl(model);
 }
 
 export function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string> | undefined): boolean {

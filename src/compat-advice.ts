@@ -1,8 +1,6 @@
-import { type PiModel, isNonEmptyString, lower } from "./common.ts";
-import { isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./model-detect.ts";
-import { getCompat, isDeepSeekLikeModel, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isOpenAICompatibleProxyApi, isThirdPartyOpenAIProxyEndpoint, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, isRoutedFallbackModel } from "./model-identity.ts";
-import { buildModelsJsonTypoHintLines } from "./models-json-lint.ts";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type PiModel } from "./common.ts";
+import { getCompat, isDeepSeekLikeModel, isOpenAICompatibleProxyApi } from "./model-identity.ts";
+import { STATE_DIR } from "./paths.ts";
 import { homedir } from "node:os";
 
 /** Join display-only path fragments without resolving them for I/O. */
@@ -12,15 +10,12 @@ export function joinDisplayPath(base: string, child: string, platform: string = 
 }
 
 /**
- * Return a platform-friendly display path for Pi's agent directory.
- *
- * Derives the display path from Pi core's `getAgentDir()` result. Home-relative
- * paths use `%USERPROFILE%` on Windows and `~` on Unix-like systems; custom
- * absolute or relative agent directories remain visible as configured.
+ * 返回平台友好的 OMP agent 目录展示路径（仅用于文案，不用于 I/O）。
+ * 位于家目录下时 Windows 用 `%USERPROFILE%`、其它平台用 `~`；自定义目录原样展示。
  */
 export function getAgentDirDisplayPath(
   platform: string = process.platform,
-  agentDir: string = getAgentDir(),
+  agentDir: string = STATE_DIR,
   homeDir: string = homedir(),
 ): string {
   const sep = platform.startsWith("win") ? "\\" : "/";
@@ -38,97 +33,49 @@ export function getAgentDirDisplayPath(
 }
 
 /**
- * Return a platform-friendly display path for Pi's `models.json`.
- *
- * This is a DISPLAY helper only. Actual I/O uses `MODELS_JSON_PATH`, resolved
- * from the same custom agent/config directory rules as `STATE_DIR`.
+ * 返回平台友好的 `models.yml` 展示路径（仅用于文案）。
+ * Windows：`%USERPROFILE%\.omp\agent\models.yml`；其它平台：`~/.omp/agent/models.yml`。
  */
-export function getModelsJsonDisplayPath(
+export function getModelsYmlDisplayPath(
   platform: string = process.platform,
-  agentDir: string = getAgentDir(),
+  agentDir: string = STATE_DIR,
   homeDir: string = homedir(),
 ): string {
-  return joinDisplayPath(getAgentDirDisplayPath(platform, agentDir, homeDir), "models.json", platform);
-}
-
-export function isAdaptiveThinkingCompatApplicable(model: PiModel): boolean {
-  // A routed registry miss may preserve the upstream API/model identity while
-  // lacking a verified endpoint. Do not diagnose or suggest compat fixes for
-  // that incomplete transport metadata; ordinary direct Anthropic models still
-  // use their normal native adaptive-thinking check.
-  if (isRoutedFallbackModel(model) && !isNonEmptyString(model.baseUrl)) {
-    return false;
-  }
-
-  return lower(model.api) === "anthropic-messages"
-    && (isAdaptiveGenerationModel(model) || isKimiCodingAdaptiveModel(model));
-}
-
-export function describeMissingAdaptiveThinkingCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-  if (compat.forceAdaptiveThinking !== true) {
-    missing.push("forceAdaptiveThinking");
-  }
-  if (isKimiCodingEmptySignatureModel(model) && compat.allowEmptySignature !== true) {
-    missing.push("allowEmptySignature");
-  }
-  return missing;
+  return joinDisplayPath(getAgentDirDisplayPath(platform, agentDir, homeDir), "models.yml", platform);
 }
 
 /**
- * Like describeMissingOpenAIFamilyProxyCompat but without the isOpenAIFamilyModel
- * gate. Warns for ANY model using openai-completions through a non-official base
- * URL — covers GPT, Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan, and any other
- * OpenAI-compatible proxy.
+ * OMP divergence: OMP 的模型目录会自动处理 Anthropic adaptive thinking
+ * （`disableAdaptiveThinking` 等由目录规则设置），没有 Pi 的 `forceAdaptiveThinking`
+ * 需要用户手动补，所以这一组检查在 OMP 上恒为不适用。保留函数以对齐上游调用点。
  */
-export function describeMissingOpenAICompatibleProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-
-  if (!isOpenAICompatibleProxyApi(model.api)) return missing;
-  if (!isThirdPartyOpenAIProxyEndpoint(model)) return missing;
-  if (isPiBuiltInLlamaCppModel(model)) return missing;
-
-  if (compat.sendSessionAffinityHeaders === undefined) {
-    missing.push("sendSessionAffinityHeaders");
-  }
-
-  // Explicit `sendSessionAffinityHeaders: false` is a valid safe opt-out for
-  // proxies/CDNs/WAFs that block Pi's custom affinity headers with HTTP 403.
-  // Treat only a missing/undefined value as missing compat; do not mark an
-  // intentional false override as ⚠️ compat or let /cache-optimizer fix turn it
-  // back to true.
-  //
-  // NOTE: supportsLongCacheRetention is intentionally NOT checked here.
-  // Per spec, it is optional/risky advisory text only and must NOT trigger
-  // the ⚠️ compat marker. The before_provider_request hook proactively
-  // strips prompt_cache_retention for models without explicit opt-in,
-  // so 400 errors are prevented regardless of this compat flag.
-  // Doctor/compat may mention it as optional guidance separately.
-
-  return missing;
+export function isAdaptiveThinkingCompatApplicable(_model: PiModel): boolean {
+  return false;
 }
 
-export function buildSafeOpenAIProxyCompatSuggestion(missing: string[]): Record<string, boolean> {
-  const suggestion: Record<string, boolean> = {};
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    suggestion.sendSessionAffinityHeaders = true;
-  }
-  // supportsLongCacheRetention is NOT suggested here — per spec it is
-  // optional/risky and must not appear in the copyable safe snippet.
-  // The proactive stripping in before_provider_request handles 400 prevention.
-  return suggestion;
+export function describeMissingAdaptiveThinkingCompat(_model: PiModel): string[] {
+  return [];
+}
+
+/**
+ * OMP divergence: Pi 的 `sendSessionAffinityHeaders` 在 OMP 上没有对应 compat 键。
+ * OMP 通过多凭据认证 + agent.db 的会话亲和保证上游粘性，因此 OpenAI 兼容代理在 OMP 上
+ * 没有"必需"的缓存 compat 键，这里恒返回空。可选的长缓存保留只对 openai-responses 有意义，
+ * 由 doctor/compat 作为可选建议单独说明。
+ */
+export function describeMissingOpenAICompatibleProxyCompat(_model: PiModel): string[] {
+  return [];
+}
+
+export function buildSafeOpenAIProxyCompatSuggestion(_missing: string[]): Record<string, boolean> {
+  // OMP 上没有可安全自动建议的代理 compat 键；supportsLongPromptCacheRetention 只适用于
+  // openai-responses 且可能导致 400，需用户确认上游支持后手动添加。
+  return {};
 }
 
 export type CompatAdvicePlacement = {
   providerLabel?: string;
   modelId?: string;
-  /**
-   * Append near-miss models.json key hints for this provider/model (issue #30).
-   * Default true; `/cache-optimizer doctor` lists every typo in its own section.
-   */
-  typoHints?: boolean;
 };
 
 export function buildProviderCompatOverride(providerLabel: string, compat: Record<string, unknown>): Record<string, unknown> {
@@ -155,45 +102,54 @@ export function buildModelCompatOverride(providerLabel: string, modelId: string,
   };
 }
 
-export function appendCredentialSafeProviderGuidance(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
-  appendProviderGuidanceBody(lines, placement, compatSuggestion);
-  if (placement.providerLabel && placement.typoHints !== false) {
-    appendModelsJsonTypoHints(lines, placement.providerLabel, placement.modelId);
-  }
+function formatYamlKey(key: string): string {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(key) ? key : JSON.stringify(key);
+}
+
+function formatYamlScalar(value: unknown): string {
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  if (typeof value === "string") return /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value) && !/^(true|false|null|yes|no|on|off|~)$/i.test(value) ? value : JSON.stringify(value);
+  return JSON.stringify(value);
 }
 
 /**
- * Explain why a compat key the user believes they set is still missing: Pi
- * accepts and ignores unknown keys, so `model0verrides` or
- * `sendSessionAfinityHeaders` never takes effect. Hint only; never throws.
+ * 把简单嵌套对象（叶子为布尔/数字/字符串）格式化为 models.yml 可直接粘贴的块样式 YAML。
+ * 键名或取值含特殊字符时使用 JSON 双引号字符串（也是合法的 YAML 标量）。
  */
-export function appendModelsJsonTypoHints(lines: string[], providerLabel: string | undefined, modelId?: string): void {
-  const hints = buildModelsJsonTypoHintLines(providerLabel, modelId);
-  if (hints.length === 0) return;
-  lines.push("");
-  lines.push(...hints);
+export function formatYamlSnippet(value: Record<string, unknown>, indent = 0): string {
+  const pad = " ".repeat(indent);
+  const lines: string[] = [];
+  for (const [key, child] of Object.entries(value)) {
+    if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+      lines.push(`${pad}${formatYamlKey(key)}:`);
+      lines.push(formatYamlSnippet(child as Record<string, unknown>, indent + 2));
+    } else {
+      lines.push(`${pad}${formatYamlKey(key)}: ${formatYamlScalar(child)}`);
+    }
+  }
+  return lines.join("\n");
 }
 
-function appendProviderGuidanceBody(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
+export function appendCredentialSafeProviderGuidance(lines: string[], placement: CompatAdvicePlacement, compatSuggestion: Record<string, unknown>): void {
   const providerLabel = placement.providerLabel;
   if (!providerLabel) return;
 
   lines.push("");
-  lines.push("If this channel has no models.json provider entry yet:");
-  lines.push("- Keep existing authentication as-is; do not copy credentials, tokens, or API keys.");
-  lines.push(`- Add only cache/routing compat overrides in ${getModelsJsonDisplayPath()}.`);
+  lines.push("如果这个渠道在 models.yml 里还没有 provider 配置：");
+  lines.push("- 保留现有认证方式；不要复制 credential、token 或 API key。");
+  lines.push(`- 只在 ${getModelsYmlDisplayPath()} 里添加缓存/路由 compat 覆盖。`);
 
   if (Object.keys(compatSuggestion).length === 0) {
-    lines.push("- No safe copyable override is available for the missing flags shown above.");
+    lines.push("- 上面这些缺失项目前没有安全可复制的覆盖片段。");
     return;
   }
 
-  lines.push("Provider-level minimal override:");
-  lines.push(JSON.stringify(buildProviderCompatOverride(providerLabel, compatSuggestion), null, 2));
+  lines.push("Provider 级最小覆盖：");
+  lines.push(formatYamlSnippet(buildProviderCompatOverride(providerLabel, compatSuggestion)));
 
   if (placement.modelId) {
-    lines.push("Single-model override (use this if only this model should change):");
-    lines.push(JSON.stringify(buildModelCompatOverride(providerLabel, placement.modelId, compatSuggestion), null, 2));
+    lines.push("单模型覆盖（只想影响当前模型时使用）：");
+    lines.push(formatYamlSnippet(buildModelCompatOverride(providerLabel, placement.modelId, compatSuggestion)));
   }
 }
 
@@ -203,41 +159,30 @@ export function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: str
 
   if (hasSafeSuggestion) {
     if (options.includeJsonIntro !== false) {
-      lines.push("Safe default suggestion:");
+      lines.push("安全默认建议：");
     }
-    lines.push(JSON.stringify(suggestion, null, 2));
+    lines.push(formatYamlSnippet({ compat: suggestion }));
   }
 
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for third-party proxies when supported; it helps keep one Pi session on the same upstream/backend.");
-  }
   appendCredentialSafeProviderGuidance(lines, options, suggestion);
 }
 
 /**
- * Build the warning text displayed to users when an OpenAI-family third-party
- * proxy is missing one or more cache/session-affinity compat flags.
+ * Build the warning text displayed to users when an OpenAI-compatible
+ * third-party proxy is missing one or more cache compat flags.
  *
- * The returned string contains a parseable JSON object (via JSON.stringify)
- * listing only the missing flags with recommended value `true`. Inline
- * explanations for each flag follow the JSON snippet as separate prose lines,
- * so the JSON remains valid and copyable.
- *
- * Expected use: the openai adapter's warningText calls this function; tests
- * exercise it via __internals_for_tests.
+ * OMP 上 describeMissingOpenAICompatibleProxyCompat 恒为空，所以这段文案只在
+ * 将来 OMP 引入新的代理缓存 compat 键时才会出现；保留以对齐上游适配器接口。
  */
 export function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): string {
-  // Extract provider id from the model key (e.g. "otokapi/gpt-5.5" -> "otokapi").
-  // If no slash is found, fall back to the key itself.
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
 
-  const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is a third-party OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
-    `Run /cache-optimizer fix to preview a confirmed repair (or edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat manually).`,
-    ``,
+    `💡 omp-cache-optimizer：${key} 是第三方 OpenAI 兼容代理，但合并后的 compat 缺少 ${missing.join(" 和 ")}。`,
+    `运行 /cache-optimizer fix 查看修复片段，或手动编辑 ${getModelsYmlDisplayPath()} -> providers["${providerLabel}"] -> compat。`,
+    "",
   ];
 
   appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId });
@@ -246,19 +191,15 @@ export function buildOpenAIProxyCompatWarningText(key: string, missing: string[]
 }
 
 /**
- * DeepSeek's model family and its reasoning wire protocol are separate facts.
- * The family name selects the cache adapter, but only an explicit effective
- * `thinkingFormat: "deepseek"` opts a third-party OpenAI Completions model into
- * the reasoning/replay compat checks below. Model names, provider ids, URLs,
- * and supportsReasoningEffort are not protocol evidence.
+ * DeepSeek 家族名只用于选择缓存适配器；是否需要 reasoning 回放 compat 由 OMP
+ * 解析后的 compat 决定。OMP 的目录规则会为可推理的 DeepSeek 家族自动设置
+ * `requiresReasoningContentForToolCalls: true`，所以只有名字像 DeepSeek、声明了
+ * `reasoning: true`、走 openai-completions，但 OMP 没有识别出来（解析结果仍为 false）时才提醒。
  */
 export function isDeepSeekWireCompatApplicable(model: PiModel): boolean {
-  // `thinkingFormat` is the only wire-protocol signal. The model family is
-  // still name/id based for adapter selection, while provider, URL, and
-  // supportsReasoningEffort remain deliberately irrelevant here.
   return isDeepSeekLikeModel(model)
     && isOpenAICompatibleProxyApi(model.api)
-    && getCompat(model).thinkingFormat === "deepseek";
+    && model.reasoning === true;
 }
 
 export function describeMissingDeepSeekCompat(model: PiModel): string[] {
@@ -266,8 +207,8 @@ export function describeMissingDeepSeekCompat(model: PiModel): string[] {
 
   const compat = getCompat(model);
   const missing: string[] = [];
-  if (compat.requiresReasoningContentOnAssistantMessages !== true) {
-    missing.push("requiresReasoningContentOnAssistantMessages");
+  if (compat.requiresReasoningContentForToolCalls !== true) {
+    missing.push("requiresReasoningContentForToolCalls");
   }
   return missing;
 }
@@ -288,8 +229,8 @@ export function buildDeepSeekCompatSuggestion(missing: string[]): Record<string,
   const suggestion: Record<string, unknown> = {
     ...buildSafeOpenAIProxyCompatSuggestion(missing),
   };
-  if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    suggestion.requiresReasoningContentOnAssistantMessages = true;
+  if (missing.includes("requiresReasoningContentForToolCalls")) {
+    suggestion.requiresReasoningContentForToolCalls = true;
   }
   return suggestion;
 }
@@ -297,15 +238,12 @@ export function buildDeepSeekCompatSuggestion(missing: string[]): Record<string,
 export function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
   const suggestion = buildDeepSeekCompatSuggestion(missing);
   if (Object.keys(suggestion).length > 0) {
-    lines.push("Recommended DeepSeek reasoning/replay compat snippet:");
-    lines.push(JSON.stringify(suggestion, null, 2));
+    lines.push("推荐的 DeepSeek reasoning 回放 compat 片段：");
+    lines.push(formatYamlSnippet({ compat: suggestion }));
   }
 
-  if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    lines.push('- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with an explicitly selected DeepSeek reasoning wire format.');
-  }
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for third-party OpenAI-compatible proxies when supported; it helps keep one Pi session on the same upstream/backend.");
+  if (missing.includes("requiresReasoningContentForToolCalls")) {
+    lines.push("- requiresReasoningContentForToolCalls：DeepSeek 思考模式下的工具调用需要 assistant 消息回传 reasoning 内容。");
   }
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
@@ -315,10 +253,9 @@ export function buildDeepSeekCompatWarningText(key: string, missing: string[]): 
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
-  const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is DeepSeek-like but merged compat lacks ${missing.join(" and ")}.`,
-    `Proxies may reduce or hide cache hits. Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
+    `💡 omp-cache-optimizer：${key} 看起来是 DeepSeek 系推理模型，但 OMP 解析后的 compat 缺少 ${missing.join(" 和 ")}。`,
+    `代理可能降低或隐藏缓存命中。编辑 ${getModelsYmlDisplayPath()} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`,
     "",
   ];
 
@@ -327,17 +264,7 @@ export function buildDeepSeekCompatWarningText(key: string, missing: string[]): 
   return lines.join("\n");
 }
 
-export function describeMissingOpenAIFamilyProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-
-  if (!isOpenAIFamilyModel(model)) return missing;
-  if (!isOpenAICompatibleProxyApi(model.api)) return missing;
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) return missing;
-
-  if (compat.sendSessionAffinityHeaders !== true) {
-    missing.push("sendSessionAffinityHeaders");
-  }
-
-  return missing;
+/** OMP divergence：见 describeMissingOpenAICompatibleProxyCompat。 */
+export function describeMissingOpenAIFamilyProxyCompat(_model: PiModel): string[] {
+  return [];
 }

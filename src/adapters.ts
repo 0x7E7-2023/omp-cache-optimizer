@@ -1,8 +1,8 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type PiModel, isNonEmptyString } from "./common.ts";
-import { appendModelsJsonTypoHints, buildDeepSeekCompatWarningText, buildOpenAIProxyCompatWarningText, describeMissingCacheCompatForModel, describeMissingOpenAICompatibleProxyCompat, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
+import { buildDeepSeekCompatWarningText, buildOpenAIProxyCompatWarningText, describeMissingCacheCompatForModel, describeMissingOpenAICompatibleProxyCompat, getModelsYmlDisplayPath, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, hasAnyTokenContaining } from "./model-detect.ts";
-import { ALEPH_MODEL_PATTERN, ARCTIC_MODEL_PATTERN, AYA_MODEL_PATTERN, DOUBAO_SEED_PATTERN, MIMO_MODEL_PATTERN, MPT_MODEL_PATTERN, NOVA_MODEL_PATTERN, ORION_MODEL_PATTERN, PHI_MODEL_PATTERN, PPLX_MODEL_PATTERN, XAI_MODEL_PATTERN, YI_MODEL_PATTERN, getAssistantRecord, getCompat, isAssistantMessage, isClaudeLikeAssistantMessage, isClaudeLikeModel, isDeepSeekLikeAssistantMessage, isDeepSeekLikeModel, isGeminiLikeAssistantMessage, isGeminiLikeModel, isNativeVirtualModel, isOpenAICompatibleApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isPiBuiltInLlamaCppModel, modelKey } from "./model-identity.ts";
+import { ALEPH_MODEL_PATTERN, ARCTIC_MODEL_PATTERN, AYA_MODEL_PATTERN, DOUBAO_SEED_PATTERN, MIMO_MODEL_PATTERN, MPT_MODEL_PATTERN, NOVA_MODEL_PATTERN, ORION_MODEL_PATTERN, PHI_MODEL_PATTERN, PPLX_MODEL_PATTERN, XAI_MODEL_PATTERN, YI_MODEL_PATTERN, getAssistantRecord, getCompat, isAssistantMessage, isClaudeLikeAssistantMessage, isClaudeLikeModel, isDeepSeekLikeAssistantMessage, isDeepSeekLikeModel, isGeminiLikeAssistantMessage, isGeminiLikeModel, isOpenAICompatibleApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, modelKey } from "./model-identity.ts";
 import { firstNonEmptyString, getRoutingRegistry, isRouterModel, resolveActiveRouteSnapshot } from "./routing.ts";
 import { type CacheProviderId, type UsageSnapshot } from "./stats-store.ts";
 import { getAnthropicRawUsage, getDeepSeekRawUsage, getGeminiRawUsage, getOpenAIRawUsage, normalizeWithFallback } from "./usage.ts";
@@ -19,19 +19,20 @@ export type CacheProviderAdapter = {
 
 export function isVirtualRoutingModel(model: PiModel | undefined, ctx?: Pick<ExtensionContext, "sessionManager">): boolean {
   if (!model) return false;
-  return isNativeVirtualModel(model) || isRouterModel(model) || !!getRoutingRegistry()?.getRouter(model.provider) || !!resolveActiveRouteSnapshot(model, ctx);
+  return isRouterModel(model) || !!getRoutingRegistry()?.getRouter(model.provider) || !!resolveActiveRouteSnapshot(model, ctx);
 }
 
 export function modelFromAssistantMessage(message: unknown, fallback: PiModel | undefined, preferCatalogId = false): PiModel | undefined {
   const record = getAssistantRecord(message);
   if (!record) return fallback;
 
-  // Pi's model field is the dispatched catalog id. Legacy routing adapters
-  // can still use responseModel as their only physical identity, so callers
-  // that need catalog attribution opt in rather than changing that protocol.
+  // OMP's model field is the dispatched catalog id. Legacy routing adapters
+  // can still use responseModel as their only physical identity, and OMP's
+  // own upstreamModel names the model a router actually served; callers that
+  // need catalog attribution opt in rather than changing that protocol.
   const id = preferCatalogId
-    ? firstNonEmptyString(record.model, record.responseModel, fallback?.id)
-    : firstNonEmptyString(record.responseModel, record.model, fallback?.id);
+    ? firstNonEmptyString(record.model, record.responseModel, record.upstreamModel, fallback?.id)
+    : firstNonEmptyString(record.responseModel, record.upstreamModel, record.model, fallback?.id);
   const provider = firstNonEmptyString(record.provider, fallback?.provider);
   const api = firstNonEmptyString(record.api, fallback?.api) ?? "";
   if (!id || !provider) return fallback;
@@ -188,15 +189,12 @@ export const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       return normalizeWithFallback(message, getAnthropicRawUsage);
     },
     warningText(model) {
-      if (!isClaudeLikeModel(model) || !isOpenAICompatibleApi(model.api) || isPiBuiltInLlamaCppModel(model)) return undefined;
+      if (!isClaudeLikeModel(model) || !isOpenAICompatibleApi(model.api)) return undefined;
       if (getCompat(model).cacheControlFormat === "anthropic") return undefined;
 
-      const lines = [
-        `💡 Cache optimizer: ${modelKey(model)} looks Claude/Anthropic-like but OpenAI-compatible compat lacks cacheControlFormat: "anthropic". ` +
-        "Pi may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag.",
-      ];
-      appendModelsJsonTypoHints(lines, model.provider, model.id);
-      return lines.join("\n");
+      return `💡 缓存优化器：${modelKey(model)} 看起来是 Claude/Anthropic 系模型，但 OpenAI 兼容 compat 缺少 cacheControlFormat: "anthropic"。` +
+        `除非该 endpoint 支持并开启了这个 compat 字段，否则 OMP 可能不会放置 Anthropic cache_control 断点。` +
+        `确认 endpoint 支持后，可在 ${getModelsYmlDisplayPath()} 对应 provider 或模型的 compat 下添加。`;
     },
   },
   {
@@ -237,9 +235,6 @@ export const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
 ];
 
 export function selectAdapterForModel(model: PiModel | undefined): CacheProviderAdapter | undefined {
-  // A native virtual selection has no cache identity of its own; stats always
-  // belong to the physical model it routed to.
-  if (isNativeVirtualModel(model)) return undefined;
   return CACHE_PROVIDER_ADAPTERS.find((adapter) => adapter.matchesModel(model));
 }
 

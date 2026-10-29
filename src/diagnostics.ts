@@ -1,55 +1,41 @@
 import { type CacheProviderAdapter } from "./adapters.ts";
 import { type PiModel, type UnknownRecord, asRecord, isNonEmptyString, lower } from "./common.ts";
-import { type CompatAdvicePlacement, appendCredentialSafeProviderGuidance, appendDeepSeekCompatAdviceLines, appendOpenAIProxyCompatAdviceLines, buildDeepSeekCompatSuggestion, buildSafeOpenAIProxyCompatSuggestion, describeMissingCacheCompatForModel, getModelsJsonDisplayPath, isAdaptiveThinkingCompatApplicable, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
+import { type CompatAdvicePlacement, appendDeepSeekCompatAdviceLines, appendOpenAIProxyCompatAdviceLines, buildDeepSeekCompatSuggestion, buildSafeOpenAIProxyCompatSuggestion, describeMissingCacheCompatForModel, getModelsYmlDisplayPath, isAdaptiveThinkingCompatApplicable, isDeepSeekWireCompatApplicable } from "./compat-advice.ts";
 import { type FixSuggestion } from "./fix-types.ts";
-import { getCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOfficialKimiCodeEndpoint, isOpenAICompatibleProxyApi, isPiBuiltInLlamaCppModel, isThirdPartyOpenAIProxyEndpoint, modelKey } from "./model-identity.ts";
-import { type CacheUsageSample, formatRecentTrendSummary } from "./stats-report.ts";
+import { getCompat, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, modelKey } from "./model-identity.ts";
+import { type CacheUsageSample, type PromptDiagnosticSample, formatRecentTrendSummary } from "./stats-report.ts";
 import { type CacheStats, emptyCacheStats } from "./stats-store.ts";
 import { snapshotBaseUrlForDiagnostics } from "./request-state.ts";
 
-export function buildAdaptiveThinkingCompatSuggestion(missing: string[]): Record<string, unknown> {
-  const suggestion: Record<string, unknown> = {};
-  if (missing.includes("forceAdaptiveThinking")) {
-    suggestion.forceAdaptiveThinking = true;
-  }
-  if (missing.includes("allowEmptySignature")) {
-    suggestion.allowEmptySignature = true;
-  }
-  return suggestion;
+/** OMP divergence：OMP 自动处理 adaptive thinking，没有可建议的 compat（保留以对齐上游调用点）。 */
+export function buildAdaptiveThinkingCompatSuggestion(_missing: string[]): Record<string, unknown> {
+  return {};
 }
 
-export function appendAdaptiveThinkingCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
-  const suggestion = buildAdaptiveThinkingCompatSuggestion(missing);
-  if (Object.keys(suggestion).length > 0) {
-    lines.push("Suggested fix:");
-    lines.push(JSON.stringify(suggestion, null, 2));
-  }
-  lines.push("- forceAdaptiveThinking: true tells Pi to use adaptive thinking format");
-  lines.push("  (thinking: {type: 'adaptive'}) instead of legacy budget tokens format.");
-  lines.push("  Without this flag, Pi sends legacy thinking which adaptive-only upstreams reject.");
-  if (missing.includes("allowEmptySignature")) {
-    lines.push("- allowEmptySignature: true preserves Kimi Coding K3 thinking blocks whose replay signature is empty.");
-  }
-  appendCredentialSafeProviderGuidance(lines, placement, suggestion);
+/** OMP divergence：见 buildAdaptiveThinkingCompatSuggestion。 */
+export function appendAdaptiveThinkingCompatAdviceLines(_lines: string[], _missing: string[], _placement: CompatAdvicePlacement = {}): void {}
+
+/** 仅字面 `api: openai-responses` 的第三方 endpoint 可以声明 24h prompt_cache_retention。 */
+export function isOpenAIResponsesLongRetentionApi(api: unknown): boolean {
+  return lower(api) === "openai-responses";
 }
 
+/**
+ * 可选（不会触发 ⚠️ 配置标记，也不会出现在修复片段里）：第三方 openai-responses
+ * endpoint 的 supportsLongPromptCacheRetention。其他 API（含 openai-completions）一律不建议。
+ */
 export function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
   const optional: string[] = [];
-
-  if (!isOpenAICompatibleProxyApi(model.api)) return optional;
-  if (!isThirdPartyOpenAIProxyEndpoint(model)) return optional;
-  if (isPiBuiltInLlamaCppModel(model)) return optional;
-
-  if (compat.supportsLongCacheRetention !== true) {
-    optional.push("supportsLongCacheRetention");
+  if (!isOpenAIResponsesLongRetentionApi(model.api)) return optional;
+  if (!isKnownThirdPartyOpenAIEndpoint(model)) return optional;
+  if (getCompat(model).supportsLongPromptCacheRetention !== true) {
+    optional.push("supportsLongPromptCacheRetention");
   }
-
   return optional;
 }
 
 export function getPromptCacheRetentionUnsupportedHint(): string {
-  return "If this channel returns `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention`; this extension does not write that field directly, but Pi may send it when long retention is requested and compat says the proxy supports it.";
+  return "如果第三方 openai-responses endpoint 返回 `400 Unsupported parameter: prompt_cache_retention`，请移除 `supportsLongPromptCacheRetention` 或改用支持该字段的 endpoint；本扩展观测到这个 400 后会在本进程内自动去掉该字段。";
 }
 
 export function isPromptCacheKeyUnsupportedApplicable(model: PiModel): boolean {
@@ -66,7 +52,8 @@ export function getOptionalAssistantHttpStatus(record: UnknownRecord): number | 
     return undefined;
   };
 
-  for (const key of ["status", "statusCode", "httpStatus", "httpStatusCode"]) {
+  // OMP 的 AssistantMessage 在 provider 失败时带结构化的 `errorStatus`。
+  for (const key of ["errorStatus", "status", "statusCode", "httpStatus", "httpStatusCode"]) {
     const status = readStatus(record[key]);
     if (status !== undefined) return status;
   }
@@ -102,7 +89,7 @@ export function getOptionalAssistantHttpStatus(record: UnknownRecord): number | 
     if (status !== undefined) return status;
   }
 
-  // Pi's built-in OpenAI-compatible adapters normally prefix a provider error
+  // Built-in OpenAI-compatible adapters normally prefix a provider error
   // body with the HTTP status (for example `400: {...}` or
   // `OpenAI API error (400): ...`). Only parse status-shaped prefixes; never
   // search arbitrary body text where a model id or payload number could be
@@ -124,51 +111,38 @@ export function getOptionalAssistantHttpStatus(record: UnknownRecord): number | 
 }
 
 export function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: string[]): void {
-  if (!optional.includes("supportsLongCacheRetention")) return;
+  if (!optional.includes("supportsLongPromptCacheRetention")) return;
   lines.push("");
-  lines.push("Optional (not required, not auto-fixed):");
-  lines.push("- supportsLongCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.");
+  lines.push("可选项（非必需，不会自动修复，仅 api: openai-responses）：");
+  lines.push("- supportsLongPromptCacheRetention：仅当第三方 openai-responses endpoint 明确支持 OpenAI long prompt cache retention 时再开启。");
   lines.push(`- ${getPromptCacheRetentionUnsupportedHint()}`);
 }
 
 /**
- * Compatibility diagnostics for a DeepSeek-like model are generic unless the
- * user has explicitly selected Pi's DeepSeek reasoning wire format. In
- * particular, never manufacture `thinkingFormat: "deepseek"`: doing so can
- * turn a valid reasoning_effort request into a provider-rejected `thinking`
- * request (Issue #10).
+ * DeepSeek reasoning 回放 compat 检查只针对 OMP 没有识别出来的 DeepSeek 推理模型
+ * （见 isDeepSeekWireCompatApplicable）。
  */
 export function isDeepSeekCompatCheckApplicable(model: PiModel): boolean {
   return isDeepSeekWireCompatApplicable(model);
 }
 
 export function isCompatCheckApplicable(model: PiModel): boolean {
-  return isOpenAICompatibleProxyApi(model.api) && isThirdPartyOpenAIProxyEndpoint(model) && !isPiBuiltInLlamaCppModel(model);
+  return isOpenAICompatibleProxyApi(model.api) && isKnownThirdPartyOpenAIEndpoint(model);
 }
 
 export function isPromptCacheRetention400Applicable(model: PiModel): boolean {
   return isOpenAICompatibleApi(model.api) &&
     isKnownThirdPartyOpenAIEndpoint(model) &&
-    !isPiBuiltInLlamaCppModel(model) &&
-    getCompat(model).supportsLongCacheRetention === true;
+    getCompat(model).supportsLongPromptCacheRetention === true;
 }
 
 /**
- * Whether the 403 sendSessionAffinityHeaders diagnostic applies to a model.
- *
- * Pi's openai-completions adapter sends custom HTTP headers (session_id,
- * x-client-request-id, x-session-affinity) when `sendSessionAffinityHeaders`
- * is enabled. Some third-party proxies / CDNs / WAFs block these headers and
- * return HTTP 403 "Your request was blocked". Pi 0.80.7+ no longer uses this
- * flag for openai-responses; Responses header shape is controlled by
- * `sessionAffinityFormat`. This guard therefore applies only to
- * openai-completions, where doctor/fix can safely advise disabling the flag.
+ * OMP divergence: Pi 的 openai-completions 会在 `sendSessionAffinityHeaders` 打开时
+ * 发自定义会话亲和 header，某些 CDN/WAF 会因此返回 403。OMP 没有这个 compat 字段，
+ * 该诊断恒不适用；保留函数以对齐上游调用点。
  */
-export function isSessionAffinity403Applicable(model: PiModel): boolean {
-  if (!isOpenAICompatibleProxyApi(model.api)) return false;
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) return false;
-  if (isPiBuiltInLlamaCppModel(model)) return false;
-  return getCompat(model).sendSessionAffinityHeaders === true;
+export function isSessionAffinity403Applicable(_model: PiModel): boolean {
+  return false;
 }
 
 /**
@@ -176,16 +150,10 @@ export function isSessionAffinity403Applicable(model: PiModel): boolean {
  *
  * Some third-party OpenAI-compatible proxies/CDNs/WAFs allow a plain curl
  * request but block the OpenAI JS SDK's default request fingerprint, especially
- * its `User-Agent: OpenAI/JS ...` and `X-Stainless-*` headers. This is distinct
- * from session-affinity header blocking: it applies when session-affinity
- * headers are NOT enabled but the model still uses a non-official
- * OpenAI-compatible proxy transport.
+ * its `User-Agent: OpenAI/JS ...` and `X-Stainless-*` headers.
  */
 export function isOpenAISdkHeader403Applicable(model: PiModel): boolean {
-  if (!isOpenAICompatibleProxyApi(model.api)) return false;
-  if (!isKnownThirdPartyOpenAIEndpoint(model)) return false;
-  if (isPiBuiltInLlamaCppModel(model)) return false;
-  return getCompat(model).sendSessionAffinityHeaders !== true;
+  return isOpenAICompatibleProxyApi(model.api) && isKnownThirdPartyOpenAIEndpoint(model);
 }
 
 /**
@@ -205,8 +173,8 @@ export function isOpenAISdkHeader403Applicable(model: PiModel): boolean {
  *   4. Generic third-party OpenAI-compatible proxy — any openai-completions model
  *      with a non-official base URL that does not match a higher-profile above.
  *
- * Official OpenAI (api.openai.com) and custom transports (kiro-api, anthropic-messages,
- * bedrock-converse-stream) do NOT produce notes.
+ * Official OpenAI (api.openai.com) and custom transports (anthropic-messages,
+ * bedrock-converse-stream, ...) do NOT produce notes.
  */
 export function describeRouterChannelDiagnostics(model: PiModel): string[] {
   const notes: string[] = [];
@@ -215,22 +183,13 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
   const provider = lower(model.provider);
 
   // Router/channel diagnostics only apply to OpenAI-compatible proxy APIs.
-  // Native APIs like mistral-conversations, azure-openai-responses,
-  // anthropic-messages, or bedrock-converse-stream are intentionally excluded.
   if (api === "azure-openai-responses" || isMistralConversationsApi(api) || !isOpenAICompatibleApi(api)) {
     return notes;
   }
 
   // Unknown/default endpoints and official OpenAI are not diagnosable as
-  // third-party router channels. Request-header bridging also fails closed.
-  if (!isThirdPartyOpenAIProxyEndpoint(model)) {
-    return notes;
-  }
-
-  // Pi 0.81+ built-in llama.cpp uses an OpenAI-shaped transport, but its
-  // untouched explicit compat fingerprint does not expose proxy-routing or
-  // session-affinity configuration. Same-id overrides are not exempt.
-  if (isPiBuiltInLlamaCppModel(model)) {
+  // third-party router channels.
+  if (!isKnownThirdPartyOpenAIEndpoint(model)) {
     return notes;
   }
 
@@ -241,31 +200,17 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
     provider.includes("openrouter")
   ) {
     const compat = getCompat(model);
-    const routing = asRecord((compat as Record<string, unknown>)["openRouterRouting"]);
+    const routing = asRecord(compat.openRouterRouting);
     const hasOnly = !!routing?.only;
     const hasOrder = !!routing?.order;
 
-    notes.push(
-      "🔀 Router/channel: OpenRouter detected. OpenRouter is a multi-provider router; " +
-      "low cache hit rates are common when each turn lands on a different upstream provider.",
-    );
+    notes.push("🔀 路由/渠道：检测到 OpenRouter。OpenRouter 是多上游路由器；如果每一轮落到不同上游，缓存命中率偏低很常见。");
 
     if (!hasOnly && !hasOrder) {
-      notes.push(
-        "   Suggestion: Add an openRouterRouting config to fix the upstream provider. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
-      );
-      notes.push(
-        `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
-        `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
-      );
-      notes.push(
-        '   Replace <provider-slug> with the actual OpenRouter provider slug (e.g. "openai", "anthropic").',
-      );
-      notes.push(
-        "   Alternatively, use openRouterRouting.order: [\"<provider-slug>\", \"...\"] for fallback order. " +
-        "Only set supportsLongCacheRetention if your upstream supports long cache retention.",
-      );
+      notes.push(`   建议：添加 openRouterRouting，把上游固定住。位置：${getModelsYmlDisplayPath()} -> providers["<providerId>"] -> compat：`);
+      notes.push("   compat:\n     openRouterRouting:\n       only: [<provider-slug>]");
+      notes.push('   把 <provider-slug> 替换成真实的 OpenRouter provider slug（如 openai、anthropic）。');
+      notes.push("   也可以用 openRouterRouting.order: [<provider-slug>, ...] 作为回退顺序。");
     }
 
     return notes;
@@ -278,30 +223,16 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
     provider.includes("vercel-ai-gateway")
   ) {
     const compat = getCompat(model);
-    const routing = asRecord((compat as Record<string, unknown>)["vercelGatewayRouting"]);
+    const routing = asRecord(compat.vercelGatewayRouting);
     const hasOnly = !!routing?.only;
     const hasOrder = !!routing?.order;
 
-    notes.push(
-      "🔀 Router/channel: Vercel AI Gateway detected. The gateway may route to different " +
-      "provider endpoints per request, reducing cache locality.",
-    );
+    notes.push("🔀 路由/渠道：检测到 Vercel AI Gateway。这个网关可能把不同请求分发到不同 provider endpoint，降低缓存局部性。");
 
     if (!hasOnly && !hasOrder) {
-      notes.push(
-        "   Suggestion: Add a vercelGatewayRouting config to fix the upstream. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
-      );
-      notes.push(
-        `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
-        `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
-      );
-      notes.push(
-        "   Replace <provider-id> with the actual Vercel provider ID (e.g. \"openai\").",
-      );
-      notes.push(
-        "   Only set supportsLongCacheRetention if your upstream supports it.",
-      );
+      notes.push(`   建议：添加 vercelGatewayRouting，把上游固定住。位置：${getModelsYmlDisplayPath()} -> providers["<providerId>"] -> compat：`);
+      notes.push("   compat:\n     vercelGatewayRouting:\n       only: [<provider-id>]");
+      notes.push("   把 <provider-id> 替换成真实的 Vercel provider ID（如 openai）。");
     }
 
     return notes;
@@ -313,28 +244,11 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
     aggregationPatterns.some((p) => baseUrl.includes(p)) ||
     aggregationPatterns.some((p) => provider.includes(p))
   ) {
-    notes.push(
-      "🔀 Router/channel: Self-hosted aggregation proxy detected (LiteLLM / OneAPI / NewAPI / VoAPI). " +
-      "These proxies route to multiple upstream accounts or instances, which can split the cache.",
-    );
-    notes.push(
-      "   Suggestions:",
-    );
-    notes.push(
-      "   • Ensure the proxy can fix to a single upstream per session (session_id affinity).",
-    );
-    notes.push(
-      "   • Forward prompt_cache_key and session-affinity headers to the upstream.",
-    );
-    notes.push(
-      "   • Return cache usage fields (prompt_cache_hit_tokens, etc.) in the response.",
-    );
-    notes.push(
-      `   Safe compat default: { "sendSessionAffinityHeaders": true }`,
-    );
-    notes.push(
-      `   Add supportsLongCacheRetention only if the proxy explicitly supports prompt_cache_retention.`,
-    );
+    notes.push("🔀 路由/渠道：检测到自建聚合代理（LiteLLM / OneAPI / NewAPI / VoAPI）。这类代理常把请求分到多个上游账号或实例，导致缓存被拆散。");
+    notes.push("   建议：");
+    notes.push("   • 确保代理能按 session 固定到单一上游（session_id affinity）。");
+    notes.push("   • 向上游透传 prompt_cache_key 与会话亲和性相关 header。");
+    notes.push("   • 在响应里返回缓存 usage 字段（如 prompt_cache_hit_tokens）。");
 
     return notes;
   }
@@ -342,22 +256,12 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
   // ── 4. Generic third-party OpenAI-compatible proxy ─────────────────
   if (api === "openai-completions" && baseUrl) {
     const missing = describeMissingCacheCompatForModel(model);
-    notes.push(
-      "🔀 Router/channel: Third-party OpenAI-compatible proxy. If cache hit rates are low:",
-    );
-    notes.push(
-      "   • Verify the proxy routes to the same upstream account/instance per session.",
-    );
-    notes.push(
-      "   • Ensure the proxy forwards prompt_cache_key and sends session-affinity headers.",
-    );
-    notes.push(
-      "   • Check that the proxy returns cache usage fields (prompt_cache_hit_tokens etc.).",
-    );
+    notes.push("🔀 路由/渠道：第三方 OpenAI 兼容代理。如果缓存命中率偏低：");
+    notes.push("   • 确认代理会把同一 session 路由到同一个上游账号/实例。");
+    notes.push("   • 确认代理会透传 prompt_cache_key，并发送会话亲和性相关 header。");
+    notes.push("   • 确认代理会返回缓存 usage 字段（如 prompt_cache_hit_tokens）。");
     if (missing.length > 0) {
-      notes.push(
-        `   • The compat flags above (${missing.join(", ")}) are recommended for cache stability.`,
-      );
+      notes.push(`   • 上面这些 compat 字段（${missing.join(", ")}）有助于提升缓存稳定性。`);
     }
 
     return notes;
@@ -369,159 +273,115 @@ export function describeRouterChannelDiagnostics(model: PiModel): string[] {
 export function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   const api = lower(model.api);
 
-  if (isNativeVirtualModel(model)) {
-    return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native virtual model: Pi routes each request to a physical model and none has answered on this session branch yet. Send a prompt, then rerun to diagnose the physical model that answered.",
-    ];
-  }
-
   if (isMistralConversationsApi(api)) {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Mistral `mistral-conversations` uses provider-native transport; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Mistral `mistral-conversations` 使用 provider 原生传输；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
   if (api === "azure-openai-responses") {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Azure OpenAI Responses uses the Responses transport; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Azure OpenAI Responses 使用 Responses 传输；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
   if (api === "openai-codex-responses" || (api === "openai-responses" && isOfficialOpenAIBaseUrl(model))) {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Responses transports already use Pi core request handling; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Responses 传输已经使用 OMP 核心请求链路；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
   if (isOpenAICompatibleApi(api) && !isNonEmptyString(model.baseUrl)) {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Upstream endpoint metadata is unavailable; session-affinity header injection is disabled.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   上游 endpoint 元数据不可用，无法判断是否为第三方代理。",
     ];
   }
 
-  if (isOpenAICompatibleApi(api) && isOfficialKimiCodeEndpoint(model)) {
-    return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Official Kimi Code endpoint: Pi ships this provider's compat itself, and proxy session-affinity flags do not apply to a first-party origin.",
-    ];
-  }
-
-  return ["ℹ️ Compat check not applicable for this model."];
+  return ["ℹ️ 当前模型不适用 compat 检查。"];
 }
 
 export function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean; promptCacheKey400?: boolean; anthropicTtlOrderError?: boolean; sessionAffinity403?: boolean; openAISdkHeader403?: boolean } = {}): string {
   const lines: string[] = [];
-  lines.push(`Provider: ${model.provider}`);
-  lines.push(`Model:    ${model.id}`);
-  if (model.name && model.name !== model.id) lines.push(`Name:     ${model.name}`);
-  lines.push(`API:      ${model.api}`);
+  lines.push(`提供方：  ${model.provider}`);
+  lines.push(`模型：    ${model.id}`);
+  if (model.name && model.name !== model.id) lines.push(`名称：    ${model.name}`);
+  lines.push(`API：     ${model.api}`);
   const endpoint = snapshotBaseUrlForDiagnostics(model.baseUrl);
-  lines.push(`Base URL: ${endpoint || (isNonEmptyString(model.baseUrl) ? "(unavailable)" : "(default)")}`);
+  lines.push(`Base URL：${endpoint || (isNonEmptyString(model.baseUrl) ? "（不可用）" : "（默认）")}`);
 
   const compat = getCompat(model);
-  lines.push(`Compat:   ${JSON.stringify(compat)}`);
+  lines.push(`Compat：  ${JSON.stringify(compat)}`);
 
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
   const missing = describeMissingCacheCompatForModel(model);
-  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
-    : [];
+  const optionalOpenAIProxyCompat = describeOptionalOpenAICompatibleProxyCompat(model);
   const fixSug = buildFixSuggestion(model);
   const safeFixableMissing = fixSug ? Object.keys(fixSug.compatKeys) : [];
   const advisoryMissing = missing.filter(m => !safeFixableMissing.includes(m));
 
   if (safeFixableMissing.length > 0) {
-    lines.push(`⚠️  Missing compat flags: ${safeFixableMissing.join(", ")}`);
+    lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissing.join(", ")}`);
   }
   if (advisoryMissing.length > 0) {
-    lines.push(`ℹ️  Optional: ${advisoryMissing.join(", ")} (enable only if needed)`);
+    lines.push(`ℹ️ 可选项：${advisoryMissing.join(", ")}（仅在确认支持时启用）`);
   }
 
   if (missing.length > 0) {
     const key = modelKey(model);
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
-    const modelsJsonPath = getModelsJsonDisplayPath();
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (same level as baseUrl/api/apiKey/models).`);
-    if (adaptiveThinkingApplicable) {
-      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
-    } else if (deepSeekCompatApplicable) {
-      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
+    lines.push(`编辑 ${getModelsYmlDisplayPath()} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`);
+    if (deepSeekCompatApplicable) {
+      appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
-      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id, typoHints: false });
+      appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     }
   } else if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
-    lines.push("✅ Compat fully configured.");
+    lines.push("✅ compat 配置完整。");
     appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
   } else {
     lines.push(...getCompatCheckNotApplicableLines(model));
+    appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
   }
 
   if (options.promptCacheKey400 && isPromptCacheKeyUnsupportedApplicable(model)) {
     lines.push("");
-    lines.push("⚠️  This model previously rejected prompt_cache_key with an explicit HTTP 400 signal.");
-    lines.push("   /cache-optimizer fix will offer a precise model-scoped opt-out.");
-    lines.push("   The opt-out removes both prompt_cache_key and promptCacheKey from the final request body.");
+    lines.push("⚠️ 该模型之前明确以 HTTP 400 拒绝过 prompt_cache_key。");
+    lines.push("   /cache-optimizer fix 会提供只对该模型生效的关闭方案（写入本扩展自己的配置文件）。");
+    lines.push("   关闭后最终请求体会同时去掉 prompt_cache_key 和 promptCacheKey。");
   }
 
   if (isPromptCacheRetention400Applicable(model)) {
     lines.push("");
     if (options.promptCacheRetention400) {
-      lines.push("⚠️  A 400 response was observed while supportsLongCacheRetention is enabled.");
+      lines.push("⚠️ 在 supportsLongPromptCacheRetention 开启时观测到了 400 响应。");
       lines.push(`   ${getPromptCacheRetentionUnsupportedHint()}`);
     } else {
-      lines.push(`ℹ️ Long retention is enabled. ${getPromptCacheRetentionUnsupportedHint()}`);
+      lines.push(`ℹ️ 已启用 openai-responses 长缓存保留。${getPromptCacheRetentionUnsupportedHint()}`);
     }
   }
 
   if (options.anthropicTtlOrderError) {
     lines.push("");
-    lines.push("⚠️  An Anthropic cache-control TTL ordering error was observed for this model.");
-    lines.push("   Runtime requests now fall back from 1h to the default 5-minute cache TTL.");
-    lines.push(`   Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false in ${getModelsJsonDisplayPath()}.`);
+    lines.push("⚠️ 该模型出现过 Anthropic cache-control TTL 顺序错误。");
+    lines.push("   本进程后续请求已从 1h 回退到默认 5 分钟缓存 TTL。");
+    lines.push(`   如需持久生效，运行 /cache-optimizer fix 查看在 ${getModelsYmlDisplayPath()} 设置模型级 supportsLongCacheRetention: false 的片段。`);
   }
 
-  // ── Session affinity 403 diagnostics ──
-  // Advises the user when sendSessionAffinityHeaders is enabled, since some
-  // third-party proxies / CDNs / WAFs block Pi's custom session-affinity HTTP
-  // headers (session_id, x-client-request-id, x-session-affinity) and return
-  // 403. If a 403 was already observed for this model, show a stronger hint.
-  if (isSessionAffinity403Applicable(model)) {
+  // ── OpenAI SDK header 403 diagnostics ──
+  if (isOpenAISdkHeader403Applicable(model) && options.openAISdkHeader403) {
     lines.push("");
-    if (options.sessionAffinity403) {
-      lines.push("⚠️  A 403 response was observed while sendSessionAffinityHeaders is enabled.");
-      lines.push("   The proxy/CDN likely blocks Pi's custom session-affinity headers (session_id,");
-      lines.push("   x-client-request-id, x-session-affinity). Run /cache-optimizer fix to");
-      lines.push(`   set sendSessionAffinityHeaders: false in ${getModelsJsonDisplayPath()}.`);
-    } else {
-      lines.push("ℹ️ Session affinity headers are enabled. Some CDNs/WAFs block custom headers");
-      lines.push("   (session_id, x-client-request-id, x-session-affinity) and return 403. If you");
-      lines.push("   see 403 errors, run /cache-optimizer fix to set sendSessionAffinityHeaders: false.");
-    }
-  } else if (isOpenAISdkHeader403Applicable(model) && (options.openAISdkHeader403 || !isOfficialKimiCodeEndpoint(model))) {
-    // Official Kimi Code gets the 403 hint only after a 403 was observed; the
-    // passive "after disabling sendSessionAffinityHeaders" advice is proxy-only.
-    lines.push("");
-    if (options.openAISdkHeader403) {
-      lines.push("⚠️  A 403 response was observed while sendSessionAffinityHeaders is not enabled.");
-      lines.push("   The proxy/CDN may be blocking the OpenAI JS SDK request fingerprint");
-      lines.push("   (for example User-Agent: OpenAI/JS ... or X-Stainless-* headers). This");
-      lines.push("   is provider/WAF-specific; /cache-optimizer fix will not auto-write headers.");
-      lines.push(`   Manual workaround: add a provider-level headers.User-Agent override in ${getModelsJsonDisplayPath()}`);
-      lines.push("   only after testing the value with the affected provider.");
-    } else {
-      lines.push("ℹ️ If 403 persists after disabling sendSessionAffinityHeaders, some CDNs/WAFs");
-      lines.push("   may block the OpenAI JS SDK User-Agent / X-Stainless-* headers. Test the");
-      lines.push("   provider manually before adding a provider-level headers.User-Agent override.");
-    }
+    lines.push("⚠️ 该模型观测到 HTTP 403。代理/CDN 可能在拦截 OpenAI JS SDK 的请求指纹");
+    lines.push("   （例如 User-Agent: OpenAI/JS ... 或 X-Stainless-* header）。这和具体 provider/WAF 有关，");
+    lines.push("   /cache-optimizer fix 不会自动写 header。");
+    lines.push(`   手动方案：先对受影响的 provider 测试可用值，再在 ${getModelsYmlDisplayPath()} 里添加 provider 级 headers.User-Agent 覆盖。`);
   }
 
   // ── Router/channel diagnostics ──
@@ -537,7 +397,7 @@ export function buildDoctorDiagnosis(model: PiModel, options: { promptCacheReten
 }
 
 /**
- * Build a "Cache diagnosis" section for low-hit causes, appended to doctor output.
+ * Build a "缓存诊断" section for low-hit causes, appended to doctor output.
  * This is a separate function because it depends on per-session state (recent samples,
  * per-model stats) that is not available at the module level.
  */
@@ -546,7 +406,9 @@ export function buildLowHitDiagnosis(
   adapter: CacheProviderAdapter | undefined,
   stats: CacheStats | undefined,
   samples: CacheUsageSample[],
+  promptSamples: PromptDiagnosticSample[] = [],
 ): string[] {
+  void adapter;
   const lines: string[] = [];
 
   // 1. Missing compat flags (adapter-aware: DeepSeek has extra reasoning compat)
@@ -566,6 +428,10 @@ export function buildLowHitDiagnosis(
 
   // 5. Today's overall trend from persisted stats
   const todayStats = stats ?? emptyCacheStats();
+
+  // 6. Prompt fingerprint drift across recent provider requests
+  const recentPrompt = promptSamples.slice(-10);
+  const promptFingerprints = new Set(recentPrompt.flatMap((sample) => (sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : [])));
 
   const hasMissingCompat = safeFixableMissingLHD.length > 0;
   const hasRouterRisk = routerNotes.length > 0;
@@ -592,55 +458,55 @@ export function buildLowHitDiagnosis(
   }
 
   lines.push("");
-  lines.push("── Cache diagnosis ──");
+  lines.push("── 缓存诊断 ──");
+  if (promptFingerprints.size > 1) {
+    lines.push(`ℹ️ 最近 ${recentPrompt.length} 条 provider 请求观测到 ${promptFingerprints.size} 组 system prompt 指纹。`);
+    lines.push("   若低命中持续，请避免在同一实验窗口混用不同 prompt 模式或动态 system 内容。");
+  }
 
   // Priority 1: missing compat flags
   if (hasMissingCompat) {
-    lines.push(`⚠️  Missing compat flags: ${safeFixableMissingLHD.join(", ")}`);
-    lines.push("   These flags enable prompt caching and session-affinity routing.");
-    lines.push("   Run /cache-optimizer compat for edit instructions.");
+    lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissingLHD.join(", ")}`);
+    lines.push("   这些字段有助于稳定 prompt 缓存与上游路由粘性。");
+    lines.push("   可运行 /cache-optimizer compat 查看编辑建议。");
   }
 
   // Priority 2: router/channel risk (only flag when there are other issues)
-  // Router notes are already shown in the main doctor output, so we only
-  // mention them in the diagnosis section when they compound a problem.
   if (hasRouterRisk && (hasMissingCompat || hasUsageMissing || hasActualIssues)) {
-    lines.push("🔀 Router/channel proxy detected — see routing notes above.");
+    lines.push("🔀 检测到路由/代理风险 —— 详见上方路由诊断。");
   }
 
   // Priority 3: usage fields missing
   if (hasUsageMissing) {
-    lines.push(`⚠️  ${missingUsageSamples}/${samples.length} recent responses had missing/empty usage fields.`);
-    lines.push("   Footer may under-report cache hit rate.");
-    lines.push("   Verify the proxy returns prompt-level usage (prompt_tokens, input_tokens_details).");
+    lines.push(`⚠️ 最近 ${samples.length} 条样本里有 ${missingUsageSamples} 条缺少或返回了空的 usage 字段。`);
+    lines.push("   Footer 命中率可能会被低估。");
+    lines.push("   请确认代理会返回 prompt 级 usage（如 prompt_tokens、input_tokens_details）。");
   }
 
   // Priority 4: recent trend low
   if (recent10Total > 0) {
     if (recent10Hits === 0 && todayStats.totalRequests > 3 && todayHitRatio < 30) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${recent10Total} recent samples).`);
-      lines.push("   Likely causes: proxy routing to different backends per request,");
-      lines.push("   or prompt prefix changes across turns.");
-      lines.push("   Verify session affinity (sendSessionAffinityHeaders) and long cache retention.");
+      lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（最近 ${recent10Total} 条样本）。`);
+      lines.push("   常见原因：代理把请求路由到不同后端，或 prompt 前缀在各轮之间变化。");
+      lines.push("   请检查上游路由粘性与长缓存保留设置。");
     } else if (todayHitRatio < 30 && todayStats.totalRequests > 3) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${todayStats.totalRequests} total requests).`);
-      lines.push("   Check compat flags and proxy upstream routing.");
+      lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（共 ${todayStats.totalRequests} 次请求）。`);
+      lines.push("   请检查 compat 配置与代理上游路由。");
     }
 
     // Show brief trend summary if there are enough samples
     if (recent10Total >= 3) {
-      const trend = formatRecentTrendSummary(samples, 10);
-      lines.push(`📊 ${trend}`);
+      lines.push(`📊 ${formatRecentTrendSummary(samples, 10)}`);
     }
   }
 
   // For fully configured but low hit models, emphasize sticky routing
   if (!hasMissingCompat && !hasRouterRisk && todayStats.totalRequests > 3 && todayHitRatio < 30) {
-    lines.push("💡 Compat is configured but cache hit rate remains low.");
-    lines.push("   Possible causes:");
-    lines.push("   • Proxy still routes to multiple backends — check session affinity on the proxy side.");
-    lines.push("   • Prompt prefix varies per turn — check dynamic context in system prompt.");
-    lines.push("   • Provider does not return cache usage fields — footer can't measure hits.");
+    lines.push("💡 compat 已配置完整，但缓存命中率仍然偏低。");
+    lines.push("   可能原因：");
+    lines.push("   • 代理仍把请求分发到多个后端 —— 请检查代理侧的会话粘性。");
+    lines.push("   • prompt 前缀每轮都在变化 —— 请检查 system prompt 中的动态上下文。");
+    lines.push("   • provider 没有返回缓存 usage 字段 —— footer 无法准确测量命中。");
   }
 
   return lines;
@@ -653,9 +519,7 @@ export function buildCompatDiagnosis(model: PiModel): string | undefined {
   const advisoryMissingC = missing.filter(m => !safeFixableMissingC.includes(m));
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
-  const optionalOpenAIProxyCompat = !adaptiveThinkingApplicable
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
-    : [];
+  const optionalOpenAIProxyCompat = describeOptionalOpenAICompatibleProxyCompat(model);
   const routerNotes = describeRouterChannelDiagnostics(model);
 
   if (missing.length === 0 && routerNotes.length === 0 && optionalOpenAIProxyCompat.length === 0) return undefined;
@@ -666,20 +530,17 @@ export function buildCompatDiagnosis(model: PiModel): string | undefined {
   if (missing.length > 0) {
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
-    const modelsJsonPath = getModelsJsonDisplayPath();
-    lines.push(`Active model: ${key}`);
+    lines.push(`当前模型：${key}`);
     if (safeFixableMissingC.length > 0) {
-      lines.push(`Safe-fixable: ${safeFixableMissingC.join(", ")}`);
+      lines.push(`可安全修复：${safeFixableMissingC.join(", ")}`);
     }
     if (advisoryMissingC.length > 0) {
-      lines.push(`Optional: ${advisoryMissingC.join(", ")} (enable only if needed)`);
+      lines.push(`可选项：${advisoryMissingC.join(", ")}（仅在确认支持时启用）`);
     }
     lines.push("");
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat`);
-    lines.push(`(at the same level as baseUrl/api/apiKey/models).`);
-    if (adaptiveThinkingApplicable) {
-      appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-    } else if (deepSeekCompatApplicable) {
+    lines.push(`编辑 ${getModelsYmlDisplayPath()} -> providers["${providerLabel}"] -> compat`);
+    lines.push("（与 baseUrl/api/apiKey/models 同级）。");
+    if (deepSeekCompatApplicable) {
       appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
@@ -691,27 +552,20 @@ export function buildCompatDiagnosis(model: PiModel): string | undefined {
   // When compat is fully configured but router/optional notes exist, prefix the status.
   if ((routerNotes.length > 0 || optionalOpenAIProxyCompat.length > 0) && missing.length === 0) {
     if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
-      lines.push("✅ Compat fully configured.");
+      lines.push("✅ compat 配置完整。");
       if (isPromptCacheRetention400Applicable(model)) {
         lines.push(getPromptCacheRetentionUnsupportedHint());
       }
-      // Advisory for 403 session-affinity header blocking (only when enabled),
-      // or OpenAI SDK header/User-Agent blocking after session affinity is disabled.
-      if (isSessionAffinity403Applicable(model)) {
+      if (isOpenAISdkHeader403Applicable(model)) {
         lines.push(
-          "ℹ️ Session affinity headers are enabled. If you see 403 \"blocked\" errors,",
-          "   the proxy/CDN may be blocking Pi's custom headers. Set sendSessionAffinityHeaders: false.",
-        );
-      } else if (isOpenAISdkHeader403Applicable(model)) {
-        lines.push(
-          "ℹ️ If 403 persists with sendSessionAffinityHeaders disabled, the proxy/CDN may",
-          "   be blocking the OpenAI JS SDK User-Agent / X-Stainless-* headers. Test a",
-          "   provider-level headers.User-Agent override manually; /fix does not auto-write it.",
+          "ℹ️ 如果出现 403 \"blocked\"，代理/CDN 可能在拦截 OpenAI JS SDK 的 User-Agent / X-Stainless-* header。",
+          "   请先手动测试 provider 级 headers.User-Agent 覆盖；/fix 不会自动写入。",
         );
       }
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     } else {
       lines.push(...getCompatCheckNotApplicableLines(model));
+      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     }
     lines.push("");
   }
@@ -727,7 +581,7 @@ export function buildCompatDiagnosis(model: PiModel): string | undefined {
 }
 
 // ============================================================
-// JSONC comment-preserving surgical edit helpers for /cache-optimizer fix
+// Manual models.yml compat suggestions for /cache-optimizer fix
 // ============================================================
 
 /**
@@ -738,15 +592,9 @@ export function buildFixSuggestion(model: PiModel): FixSuggestion | undefined {
   const missing = describeMissingCacheCompatForModel(model);
   if (missing.length === 0) return undefined;
 
-  let compatKeys: Record<string, unknown> = {};
-
-  if (isAdaptiveThinkingCompatApplicable(model)) {
-    compatKeys = buildAdaptiveThinkingCompatSuggestion(missing);
-  } else if (isDeepSeekCompatCheckApplicable(model)) {
-    compatKeys = buildDeepSeekCompatSuggestion(missing);
-  } else {
-    compatKeys = buildSafeOpenAIProxyCompatSuggestion(missing);
-  }
+  const compatKeys = isDeepSeekCompatCheckApplicable(model)
+    ? buildDeepSeekCompatSuggestion(missing)
+    : buildSafeOpenAIProxyCompatSuggestion(missing);
 
   if (Object.keys(compatKeys).length === 0) return undefined;
 

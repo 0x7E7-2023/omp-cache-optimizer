@@ -8,15 +8,14 @@ export const REQUEST_SNAPSHOT_COMPAT_KEYS: Array<keyof CacheCompat> = [
   "supportsReasoningEffort",
   "supportsUsageInStreaming",
   "supportsStrictMode",
-  "maxTokensField",
-  "sendSessionAffinityHeaders",
-  "sessionAffinityFormat",
+  "supportsLongPromptCacheRetention",
   "supportsLongCacheRetention",
+  "supportsPromptCacheKey",
   "thinkingFormat",
-  "requiresReasoningContentOnAssistantMessages",
+  "requiresReasoningContentForToolCalls",
   "cacheControlFormat",
-  "forceAdaptiveThinking",
-  "allowEmptySignature",
+  "isOpenRouterHost",
+  "officialEndpoint",
 ];
 
 export function snapshotCompatForDiagnostics(model: PiModel): CacheCompat {
@@ -54,7 +53,7 @@ export function snapshotProviderRequestModel(model: PiModel | undefined): PiMode
   if (!model) return undefined;
 
   // The provider response hooks do not receive the model that initiated the
-  // request (Pi's runner only forwards status/headers). Keep a process-local,
+  // request (OMP's runner only forwards status/headers). Keep a process-local,
   // credential-blind metadata snapshot so a model switch or route change
   // between request and response cannot retarget a protocol observation. Do
   // not retain the caller's complete model object or any request data.
@@ -73,9 +72,9 @@ export function snapshotProviderRequestModel(model: PiModel | undefined): PiMode
   } as PiModel;
 }
 
-// Some provider requests never produce a finalized assistant message: Pi's
-// prompt-cache warming (0.86+) replays a request with maxTokens: 1 outside the
-// agent loop, so message_end never consumes its lifecycle record. Cap the
+// Some provider requests never produce a finalized assistant message: OMP's
+// prompt-cache warming replays a request with maxTokens: 1 outside the agent
+// loop, so message_end never consumes its lifecycle record. Cap the
 // process-local list and drop the oldest completed record first.
 export const MAX_PROVIDER_REQUEST_STATES = 32;
 
@@ -91,12 +90,10 @@ export function pruneProviderRequestStates<T extends { responseReceived: boolean
 
 export type ProviderRequestState = {
   model: PiModel;
-  /** Model selection visible to Pi when this request was dispatched. */
+  /** Model selection visible to OMP when this request was dispatched. */
   selectionModelKey: string;
   /** Whether that selection routed to a physical model for this request. */
   virtualSelection: boolean;
   responseReceived: boolean;
   correlationAmbiguous: boolean;
-  // A native virtual request whose dispatched id matched several providers.
-  identityAmbiguous?: boolean;
 };

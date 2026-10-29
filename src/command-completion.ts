@@ -18,9 +18,9 @@ export const CACHE_OPTIMIZER_COMMANDS = [
   "rollback",
 ] as const;
 
-export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"] as const;
+export const CACHE_OPTIMIZER_CONFIG_ARGUMENTS = ["footer-mode", "prompt-rewrite", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"] as const;
 
-export const CACHE_OPTIMIZER_FEATURE_COMMANDS = ["prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental"] as const;
+export const CACHE_OPTIMIZER_FEATURE_COMMANDS = ["prompt-rewrite", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental"] as const;
 
 export const CACHE_OPTIMIZER_FEATURE_VALUES = ["on", "off"] as const;
 
@@ -28,8 +28,6 @@ export const CACHE_OPTIMIZER_FOOTER_MODES = ["total", "session", "process"] as c
 
 export const FEATURE_COMMAND_MAP: Record<string, PersistedCacheOptimizerFeature> = {
   "prompt-rewrite": "promptRewrite",
-  "virtual-rewrite": "virtualRewrite",
-  "skill-compression": "skillCompression",
   "openai-cache-key": "openAICacheKey",
   "tool-order": "toolOrder",
   "zero-price-warming": "zeroPriceWarming",
@@ -38,7 +36,8 @@ export const FEATURE_COMMAND_MAP: Record<string, PersistedCacheOptimizerFeature>
 
 export const CACHE_OPTIMIZER_STATS_ARGUMENTS = ["all", "contributors"] as const;
 
-export const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache", "prompt-cache-key", "kimi-base-url"] as const;
+/** OMP 版只有写本扩展自有配置的 prompt-cache-key 修复；models.yml 只给手动片段。 */
+export const CACHE_OPTIMIZER_FIX_ARGUMENTS = ["prompt-cache-key"] as const;
 
 export function filterCommandCompletionItems(
   values: readonly string[],
@@ -49,7 +48,7 @@ export function filterCommandCompletionItems(
   const matches = values
     .filter((value) => value.startsWith(normalizedPrefix))
     .map((value) => ({
-      // Pi replaces the complete argumentPrefix when applying a command
+      // OMP replaces the complete argumentPrefix when applying a command
       // completion, so nested suggestions must include their full path.
       value: argumentPath ? `${argumentPath} ${value}` : value,
       label: value,

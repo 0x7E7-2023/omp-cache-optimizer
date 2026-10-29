@@ -7,11 +7,16 @@ import { statsReadFs } from "./stats-fs.ts";
 
 export type CacheProviderId = "deepseek" | "openai" | "claude" | "gemini";
 
-export const STATE_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-stats.json");
+/** 1.x 单文件统计（v5），2.0 起改为分片统计后作为过时文件删除。 */
+export const STATE_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-stats.json");
 
 export const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
 
-export const SHARD_STATE_DIR = join(STATE_DIR, "pi-cache-optimizer-stats.d");
+/**
+ * 分片统计目录。分片/归档文件里的 `kind`（"pi-cache-optimizer-shard" 等）沿用上游
+ * 的内部格式标识，便于与上游同步；目录本身是 OMP 专用的，不会与 Pi 混用。
+ */
+export const SHARD_STATE_DIR = join(STATE_DIR, "omp-cache-optimizer-stats.d");
 
 export const SHARD_FILES_DIR = join(SHARD_STATE_DIR, "shards");
 

@@ -9,7 +9,7 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, copyFile, link, lstat, mkdir, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-export const CONFIG_RECEIPT_FILE_NAME = "pi-cache-optimizer-config-receipt.json";
+export const CONFIG_RECEIPT_FILE_NAME = "omp-cache-optimizer-config-receipt.json";
 
 export const CONFIG_RECEIPT_PATH = join(STATE_DIR, CONFIG_RECEIPT_FILE_NAME);
 
@@ -51,7 +51,7 @@ export function parsePromptCacheKeyConfigReceipt(value: unknown): PromptCacheKey
   if (Object.keys(record).some((key) => !allowed.has(key))) return undefined;
   if (![record.transactionId, record.provider, record.modelId].every(isSafeReceiptText)) return undefined;
   if (!isSha256(record.beforeHash) || !isSha256(record.afterHash) || record.beforeHash === record.afterHash) return undefined;
-  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || !record.backupFile.startsWith("pi-cache-optimizer-config.backup-")) return undefined;
+  if (!isSafeReceiptText(record.backupFile) || basename(record.backupFile) !== record.backupFile || !record.backupFile.startsWith("omp-cache-optimizer-config.backup-")) return undefined;
   if (
     typeof record.targetExistedBefore !== "boolean" ||
     !isReceiptTimestamp(record.createdAt) ||
@@ -190,7 +190,7 @@ export async function applyPromptCacheKeyConfigFixUnderLock(
   const beforeHash = hashText(originalText);
   const afterHash = hashText(modifiedText);
   const originalInfo = targetExistedBefore ? await lstat(configPath) : undefined;
-  const backupFile = `pi-cache-optimizer-config.backup-${backupTimestamp()}`;
+  const backupFile = `omp-cache-optimizer-config.backup-${backupTimestamp()}`;
   const backupPath = join(dirname(configPath), backupFile);
   if (targetExistedBefore) {
     await copyFile(configPath, backupPath, fsConstants.COPYFILE_EXCL);

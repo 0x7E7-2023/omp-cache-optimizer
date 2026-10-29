@@ -5,7 +5,7 @@ import { modelKey } from "./model-identity.ts";
 import { STATE_DIR } from "./paths.ts";
 import { CACHE_PROVIDER_IDS, type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, type PersistedRoutedModelRef, STATE_FILE_PATH, type ShardAggregate, currentLocalDay, emptyCacheStats, mergeCacheStatsForTotal, parseCacheStats, parsePersistedRoutedModelRef } from "./stats-store.ts";
 import { usageRecordFromAssistant } from "./usage.ts";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 
 export type CacheStatsState = {
@@ -49,37 +49,70 @@ export function modelKeyFromSessionKey(sessionModelKey: string): string {
   return idx >= 0 ? sessionModelKey.slice(idx + 1) : sessionModelKey;
 }
 
+/** token 数的人类可读格式：<1000 原样，k / M 两档。 */
 export function formatTokenCount(value: number): string {
-  const millions = Math.max(0, Math.round(value)) / 1_000_000;
-  if (millions === 0) return "0M";
-  if (millions < 0.001) return `${millions.toFixed(4)}M`;
-  if (millions < 0.01) return `${millions.toFixed(3)}M`;
-  if (millions >= 10) return `${millions.toFixed(1)}M`;
-  return `${millions.toFixed(2)}M`;
+  const n = Math.max(0, Math.round(value));
+  if (n === 0) return "0";
+  if (n < 1000) return String(n);
+  if (n < 10_000) return `${(n / 1000).toFixed(2)}k`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  const millions = n / 1_000_000;
+  if (millions < 10) return `${millions.toFixed(2)}M`;
+  return `${millions.toFixed(1)}M`;
 }
 
-export function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): string {
-  const percent = stats.totalInputTokens > 0
-    ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
-    : 0;
+/** 适配器标签展示形式："OpenAI cache" → "OpenAI Cache"。 */
+export function localizeAdapterLabel(label: string): string {
+  return label.endsWith(" cache") ? `${label.slice(0, -6)} Cache` : label;
+}
+
+/** token 命中率：cachedInputTokens / totalInputTokens，0–100 整数百分比。 */
+export function formatTokenHitPercent(stats: Pick<CacheStats, "cachedInputTokens" | "totalInputTokens">): string {
+  if (stats.totalInputTokens <= 0) return "—";
+  return `${Math.round((stats.cachedInputTokens / stats.totalInputTokens) * 100)}%`;
+}
+
+/** 最近 N 次有效样本（usage 完整且有输入）的 token 命中率；没有有效样本时返回 undefined。 */
+export function formatRecentTokenHitRate(samples: CacheUsageSample[], maxCount: number): string | undefined {
+  const valid = samples.slice(-maxCount).filter((sample) => !sample.missingUsageFields && sample.totalInputTokens > 0);
+  if (valid.length === 0) return undefined;
+  const cachedInputTokens = valid.reduce((sum, sample) => sum + sample.cachedInputTokens, 0);
+  const totalInputTokens = valid.reduce((sum, sample) => sum + sample.totalInputTokens, 0);
+  return `最近${valid.length}次token命中率：${formatTokenHitPercent({ cachedInputTokens, totalInputTokens })}`;
+}
+
+/**
+ * Footer 文案（fork 的中文格式）：主指标为 token 命中率；有近期有效样本时追加最近 N 次命中率。
+ * 例：`OpenAI Cache | 缓存命中率：40% | 最近2次token命中率：40% | 缓存请求命中次数：1/2 次 | 缓存token/总输入：800/2.00k`
+ */
+export function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats, recentSamples: CacheUsageSample[] = []): string {
+  const recentHit = formatRecentTokenHitRate(recentSamples, 10);
   const writeText = adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
-    ? `·write ${formatTokenCount(stats.cacheWriteInputTokens)}`
+    ? ` | 写入token：${formatTokenCount(stats.cacheWriteInputTokens)}`
     : "";
 
-  return `${adapter.label} ${stats.hitRequests}/${stats.totalRequests}·${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} ${percent.toFixed(1)}%${writeText}`;
+  return `${localizeAdapterLabel(adapter.label)}` +
+    ` | 缓存命中率：${formatTokenHitPercent(stats)}` +
+    (recentHit ? ` | ${recentHit}` : "") +
+    ` | 缓存请求命中次数：${stats.hitRequests}/${stats.totalRequests} 次` +
+    ` | 缓存token/总输入：${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)}` +
+    writeText;
 }
 
+/**
+ * OMP 的状态栏自己用分隔点拼接各扩展状态（见 pi-tui status-line 的 status 段），
+ * 所以这里不再像上游那样加 "· " 前缀；保留函数以对齐上游调用点。
+ */
 export function prefixFooterStatus(statusText: string | undefined): string | undefined {
-  if (!statusText || statusText.startsWith("· ")) return statusText;
-  return `· ${statusText}`;
+  return statusText;
 }
 
 /**
  * Compute a hit-ratio percentage string for a value between 0 and 1.
- * Returns e.g. "75%", "0%", "100%", or "N/A" for zero total.
+ * Returns e.g. "75%", "0%", "100%", or "无数据" for zero total.
  */
 export function formatHitRatio(hits: number, total: number): string {
-  if (total <= 0) return "N/A";
+  if (total <= 0) return "无数据";
   return `${Math.round((hits / total) * 100)}%`;
 }
 
@@ -97,7 +130,7 @@ export function formatTokenM(value: number): string {
 
 /**
  * Check if an assistant message's usage fields appear to be missing or empty.
- * Returns true when Pi-normalized fields (input, cacheRead, cacheWrite) are all
+ * Returns true when OMP-normalized fields (input, cacheRead, cacheWrite) are all
  * absent/zero AND raw usage fields (prompt_tokens, etc.) are also absent/zero
  * for the given adapter.
  */
@@ -105,12 +138,12 @@ export function hasMissingUsageFields(message: unknown, adapter: CacheProviderAd
   const usage = usageRecordFromAssistant(message);
   if (!usage) return true;
 
-  // Check Pi-normalized fields
+  // Check OMP-normalized fields
   const input = getNonNegativeNumber(usage, "input");
   const cacheRead = getNonNegativeNumber(usage, "cacheRead");
   const cacheWrite = getNonNegativeNumber(usage, "cacheWrite");
 
-  // If Pi-normalized fields exist with non-zero values, usage is present
+  // If normalized fields exist with non-zero values, usage is present
   if (cacheRead !== undefined || cacheWrite !== undefined || (input !== undefined && input > 0)) {
     return false;
   }
@@ -126,34 +159,35 @@ export function hasMissingUsageFields(message: unknown, adapter: CacheProviderAd
 
 /**
  * Build a summary string for the recent trend (last N samples).
- * Example: "Recent 10: 7/10 hits · 65% tok cached · no missing usage"
+ * Example: "最近 10/10 次：7/10 次命中 · 65% tok 已缓存"
  */
 export function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number): string {
   const recent = samples.slice(-maxCount);
-  if (recent.length === 0) return `Recent ${maxCount}: no samples yet`;
+  if (recent.length === 0) return `最近 ${maxCount} 次：暂无样本`;
 
   const hits = recent.filter((s) => s.hit).length;
   const totalCached = recent.reduce((sum, s) => sum + s.cachedInputTokens, 0);
   const totalInput = recent.reduce((sum, s) => sum + s.totalInputTokens, 0);
   const missingCount = recent.filter((s) => s.missingUsageFields).length;
 
-  const tokenRatio = totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "N/A";
+  const tokenRatio = totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "无数据";
 
-  let result = `Recent ${recent.length}/${maxCount}: ${hits}/${recent.length} hits · ${tokenRatio} tok cached`;
+  let result = `最近 ${recent.length}/${maxCount} 次：${hits}/${recent.length} 次命中 · ${tokenRatio} tok 已缓存`;
   if (missingCount > 0) {
-    result += ` · ${missingCount} missing usage`;
+    result += ` · ${missingCount} 条 usage 缺失`;
   }
   return result;
 }
 
 /**
- * Build the output for `/cache-optimizer stats`.
+ * Compact one-line counters used by `/cache-optimizer stats` outputs.
  */
 export function formatCompactStats(stats: CacheStats): string {
-  const percent = stats.totalInputTokens > 0
-    ? (stats.cachedInputTokens / stats.totalInputTokens) * 100
-    : 0;
-  return `${stats.hitRequests}/${stats.totalRequests}·${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} ${percent.toFixed(1)}%`;
+  return `${stats.hitRequests}/${stats.totalRequests} 次 · ${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} tok · ${formatTokenHitPercent(stats)}`;
+}
+
+function formatStatsTokenLine(stats: CacheStats): string {
+  return `缓存 tokens：${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} 输入 · ${formatTokenHitPercent(stats)}`;
 }
 
 export function modelFromStatsKey(key: string, ref?: PersistedRoutedModelRef): PiModel | undefined {
@@ -181,78 +215,111 @@ export function buildSessionStatsOutput(
     models[activeKey!] = emptyCacheStats();
   }
   const entries = sortStatsEntries(Object.entries(models), activeKey);
-  if (entries.length === 0) return "ℹ️ No cache statistics recorded for the current session today.";
-  const lines = ["Scope: current session", `Day:   ${currentLocalDay()}`, `Models: ${entries.length}`];
+  if (entries.length === 0) return "ℹ️ 当前 session 今天还没有缓存统计。";
+  const lines = ["范围：当前 session", `日期：${currentLocalDay()}`, `模型数：${entries.length}`];
   for (const [key, stats] of entries) {
     const model = modelFromStatsKey(key, modelRefsByKey[key]);
     const adapter = model ? selectAdapterForModel(model) : undefined;
-    lines.push("", `── ${key} ──`, `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`);
-    lines.push(`Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`);
-    lines.push(`Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`);
-    lines.push(`Summary:       ${formatCompactStats(stats)}`);
-    if (stats.cacheWriteInputTokens > 0) lines.push(`Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`);
+    lines.push("", `── ${key} ──`, `适配器：${adapter ? localizeAdapterLabel(adapter.label) : "未知缓存适配器"}`);
+    lines.push(`请求数：${stats.hitRequests} 次命中 / ${stats.totalRequests} 次总计`);
+    lines.push(formatStatsTokenLine(stats));
+    lines.push(`汇总：${formatCompactStats(stats)}`);
+    if (stats.cacheWriteInputTokens > 0) lines.push(`缓存写入：${formatTokenCount(stats.cacheWriteInputTokens)}`);
   }
   return lines.join("\n");
 }
 
 export function buildAllStatsOutput(aggregate: ShardAggregate): string {
   const entries = sortStatsEntries(Object.entries(aggregate.totalsByModel));
-  if (entries.length === 0) return "ℹ️ No local cache statistics recorded today.";
+  if (entries.length === 0) return "ℹ️ 今天本机还没有缓存统计。";
   const sessionCount = Object.keys(aggregate.instancesBySession).length;
   const instanceCount = Object.values(aggregate.instancesBySession).reduce((sum, value) => sum + value, 0);
-  const lines = ["Scope: all local sessions", `Day:   ${currentLocalDay()}`, `Sessions: ${sessionCount}`, `Instances: ${instanceCount}`];
+  const lines = ["范围：本机所有 session", `日期：${currentLocalDay()}`, `Session 数：${sessionCount}`, `实例数：${instanceCount}`];
   for (const [key, stats] of entries) {
     const model = modelFromStatsKey(key, aggregate.modelRefsByKey[key]);
     const adapter = model ? selectAdapterForModel(model) : undefined;
-    lines.push("", `── ${key} ──`, `Adapter: ${adapter?.label ?? "Unknown cache adapter"}`);
-    lines.push(`Sessions: ${aggregate.sessionsByModel[key] ?? 0} · Instances: ${aggregate.instancesByModel[key] ?? 0}`);
-    lines.push(`Requests:      ${stats.hitRequests} hit / ${stats.totalRequests} total`);
-    lines.push(`Cached tokens: ${formatTokenCount(stats.cachedInputTokens)} / ${formatTokenCount(stats.totalInputTokens)} input · ${stats.totalInputTokens > 0 ? `${((stats.cachedInputTokens / stats.totalInputTokens) * 100).toFixed(1)}%` : "0.0%"}`);
-    lines.push(`Summary:       ${formatCompactStats(stats)}`);
-    if (stats.cacheWriteInputTokens > 0) lines.push(`Cache write:   ${formatTokenCount(stats.cacheWriteInputTokens)}`);
+    lines.push("", `── ${key} ──`, `适配器：${adapter ? localizeAdapterLabel(adapter.label) : "未知缓存适配器"}`);
+    lines.push(`Session：${aggregate.sessionsByModel[key] ?? 0} · 实例：${aggregate.instancesByModel[key] ?? 0}`);
+    lines.push(`请求数：${stats.hitRequests} 次命中 / ${stats.totalRequests} 次总计`);
+    lines.push(formatStatsTokenLine(stats));
+    lines.push(`汇总：${formatCompactStats(stats)}`);
+    if (stats.cacheWriteInputTokens > 0) lines.push(`缓存写入：${formatTokenCount(stats.cacheWriteInputTokens)}`);
   }
   return lines.join("\n");
 }
 
 export function buildContributorsStatsOutput(aggregate: ShardAggregate, activeModel: PiModel | undefined, currentSessionHash?: string): string {
-  if (!activeModel) return "ℹ️ No active model selected.";
+  if (!activeModel) return "ℹ️ 当前没有活动模型。";
   const key = modelKey(activeModel);
   const rows = Object.entries(aggregate.bySession)
     .filter(([, models]) => models[key])
     .sort(([left], [right]) => left === currentSessionHash ? -1 : right === currentSessionHash ? 1 : left.localeCompare(right));
-  if (rows.length === 0) return `ℹ️ No contributors recorded for ${key} today.`;
-  const lines = [`Model: ${key}`, "Scope: contributing local sessions today"];
+  if (rows.length === 0) return `ℹ️ ${key} 今天还没有贡献统计的 session。`;
+  const lines = [`模型：${key}`, "范围：今天为该模型贡献统计的本机 session"];
   let otherIndex = 0;
   for (const [sessionHash, models] of rows) {
-    const label = sessionHash === currentSessionHash ? "Current session" : `Other session ${++otherIndex}`;
-    lines.push("", label, `  Instances: ${aggregate.instancesBySessionModel[sessionHash]?.[key] ?? 0}`, `  ${formatCompactStats(models[key])}`);
+    const label = sessionHash === currentSessionHash ? "当前 session" : `其他 session ${++otherIndex}`;
+    lines.push("", label, `  实例数：${aggregate.instancesBySessionModel[sessionHash]?.[key] ?? 0}`, `  ${formatCompactStats(models[key])}`);
   }
   return lines.join("\n");
 }
 
-export function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdapter | undefined, stats: CacheStats | undefined, recentSamples: CacheUsageSample[]): string {
+/** 请求级 prompt 诊断样本（仅内存，不与 message_end usage 强行配对）。 */
+export type PromptDiagnosticSample = {
+  timestamp: number;
+  promptRewriteEnabled: boolean;
+  systemPromptFingerprint?: string;
+  promptCacheKeySource: "header" | "project" | "session" | "custom" | "unavailable";
+};
+
+/** 最近 N 次 provider 请求的 prompt 诊断摘要；只显示截断哈希的分组数和 key 来源统计。 */
+export function formatRecentPromptDiagnostics(samples: PromptDiagnosticSample[], maxCount: number): string | undefined {
+  const recent = samples.slice(-maxCount);
+  if (recent.length === 0) return undefined;
+  const rewriteEnabled = recent.filter((sample) => sample.promptRewriteEnabled).length;
+  const fingerprints = new Set(recent.flatMap((sample) => (sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : [])));
+  const count = (source: PromptDiagnosticSample["promptCacheKeySource"]) => recent.filter((sample) => sample.promptCacheKeySource === source).length;
+  return `Prompt 诊断（最近 ${recent.length} 次 provider 请求）：改写开启 ${rewriteEnabled}/${recent.length}` +
+    ` · system 指纹 ${fingerprints.size} 组` +
+    ` · provider body cache key：header ${count("header")} / 项目稳定 ${count("project")} / 会话 ${count("session")} / 自定义 ${count("custom")} / 未注入 ${count("unavailable")}`;
+}
+
+export function buildStatsOutput(
+  model: PiModel | undefined,
+  adapter: CacheProviderAdapter | undefined,
+  stats: CacheStats | undefined,
+  recentSamples: CacheUsageSample[],
+  promptSamples: PromptDiagnosticSample[] = [],
+): string {
   const lines: string[] = [];
 
   if (!model || !adapter) {
-    lines.push("ℹ️ No cache-adapter-matched model active. Select a model with a recognized provider family.");
+    lines.push("ℹ️ 当前活动模型未匹配到缓存适配器。请选择可识别模型家族后再查看统计。");
     return lines.join("\n");
   }
 
   const key = modelKey(model);
   const currentStats = stats ?? emptyCacheStats();
 
-  lines.push(`Model key: ${key}`);
-  lines.push(`Adapter:   ${adapter.label}`);
+  lines.push(`模型键：${key}`);
+  lines.push(`适配器：${localizeAdapterLabel(adapter.label)}`);
   lines.push("");
-  lines.push("── Today ──");
-  lines.push(`Requests:      ${currentStats.hitRequests} hit / ${currentStats.totalRequests} total · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
-  lines.push(`Cached tokens: ${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M input · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "N/A"}`);
+  lines.push("── 今日 ──");
+  lines.push(`请求数：${currentStats.hitRequests} 次命中 / ${currentStats.totalRequests} 次总计 · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
+  lines.push(`缓存 tokens：${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M 输入 · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "无数据"}`);
   if (currentStats.cacheWriteInputTokens > 0) {
-    lines.push(`Cache write:   ${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
+    lines.push(`缓存写入：${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
+  }
+
+  const promptDiagnostics = formatRecentPromptDiagnostics(promptSamples, 10);
+  if (promptDiagnostics) {
+    lines.push("");
+    lines.push(promptDiagnostics);
+    lines.push("仅显示截断哈希和来源统计，不保存 prompt 或 cache key 原文。");
   }
 
   lines.push("");
-  lines.push("── Recent trend ──");
+  lines.push("── 近期趋势 ──");
   lines.push(formatRecentTrendSummary(recentSamples, 10));
   lines.push(formatRecentTrendSummary(recentSamples, 30));
 
@@ -260,8 +327,8 @@ export function buildStatsOutput(model: PiModel | undefined, adapter: CacheProvi
   const missingAny = recentSamples.some((s) => s.missingUsageFields);
   if (missingAny) {
     lines.push("");
-    lines.push("⚠️ Some recent responses had missing or empty cache usage fields. Footer may under-report hits.");
-    lines.push("   The proxy may not return prompt_cache_hit_tokens or usage.input/cacheRead in responses.");
+    lines.push("⚠️ 近期有响应缺少或返回了空的缓存 usage 字段，footer 命中率可能偏低。");
+    lines.push("   代理可能没有返回 prompt_cache_hit_tokens，或没有返回 usage.input/cacheRead 等字段。");
   }
 
   return lines.join("\n");

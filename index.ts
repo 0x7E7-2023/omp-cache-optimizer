@@ -3,63 +3,36 @@ import { appendFile, lstat, mkdir } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
   type ExtensionAPI, type ExtensionContext
-} from "@earendil-works/pi-coding-agent";
-import { LOG_PREFIX, type PiModel, asRecord, getErrorCode, isNonEmptyString } from "./src/common.ts";
-import { FIX_RECEIPT_FILE_NAME, FIX_RECEIPT_PATH, MODELS_JSON_PATH, STATE_DIR } from "./src/paths.ts";
+} from "@oh-my-pi/pi-coding-agent";
+import { LOG_PREFIX, type PiModel, asRecord, getErrorCode, isNonEmptyString, readEnv } from "./src/common.ts";
+import { STATE_DIR, resolveAgentDir } from "./src/paths.ts";
 import { type FixSuggestion } from "./src/fix-types.ts";
-import { deepEqualIgnoringKeys, findExistingCompatKeysInJsonc, locateModelOverrideInJsonc, locateProviderCompatInJsonc, parseJsonc, stripJsoncComments, stripJsoncTrailingCommas } from "./src/jsonc.ts";
 import { atomicCreateTextFileNoReplace, atomicReplaceTextFilePreservingMode, atomicRestoreFileFromBackup, backupTimestamp, hashText } from "./src/atomic-fs.ts";
-import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues, isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./src/model-detect.ts";
-import { findLastExactModelDefinition, mergeCacheCompat, resolveEffectiveCompatFromConfig } from "./src/compat-config.ts";
-import { analyzeModelsJsonForMissingEntry, applyModelsJsonFixTransaction, chooseFixPlacement, composeFixInsertion, composeMissingEntryInsertion, composeModelOverrideInsertion, composeModelsJsonReceiptRollback, composeProviderAffinityInsertion, createModelsJsonFixReceipt, createRollbackBackupPath, decideFixPlacement, formatCompatKeysForInsertion, hasExplicitLongRetentionOptInFromConfig, hasReceiptReasoningProtocolChange, isActionableModelsJsonFixReceipt, locateModelInJsonc, markModelsJsonFixReceiptRolledBack, parseModelsJsonFixReceipt, prepareModelsJsonRollback, readModelsJsonFixReceipt, readModelsJsonFixReceiptSnapshot, receiptBackupPath, resolveExplicitCompatValue, selfCheckFix, selfCheckMissingEntryInsertion, validateModelsJsonRollback, writeModelsJsonFixReceipt } from "./src/models-json-fix.ts";
+import { getAssistantMessageModelTokenValues, getModelIdNameTokenValues } from "./src/model-detect.ts";
+import { getEffectiveCompatSources, mergeCacheCompat, resolveEffectiveCompat, resolveExplicitCompat } from "./src/compat-config.ts";
 import { ARCHIVE_ABANDONED_ACTIVE_MS, SHARD_ARCHIVE_PATH, isArchivableShard, type StatsSnapshot, aggregateEpochKeys, aggregateStatsWithArchiveSync, aggregateStatsWithArchiveV7, readStatsArchiveForRefresh, compactStatsShardsV7, encodeStatsArchiveV2, listStatsArchiveGenerations, maybeRunStatsMaintenance, parseStatsArchiveV2, readStatsArchive, readStatsArchiveDetailed, readStatsArchiveView, readStatsSnapshot, setStatsArchiveTestHooks, StatsArchiveView, statsArchiveGenerationPath } from "./src/stats-archive.ts";
 import { type CacheProviderId, type CacheStats, LEGACY_STATE_FILE_PATH, acquireStatsMaintenanceLock, isMaintenanceMarkerDue, renameWithRetry, setStatsFsTestHooks, holdsStatsMaintenanceLock, releaseStatsMaintenanceLock, touchStatsMaintenanceLock, type PersistedRoutedModelRef, type PersistedStatsShardV7, SHARD_FILES_DIR, SHARD_GLOBAL_EPOCH_PATH, SHARD_RETENTION_MS, SHARD_STATE_DIR, STATE_FILE_PATH, type ShardAggregate, type UsageSnapshot, addUsageToCacheStats, advanceGlobalStatsEpoch, advanceModelStatsEpoch, aggregateStatsShardsV7, cleanupStatsShardsV7, cloneCacheStats, mapWithConcurrency, currentLocalDay, emptyAllCacheStats, emptyCacheStats, initialEpoch, loadStatsShardAggregateV7, modelEpochPath, parseCacheStats, parsePersistedRoutedModelRef, parsePersistedStatsShardV7, readGlobalStatsEpoch, readModelStatsEpoch, readValidStatsShardsV7, removeLegacyStatsFiles, writeStatsShardV7, type ShardEpochs, readEpochFileResult, readEpochFileWithRetry, createShardAggregatorSync, SHARD_FILE_NAME_PATTERN } from "./src/stats-store.ts";
 import { STATS_FULL_SCAN_INTERVAL_MS, StatsRefreshScheduler, type StatsWatchHandle, createFsShardWatch, TieredShardIndex, getStatsRefreshTestHooks, setStatsRefreshTestHooks } from "./src/stats-refresh.ts";
 import { countingStatsReadFs, setStatsReadFsForTests, statsReadFs } from "./src/stats-fs.ts";
-import { PI_VIRTUAL_MODEL_API, getCompat, isAnthropicMessagesApi, isKimiCodingEmptySignatureModel, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isNativeVirtualModel, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isPiBuiltInLlamaCppModel, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, isValidModelsConfigForEffectiveCompat, modelKey, readEffectiveCompatConfig } from "./src/model-identity.ts";
-import { STATS_INCREMENTAL_ENV, STATS_TIMING_ENV, STATS_VERIFY_ENV, isStatsIncrementalEnabled, isStatsVerifyEnabled, statsTimingLogPath } from "./src/config.ts";
-import { CONFIG_FILE_PATH, VIRTUAL_REWRITE_ENV, FOOTER_MODE_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, isEnabledEnv, isToolOrderEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, shouldInjectOpenAIPromptCacheKey, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
-import { decideZeroPriceWarming, readCacheWarmingMode } from "./src/cache-warming.ts";
-import { LONG_CACHE_RETENTION_VALUE, PI_CACHE_RETENTION_BASELINE_SYMBOL, PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, captureCacheRetentionEnv, getOrCaptureCacheRetentionBaseline, decidePromptCacheRetention, recordPromptCacheRetentionDecision, requestLongCacheRetention, restoreCacheRetentionEnv, userRequestedLongCacheRetention } from "./src/retention.ts";
-import { isRuntimeOptimizerEnabled, isZeroPriceWarmingEnabled, setRuntimeOptimizerEnabled } from "./src/config.ts";
+import { getCompat, getExplicitCompat, isAnthropicMessagesApi, isKnownThirdPartyOpenAIEndpoint, isMistralConversationsApi, isOfficialOpenAIBaseUrl, isOpenAICompatibleApi, isOpenAICompatibleProxyApi, isOpenAIFamilyAssistantMessage, isOpenAIFamilyModel, isOpenAIFamilyToken, isResponsesPromptRewriteBypassApi, isRoutedFallbackModel, modelKey } from "./src/model-identity.ts";
+import { CONFIG_FILE_PATH, FOOTER_MODE_ENV, OPENAI_CACHE_KEY_ENV, NO_OPENAI_CACHE_KEY_ENV, PERSISTED_CACHE_OPTIMIZER_FEATURES, PROMPT_REWRITE_ENV, STATS_INCREMENTAL_ENV, STATS_TIMING_ENV, STATS_VERIFY_ENV, TOOL_ORDER_ENV, featureEnabled, footerStatsMode, formatOptimizerRuntimeMode, formatPersistentFeatureConfig, getOptimizerRuntimeModeLines, isEnabledEnv, isPromptRewriteEnabled, isRuntimeOptimizerEnabled, isStatsIncrementalEnabled, isStatsVerifyEnabled, isToolOrderEnabled, isZeroPriceWarmingEnabled, parseFooterStatsMode, parsePersistedCacheOptimizerConfig, readPersistedCacheOptimizerConfig, readPersistedFooterMode, resolveFooterStatsMode, runtimeOptimizerEnabled, setPersistedCacheOptimizerConfig, setRuntimeOptimizerEnabled, shouldInjectOpenAIPromptCacheKey, statsTimingLogPath, writePersistedCacheOptimizerConfig, writePersistedFeature, writePersistedFooterMode } from "./src/config.ts";
+import { buildCacheWarmingDiagnosis, decideZeroPriceWarming, isZeroPriced, readCacheWarmingMode } from "./src/cache-warming.ts";
+import { LONG_CACHE_RETENTION_VALUE, OMP_CACHE_RETENTION_ENV, PI_CACHE_RETENTION_BASELINE_SYMBOL, PI_CACHE_RETENTION_ENV, STARTUP_CACHE_RETENTION_ENV, captureCacheRetentionEnv, getOrCaptureCacheRetentionBaseline, decidePromptCacheRetention, readCacheRetentionValue, recordPromptCacheRetentionDecision, requestLongCacheRetention, restoreCacheRetentionEnv, userRequestedLongCacheRetention } from "./src/retention.ts";
 import { compareToolOrderEntries, getToolNameForPayload, isKnownToolOrderApi, isToolOrderingEligibleModel, isVerifiedToolForApi, normalizeToolsInPayload, sortToolsInPayload } from "./src/tool-ordering.ts";
-import { SKILL_COMPRESSION_MIN_COUNT, compressSkillsInSystemPrompt, compressSkillsViaSection, formatSkillsForPrompt, formatSkillsForPromptCompressed, stripSessionOverviewChurn, explainSkillCompressionSkip, recordSkillCompressionOutcome, getLastSkillCompressionOutcome, describeSkillCompressionOutcome } from "./src/prompt-rewrite.ts";
-import { addEffectiveSessionAffinityHeaders, addOpenAIPromptCacheKey, clampPromptCacheKey, collectAnthropicCacheControlsInWireOrder, downgradeAnthropicLongCacheControls, getEffectiveCompatValueSource, hasAnthropicCacheTtlOrderError, hasEffectivePromptCacheKey, isPromptCacheKeyOmittedForModel, normalizeAnthropicCacheControlTtlOrder, omitOpenAIPromptCacheKeys, shouldInjectOpenAIPromptCacheKeyForModel, withAnthropicCacheTtlRepair, withoutPromptCacheRetention, derivePromptCacheKey } from "./src/request-payload.ts";
-import { PI_CACHE_HINTS_SYMBOL, PI_ROUTING_REGISTRY_SYMBOL, type PiCacheHintsInput, type PiCacheHintsOutput, applyConfiguredTransportToModel, canRewriteNativeVirtualPrompt, describeNativeVirtualRouteNote, ensureRoutingRegistry, findModelInRegistry, findNativeVirtualDispatches, getProtocolGlobal, getProviderPayloadModelId, getRoutingRegistry, hashSessionId, installCacheHintsService, nativeVirtualDispatchFromMessage, nativeVirtualDispatchToModel, parseRouteSnapshot, resolveActiveRouteSnapshot, resolveNativeVirtualRequestModel, resolveNativeVirtualRouteModel, resolveRouteModel, routeSnapshotToPiModel, sessionHashFromContext } from "./src/routing.ts";
-import { CONFIG_RECEIPT_PATH, applyPromptCacheKeyConfigFix, configReceiptBackupPath, parsePromptCacheKeyConfigReceipt, rollbackPromptCacheKeyConfig, writePromptCacheKeyConfigReceipt } from "./src/prompt-cache-key-config.ts";
-import { buildDeepSeekCompatSuggestion, buildDeepSeekCompatWarningText, buildModelCompatOverride, buildOpenAIProxyCompatWarningText, buildProviderCompatOverride, buildSafeOpenAIProxyCompatSuggestion, describeMissingAdaptiveThinkingCompat, describeMissingCacheCompatForModel, describeMissingDeepSeekCompat, describeMissingOpenAICompatibleProxyCompat, getAgentDirDisplayPath, getModelsJsonDisplayPath, isAdaptiveThinkingCompatApplicable, isDeepSeekWireCompatApplicable } from "./src/compat-advice.ts";
+import { describePromptRewriteOutcome, extractSystemPrompt, fingerprintPrompt, getLastPromptRewriteOutcome, joinSystemPromptBlocks, mapSystemPromptBlocks, mapSystemPromptText, normalizeSystemPromptBlocks, recordPromptRewriteOutcome, stripSessionOverviewChurn, systemPromptBlocksEqual } from "./src/prompt-rewrite.ts";
+import { addOpenAIPromptCacheKey, applyPromptCacheKeyToPayload, clampPromptCacheKey, collectAnthropicCacheControlsInWireOrder, derivePromptCacheKey, downgradeAnthropicLongCacheControls, getPromptCacheKeySource, hasAnthropicCacheTtlOrderError, hasEffectivePromptCacheKey, isPromptCacheKeyOmittedForModel, normalizeAnthropicCacheControlTtlOrder, normalizePromptCacheKeyForWire, omitOpenAIPromptCacheKeys, shouldInjectOpenAIPromptCacheKeyForModel, withAnthropicCacheTtlRepair, withoutPromptCacheRetention } from "./src/request-payload.ts";
+import { PI_CACHE_HINTS_SYMBOL, PI_ROUTING_REGISTRY_SYMBOL, type PiCacheHintsInput, type PiCacheHintsOutput, type PiCacheHintSnapshot, buildProjectPromptCacheKey, ensureRoutingRegistry, findModelInRegistry, getCacheHintsService, getProtocolGlobal, getRoutingRegistry, getSessionPromptCacheKey, hashSessionId, installCacheHintsService, isOptimizerOwnedCacheHintsService, isSessionScopedPromptCacheKey, markOptimizerOwnedCacheHintsService, normalizePromptCacheEndpoint, parseRouteSnapshot, promptCacheKeyOptionsForApi, resolveActiveRouteSnapshot, resolvePromptCacheKey, resolveRouteModel, routeSnapshotToPiModel, sessionHashFromContext } from "./src/routing.ts";
+import { CONFIG_RECEIPT_PATH, applyPromptCacheKeyConfigFix, configReceiptBackupPath, isActionablePromptCacheKeyConfigReceipt, parsePromptCacheKeyConfigReceipt, readPromptCacheKeyConfigReceipt, readPromptCacheKeyConfigReceiptSnapshot, rollbackPromptCacheKeyConfig, writePromptCacheKeyConfigReceipt } from "./src/prompt-cache-key-config.ts";
+import { buildDeepSeekCompatSuggestion, buildDeepSeekCompatWarningText, buildModelCompatOverride, buildOpenAIProxyCompatWarningText, buildProviderCompatOverride, buildSafeOpenAIProxyCompatSuggestion, describeMissingCacheCompatForModel, describeMissingDeepSeekCompat, describeMissingOpenAICompatibleProxyCompat, formatYamlSnippet, getAgentDirDisplayPath, getModelsYmlDisplayPath, isDeepSeekWireCompatApplicable } from "./src/compat-advice.ts";
 import { type CacheProviderAdapter, isVirtualRoutingModel, modelFromAssistantMessage, selectAdapterForAssistantMessage, selectAdapterForModel } from "./src/adapters.ts";
-import { describeMissingOpenAIFamilyProxyCompat } from "./src/compat-advice.ts";
-import { type CacheUsageSample, buildAllStatsOutput, buildContributorsStatsOutput, buildSessionStatsOutput, buildStatsOutput, deriveTotalsByModelFromSessionStats, filterRestorableStatsForSession, formatCacheStats, formatCompactStats, formatHitRatio, formatRecentTrendSummary, formatTokenM, hasMissingUsageFields, makeSessionModelKey, mergeCacheSessions, mergeCacheTotals, mergeLastRoutedModels, modelKeyFromSessionKey, parsePersistedCacheStats, parsePersistedTotalsByModel, prefixFooterStatus, readPersistedCacheStats, routedModelRefToPiModel, selectFooterStatsForModel, writePersistedCacheStats } from "./src/stats-report.ts";
-import { appendAdaptiveThinkingCompatAdviceLines, buildAdaptiveThinkingCompatSuggestion, buildCompatDiagnosis, buildDoctorDiagnosis, buildFixSuggestion, buildLowHitDiagnosis, describeOptionalOpenAICompatibleProxyCompat, describeRouterChannelDiagnostics, getCompatCheckNotApplicableLines, getPromptCacheRetentionUnsupportedHint, isCompatCheckApplicable, isDeepSeekCompatCheckApplicable, isOpenAISdkHeader403Applicable, isPromptCacheKeyUnsupportedApplicable, isPromptCacheRetention400Applicable, isSessionAffinity403Applicable } from "./src/diagnostics.ts";
-import { REASONING_PROTOCOL_FALLBACK_SYMBOL, buildReasoningProtocolFixSuggestion, getAnthropicTtlFallbackState, getReasoningProtocolFallbackState, hasExplicitDeepSeekReasoningProtocol, hasPromptCacheKeyUnsupportedErrorMessage, hasPromptCacheKeyUnsupportedText, hasPromptCacheRetentionUnsupportedErrorMessage, hasReasoningProtocolRejectionErrorMessage, hasReasoningProtocolRejectionText, isExplicitPromptCacheRetentionUnsupportedApplicable, isReasoningProtocolRejectionForModel, isReasoningProtocolRejectionSignalApplicable, mergeFixSuggestions, notifyReasoningProtocolObservation } from "./src/provider-errors.ts";
-import { hasPromptCacheKeyUnsupportedSignal, hasPromptCacheRetentionUnsupportedSignal, hasReasoningProtocolRejectionSignal } from "./src/provider-errors.ts";
-import { MAX_RECENT_SAMPLES, buildExactRouterStatusEntry, consolidateDirectProviderStatsModel, createSerializedAsyncRunner, findBestRouterModelStats, keyForModelExt } from "./src/stats-report.ts";
-import { type PiCacheHintSnapshot, getCacheHintsService, getSessionPromptCacheKey, isOptimizerOwnedCacheHintsService, markOptimizerOwnedCacheHintsService } from "./src/routing.ts";
-import { isActionablePromptCacheKeyConfigReceipt, readPromptCacheKeyConfigReceipt, readPromptCacheKeyConfigReceiptSnapshot } from "./src/prompt-cache-key-config.ts";
-import { formatOptimizerRuntimeMode, getOptimizerRuntimeModeLines, readPersistedFooterMode } from "./src/config.ts";
+import { type CacheUsageSample, type PromptDiagnosticSample, MAX_RECENT_SAMPLES, buildAllStatsOutput, buildContributorsStatsOutput, buildExactRouterStatusEntry, buildSessionStatsOutput, buildStatsOutput, consolidateDirectProviderStatsModel, createSerializedAsyncRunner, deriveTotalsByModelFromSessionStats, filterRestorableStatsForSession, findBestRouterModelStats, formatCacheStats, formatCompactStats, formatHitRatio, formatRecentPromptDiagnostics, formatRecentTrendSummary, formatTokenCount, formatTokenM, hasMissingUsageFields, keyForModelExt, makeSessionModelKey, mergeCacheSessions, mergeCacheTotals, mergeLastRoutedModels, modelKeyFromSessionKey, parsePersistedCacheStats, parsePersistedTotalsByModel, prefixFooterStatus, readPersistedCacheStats, routedModelRefToPiModel, selectFooterStatsForModel, writePersistedCacheStats } from "./src/stats-report.ts";
+import { buildCompatDiagnosis, buildDoctorDiagnosis, buildFixSuggestion, buildLowHitDiagnosis, describeOptionalOpenAICompatibleProxyCompat, describeRouterChannelDiagnostics, getCompatCheckNotApplicableLines, getOptionalAssistantHttpStatus, getPromptCacheRetentionUnsupportedHint, isCompatCheckApplicable, isDeepSeekCompatCheckApplicable, isOpenAISdkHeader403Applicable, isPromptCacheKeyUnsupportedApplicable, isPromptCacheRetention400Applicable } from "./src/diagnostics.ts";
+import { REASONING_PROTOCOL_FALLBACK_SYMBOL, buildReasoningProtocolFixSuggestion, getAnthropicTtlFallbackState, getReasoningProtocolFallbackState, hasPromptCacheKeyUnsupportedErrorMessage, hasPromptCacheKeyUnsupportedSignal, hasPromptCacheKeyUnsupportedText, hasPromptCacheRetentionUnsupportedErrorMessage, hasPromptCacheRetentionUnsupportedSignal, hasPromptCacheRetentionUnsupportedText, hasReasoningProtocolRejectionErrorMessage, hasReasoningProtocolRejectionSignal, hasReasoningProtocolRejectionText, isExplicitPromptCacheRetentionUnsupportedApplicable, isReasoningProtocolRejectionForModel, isReasoningProtocolRejectionSignalApplicable, mergeFixSuggestions, notifyReasoningProtocolObservation } from "./src/provider-errors.ts";
 import { getCacheOptimizerArgumentCompletions } from "./src/command-completion.ts";
-import { MAX_PROVIDER_REQUEST_STATES, pruneProviderRequestStates, snapshotProviderRequestModel } from "./src/request-state.ts";
-import { NO_PROMPT_REWRITE_ENV } from "./src/config.ts";
-import { createCacheOptimizerCommandHandler } from "./src/command.ts";
-import { type ProviderRequestState } from "./src/request-state.ts";
+import { MAX_PROVIDER_REQUEST_STATES, type ProviderRequestState, pruneProviderRequestStates, snapshotProviderRequestModel } from "./src/request-state.ts";
+import { buildManualFixLines, createCacheOptimizerCommandHandler } from "./src/command.ts";
 
-const STATUS_KEY = "pi-cache-stats";
-
-function buildAdaptiveThinkingCompatWarningText(key: string, missing: string[]): string {
-  const slashIdx = key.indexOf("/");
-  const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
-  const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
-  const modelsJsonPath = getModelsJsonDisplayPath();
-  const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is an adaptive-generation model but merged compat lacks ${missing.join(" and ")}.`,
-    `Without the required compat, Pi may send legacy thinking or replay thinking blocks incorrectly.`,
-    `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
-    "",
-  ];
-  appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId });
-  return lines.join("\n");
-}
+const STATUS_KEY = "omp-cache-stats";
 
 function notifyCacheCompatIfNeeded(
   model: PiModel | undefined,
@@ -71,21 +44,9 @@ function notifyCacheCompatIfNeeded(
   // A protocol rejection is retained separately from ordinary compat warnings;
   // it is surfaced once by the response hook and can be used by a later fix.
   // Do not turn it into an automatic write here.
-
-  // Native anthropic-messages adaptive thinking compat check.
-  // Adapter warningText only fires for OpenAI-compatible APIs, so native
-  // Anthropic and Kimi Coding adaptive models need a separate check.
-  if (isAdaptiveThinkingCompatApplicable(model)) {
-    const missing = describeMissingAdaptiveThinkingCompat(model);
-    if (missing.length > 0) {
-      const key = `adaptive-thinking:${modelKey(model)}`;
-      if (!warnedModels.has(key)) {
-        warnedModels.add(key);
-        ctx.ui.notify(buildAdaptiveThinkingCompatWarningText(modelKey(model), missing), "warning");
-      }
-    }
-    // Still check adapter warnings for other compat issues.
-  }
+  //
+  // OMP divergence: no adaptive-thinking compat check (OMP's catalog handles
+  // adaptive thinking itself; see compat-advice.ts).
 
   const adapter = selectAdapterForModel(model);
   const text = adapter?.warningText?.(model);
@@ -103,24 +64,26 @@ function notifyCacheCompatIfNeeded(
   ctx.ui.notify(text, "warning");
 }
 
-// Internal helpers exported only so the task verification script
-// (.trellis/tasks/.../verify.ts) can exercise them. They are not part of the
-// extension's public API; pi only invokes the default export below.
+// Internal helpers exported only so the test suite can exercise them. They are
+// not part of the extension's public API; OMP only invokes the default export below.
 // Most recent background stats restore started by any extension instance in
 // this module. Tests await it after session_start; runtime code uses the
 // per-instance promise instead.
 let latestStatsRestoreForTests: Promise<void> = Promise.resolve();
 /** Per extension instance in this module: resolves once no footer refresh (or its publish) is in flight. */
 const statsRefreshSettledForTests = new Set<() => Promise<void>>();
+/** Per extension instance in this module: resolves once no message_end handler is still recording. */
+const messageEndSettledForTests = new Set<() => Promise<void>>();
 
 export const __internals_for_tests = {
   waitForStatsRestore: (): Promise<void> => latestStatsRestoreForTests,
   /**
-   * Footer refreshes after tool_execution_end, agent_settled and message_end
-   * no longer hold up Pi's handlers (2.10). Tests await this before
-   * asserting on what such a refresh publishes.
+   * Footer refreshes after tool_execution_end, agent_end and message_end
+   * never hold up OMP's handlers. Tests await this before asserting on what
+   * such a refresh publishes.
    */
   statsRefreshSettled: async (): Promise<void> => {
+    for (const settled of messageEndSettledForTests) await settled();
     for (const settled of statsRefreshSettledForTests) await settled();
   },
   setStatsRefreshTestHooks,
@@ -140,31 +103,47 @@ export const __internals_for_tests = {
   STATS_TIMING_ENV,
   STATS_VERIFY_ENV,
   isStatsVerifyEnabled,
-  getLastSkillCompressionOutcome,
   decidePromptCacheRetention,
   userRequestedLongCacheRetention,
   derivePromptCacheKey,
   withAnthropicCacheTtlRepair,
   withoutPromptCacheRetention,
-  describeSkillCompressionOutcome,
   stripSessionOverviewChurn,
-  formatSkillsForPrompt,
-  formatSkillsForPromptCompressed,
-  compressSkillsInSystemPrompt,
-  SKILL_COMPRESSION_MIN_COUNT,
-  NO_PROMPT_REWRITE_ENV,
+  normalizeSystemPromptBlocks,
+  joinSystemPromptBlocks,
+  mapSystemPromptBlocks,
+  mapSystemPromptText,
+  systemPromptBlocksEqual,
+  extractSystemPrompt,
+  getLastPromptRewriteOutcome,
+  describePromptRewriteOutcome,
+  PROMPT_REWRITE_ENV,
+  isPromptRewriteEnabled,
   isEnabledEnv,
+  readEnv,
   featureEnabled,
   writePersistedFeature,
+  PERSISTED_CACHE_OPTIMIZER_FEATURES,
   // OpenAI-family cache-key helpers
   addOpenAIPromptCacheKey,
+  applyPromptCacheKeyToPayload,
   clampPromptCacheKey,
+  normalizePromptCacheKeyForWire,
   hasEffectivePromptCacheKey,
   omitOpenAIPromptCacheKeys,
   isPromptCacheKeyOmittedForModel,
+  getPromptCacheKeySource,
+  resolvePromptCacheKey,
+  promptCacheKeyOptionsForApi,
+  isSessionScopedPromptCacheKey,
+  buildProjectPromptCacheKey,
+  normalizePromptCacheEndpoint,
+  getSessionPromptCacheKey,
   isNonEmptyString,
   shouldInjectOpenAIPromptCacheKey,
   shouldInjectOpenAIPromptCacheKeyForModel,
+  OPENAI_CACHE_KEY_ENV,
+  NO_OPENAI_CACHE_KEY_ENV,
   isOpenAICompatibleApi,
   isAnthropicMessagesApi,
   isOpenAICompatibleProxyApi,
@@ -172,21 +151,16 @@ export const __internals_for_tests = {
   downgradeAnthropicLongCacheControls,
   hasAnthropicCacheTtlOrderError,
   normalizeAnthropicCacheControlTtlOrder,
-  isPiBuiltInLlamaCppModel,
   isResponsesPromptRewriteBypassApi,
-  canRewriteNativeVirtualPrompt,
-  VIRTUAL_REWRITE_ENV,
   isMistralConversationsApi,
   isOpenAIFamilyModel,
   isOpenAIFamilyAssistantMessage,
   isOpenAIFamilyToken,
-  describeMissingOpenAIFamilyProxyCompat,
   describeMissingOpenAICompatibleProxyCompat,
   describeOptionalOpenAICompatibleProxyCompat,
   describeMissingDeepSeekCompat,
   isDeepSeekWireCompatApplicable,
   isDeepSeekCompatCheckApplicable,
-  hasExplicitDeepSeekReasoningProtocol,
   describeMissingCacheCompatForModel,
   buildDeepSeekCompatSuggestion,
   buildDeepSeekCompatWarningText,
@@ -196,70 +170,85 @@ export const __internals_for_tests = {
   isKnownThirdPartyOpenAIEndpoint,
   isCompatCheckApplicable,
   isPromptCacheRetention400Applicable,
-  isSessionAffinity403Applicable,
   isOpenAISdkHeader403Applicable,
+  getOptionalAssistantHttpStatus,
   hasPromptCacheRetentionUnsupportedSignal,
   hasPromptCacheRetentionUnsupportedErrorMessage,
+  hasPromptCacheRetentionUnsupportedText,
   hasPromptCacheKeyUnsupportedText,
   hasPromptCacheKeyUnsupportedSignal,
   hasPromptCacheKeyUnsupportedErrorMessage,
   isPromptCacheKeyUnsupportedApplicable,
+  isExplicitPromptCacheRetentionUnsupportedApplicable,
   hasReasoningProtocolRejectionText,
   hasReasoningProtocolRejectionSignal,
   hasReasoningProtocolRejectionErrorMessage,
   isReasoningProtocolRejectionSignalApplicable,
   isReasoningProtocolRejectionForModel,
   buildReasoningProtocolFixSuggestion,
-  // Non-GPT OpenAI-compatible model detection
-  // Additional OpenAI-compatible model detection
-  // More OpenAI-compatible model detection (batch 2)
-  // New OpenAI-compatible model detection (batch 3, 12 families)
-  // More OpenAI-compatible model detection (batch 4, 18 families)
+  mergeFixSuggestions,
   selectAdapterForModel,
   selectAdapterForAssistantMessage,
   buildOpenAIProxyCompatWarningText,
   getModelIdNameTokenValues,
   getAssistantMessageModelTokenValues,
   mergeCacheCompat,
-  resolveEffectiveCompatFromConfig,
-  getEffectiveCompatValueSource,
-  findLastExactModelDefinition,
-  isValidModelsConfigForEffectiveCompat,
-  addEffectiveSessionAffinityHeaders,
+  getEffectiveCompatSources,
+  resolveEffectiveCompat,
+  resolveExplicitCompat,
   getCompat,
+  getExplicitCompat,
   isKnownToolOrderApi,
   getToolNameForPayload,
   compareToolOrderEntries,
   isVerifiedToolForApi,
   normalizeToolsInPayload,
   sortToolsInPayload,
+  isToolOrderingEligibleModel,
   modelKey,
   modelFromAssistantMessage,
   consolidateDirectProviderStatsModel,
   // Platform-friendly path helpers
+  STATE_DIR,
+  resolveAgentDir,
   getAgentDirDisplayPath,
-  getModelsJsonDisplayPath,
+  getModelsYmlDisplayPath,
+  formatYamlSnippet,
   buildProviderCompatOverride,
   buildModelCompatOverride,
+  buildManualFixLines,
   captureCacheRetentionEnv,
   requestLongCacheRetention,
   restoreCacheRetentionEnv,
+  readCacheRetentionValue,
   setRuntimeOptimizerEnabled,
   isRuntimeOptimizerEnabled,
   getOptimizerRuntimeModeLines,
   formatOptimizerRuntimeMode,
+  formatPersistentFeatureConfig,
+  OMP_CACHE_RETENTION_ENV,
   PI_CACHE_RETENTION_ENV,
   LONG_CACHE_RETENTION_VALUE,
+  STARTUP_CACHE_RETENTION_ENV,
   TOOL_ORDER_ENV,
   isToolOrderEnabled,
-  // Integrity diagnostics
+  // Cache warming
+  buildCacheWarmingDiagnosis,
+  decideZeroPriceWarming,
+  isZeroPriced,
+  readCacheWarmingMode,
+  isZeroPriceWarmingEnabled,
   // Diagnostic command helpers
   buildDoctorDiagnosis,
   buildCompatDiagnosis,
+  buildLowHitDiagnosis,
   describeRouterChannelDiagnostics,
-  // Cache stats helpers (module-level, usable from verify script)
+  getCompatCheckNotApplicableLines,
+  // Cache stats helpers
   addUsageToCacheStats,
   formatCacheStats,
+  formatCompactStats,
+  formatTokenCount,
   prefixFooterStatus,
   getCacheOptimizerArgumentCompletions,
   emptyCacheStats,
@@ -274,15 +263,15 @@ export const __internals_for_tests = {
   buildSessionStatsOutput,
   buildAllStatsOutput,
   buildContributorsStatsOutput,
-  formatCompactStats,
-  buildLowHitDiagnosis,
   formatRecentTrendSummary,
+  formatRecentPromptDiagnostics,
   formatHitRatio,
   formatTokenM,
   hasMissingUsageFields,
   keyForModelExt,
   // Session-scoped helpers
   hashSessionId,
+  sessionHashFromContext,
   makeSessionModelKey,
   modelKeyFromSessionKey,
   filterRestorableStatsForSession,
@@ -321,18 +310,11 @@ export const __internals_for_tests = {
   resolveActiveRouteSnapshot,
   routeSnapshotToPiModel,
   isRoutedFallbackModel,
-  applyConfiguredTransportToModel,
   resolveRouteModel,
   isVirtualRoutingModel,
-  PI_VIRTUAL_MODEL_API,
-  isNativeVirtualModel,
-  findNativeVirtualDispatches,
-  resolveNativeVirtualRouteModel,
-  resolveNativeVirtualRequestModel,
-  getProviderPayloadModelId,
-  getCompatCheckNotApplicableLines,
-  describeNativeVirtualRouteNote,
+  findModelInRegistry,
   pruneProviderRequestStates,
+  snapshotProviderRequestModel,
   MAX_PROVIDER_REQUEST_STATES,
   installCacheHintsService,
   getCacheHintsService,
@@ -386,63 +368,15 @@ export const __internals_for_tests = {
   STATE_FILE_PATH,
   LEGACY_STATE_FILE_PATH,
   SHARD_STATE_DIR,
-  FIX_RECEIPT_FILE_NAME,
-  FIX_RECEIPT_PATH,
   SHARD_FILES_DIR,
   SHARD_GLOBAL_EPOCH_PATH,
-  STATE_DIR,
-  // JSONC surgical edit helpers
-  MODELS_JSON_PATH,
-  stripJsoncComments,
-  stripJsoncTrailingCommas,
-  parseJsonc,
-  resolveExplicitCompatValue,
-  hasExplicitLongRetentionOptInFromConfig,
-  locateModelInJsonc,
-  locateModelOverrideInJsonc,
-  locateProviderCompatInJsonc,
-  composeFixInsertion,
-  selfCheckFix,
-  analyzeModelsJsonForMissingEntry,
-  composeMissingEntryInsertion,
-  composeModelOverrideInsertion,
-  composeProviderAffinityInsertion,
-  selfCheckMissingEntryInsertion,
-  decideFixPlacement,
-  chooseFixPlacement,
-  findExistingCompatKeysInJsonc,
-  deepEqualIgnoringKeys,
-  formatCompatKeysForInsertion,
   backupTimestamp,
   atomicReplaceTextFilePreservingMode,
   atomicCreateTextFileNoReplace,
   atomicRestoreFileFromBackup,
-  applyModelsJsonFixTransaction,
   hashText,
-  parseModelsJsonFixReceipt,
-  isActionableModelsJsonFixReceipt,
-  hasReceiptReasoningProtocolChange,
-  createRollbackBackupPath,
-  createModelsJsonFixReceipt,
-  writeModelsJsonFixReceipt,
-  readModelsJsonFixReceipt,
-  readModelsJsonFixReceiptSnapshot,
-  markModelsJsonFixReceiptRolledBack,
-  receiptBackupPath,
-  composeModelsJsonReceiptRollback,
-  validateModelsJsonRollback,
-  prepareModelsJsonRollback,
   // Fix suggestion builder
   buildFixSuggestion,
-  // Adaptive thinking compat helpers
-  isAdaptiveGenerationModel,
-  isKimiCodingAdaptiveModel,
-  isKimiCodingEmptySignatureModel,
-  isAdaptiveThinkingCompatApplicable,
-  describeMissingAdaptiveThinkingCompat,
-  buildAdaptiveThinkingCompatSuggestion,
-  buildAdaptiveThinkingCompatWarningText,
-  appendAdaptiveThinkingCompatAdviceLines,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -452,8 +386,6 @@ export default function (pi: ExtensionAPI) {
   const anthropicTtlFallbackState = getAnthropicTtlFallbackState();
   const anthropicTtlOrderErrorModels = anthropicTtlFallbackState.modelKeys;
   const warnedAnthropicTtlOrderErrorModels = anthropicTtlFallbackState.warnedModelKeys;
-  const sendSessionAffinityHeaders403Models = new Set<string>();
-  const warnedSendSessionAffinityHeaders403Models = new Set<string>();
   const openAISdkHeader403Models = new Set<string>();
   const warnedOpenAISdkHeader403Models = new Set<string>();
   const reasoningProtocolFallbackState = getReasoningProtocolFallbackState();
@@ -516,10 +448,9 @@ export default function (pi: ExtensionAPI) {
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
 
-    if (
-      anthropicTtlOrderErrorModels.has(key) ||
-      (isPromptCacheRetention400Applicable(model) && promptCacheRetention400Models.has(key))
-    ) {
+    // OMP compat names: Anthropic 1h TTL is `supportsLongCacheRetention`,
+    // OpenAI Responses 24h retention is `supportsLongPromptCacheRetention`.
+    if (anthropicTtlOrderErrorModels.has(key)) {
       return {
         providerLabel,
         modelId: model.id,
@@ -527,11 +458,11 @@ export default function (pi: ExtensionAPI) {
         forceModelLevel: true,
       };
     }
-    if (isSessionAffinity403Applicable(model) && sendSessionAffinityHeaders403Models.has(key)) {
+    if (isPromptCacheRetention400Applicable(model) && promptCacheRetention400Models.has(key)) {
       return {
         providerLabel,
         modelId: model.id,
-        compatKeys: { sendSessionAffinityHeaders: false },
+        compatKeys: { supportsLongPromptCacheRetention: false },
         forceModelLevel: true,
       };
     }
@@ -565,15 +496,29 @@ export default function (pi: ExtensionAPI) {
   function buildPromptCacheKeyConfigPreview(model: PiModel): string[] {
     const key = modelKey(model);
     return [
-      `Target: ${key}`,
-      `Action: persist prompt_cache_key mode = omit in ${CONFIG_FILE_PATH}.`,
-      "The final request body will omit both prompt_cache_key and promptCacheKey.",
-      "This can reduce provider-side prompt-cache reuse for this model; it does not change prompts, credentials, headers, or other models.",
-      "The setting applies after Pi core has built the payload, including when Pi already supplied a key.",
+      `目标：${key}`,
+      `操作：在 ${CONFIG_FILE_PATH} 持久化 prompt_cache_key 模式 = omit。`,
+      "最终请求体会同时去掉 prompt_cache_key 和 promptCacheKey。",
+      "这可能降低该模型在 provider 侧的 prompt 缓存复用；不会改变 prompt、凭据、header 或其他模型。",
+      "该设置在 OMP 核心生成 payload 之后生效，包括 OMP 自己已经提供 key 的情况。",
     ];
   }
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
+  /** Provider-request prompt diagnostics per session model key (memory only; not paired with message_end usage). */
+  const recentPromptDiagnosticsByModelKey = new Map<string, PromptDiagnosticSample[]>();
+  /**
+   * message_end handlers still recording. OMP does not wait for message_end,
+   * so a session switch drains these before the counters move to the next
+   * session (an aborted turn can emit one last message_end late).
+   */
+  const pendingMessageEndOperations = new Set<Promise<unknown>>();
+  async function drainPendingMessageEnds(): Promise<void> {
+    while (pendingMessageEndOperations.size > 0) {
+      await Promise.allSettled(Array.from(pendingMessageEndOperations));
+    }
+  }
+  messageEndSettledForTests.add(drainPendingMessageEnds);
 
   function syncSessionHash(ctx: Pick<ExtensionContext, "sessionManager">): void {
     const sid = ctx.sessionManager.getSessionId();
@@ -585,10 +530,15 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  const uninstallCacheHintsService = installCacheHintsService(markOptimizerOwnedCacheHintsService({
+  // The hints carry the prompt and cache key OMP will actually send, so they
+  // stay published while prompt rewrite is off (then the prompt is unchanged).
+  // OMP runs one extension instance per session, including concurrent
+  // subagents; only the top-level session publishes the process-wide service
+  // (installed at its session_start), so a finishing subagent never removes it.
+  const cacheHintsService = markOptimizerOwnedCacheHintsService({
     version: 1,
     getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined {
-      if (!runtimeOptimizerEnabled || !featureEnabled("promptRewrite", NO_PROMPT_REWRITE_ENV, true)) return undefined;
+      if (!runtimeOptimizerEnabled) return undefined;
       const hint = latestCacheHint;
       if (!hint) return undefined;
       if (input.sessionIdHash && hint.sessionIdHash && input.sessionIdHash !== hint.sessionIdHash) return undefined;
@@ -604,7 +554,24 @@ export default function (pi: ExtensionAPI) {
         cacheRetention: hint.cacheRetention,
       };
     },
-  }), { discardPrevious: isOptimizerOwnedCacheHintsService });
+  });
+  let uninstallCacheHintsService: (() => void) | undefined;
+
+  function recordPromptDiagnosticSample(modelKeyStr: string, sample: Omit<PromptDiagnosticSample, "timestamp">): void {
+    let samples = recentPromptDiagnosticsByModelKey.get(modelKeyStr);
+    if (!samples) {
+      samples = [];
+      recentPromptDiagnosticsByModelKey.set(modelKeyStr, samples);
+    }
+    samples.push({ timestamp: Date.now(), ...sample });
+    if (samples.length > MAX_RECENT_SAMPLES) {
+      samples.splice(0, samples.length - MAX_RECENT_SAMPLES);
+    }
+  }
+
+  function getRecentPromptDiagnostics(modelKeyStr: string): PromptDiagnosticSample[] {
+    return recentPromptDiagnosticsByModelKey.get(modelKeyStr) ?? [];
+  }
 
   /**
    * Build a session-scoped stats key from the current session hash + model key.
@@ -649,6 +616,7 @@ export default function (pi: ExtensionAPI) {
 
   function clearRecentSamples(): void {
     recentSamplesByModelKey.clear();
+    recentPromptDiagnosticsByModelKey.clear();
   }
 
   /**
@@ -1271,6 +1239,9 @@ export default function (pi: ExtensionAPI) {
     for (const key of Array.from(recentSamplesByModelKey.keys())) {
       if (modelKeyFromSessionScoped(key) === displayKey) recentSamplesByModelKey.delete(key);
     }
+    for (const key of Array.from(recentPromptDiagnosticsByModelKey.keys())) {
+      if (modelKeyFromSessionScoped(key) === displayKey) recentPromptDiagnosticsByModelKey.delete(key);
+    }
     lastStatusText = undefined;
   }
 
@@ -1546,10 +1517,13 @@ export default function (pi: ExtensionAPI) {
     let statusText: string | undefined;
     const mode = footerStatsMode();
     const sessionHash = currentSessionHashSet ? currentSessionHash : undefined;
+    // Recent samples are this session's requests: only meaningful next to
+    // session or process counters, not the all-sessions daily total.
+    const recentSamplesFor = (target: PiModel): CacheUsageSample[] => mode === "total" ? [] : getRecentSamples(sessionModelKey(target));
 
     if (!adapter && !routedModel && activeIsVirtualRoute) {
-      // On model_select (existing footer), keep the existing cache footer
-      // visible instead of clearing it. On session_start (no footer yet
+      // On a model change (existing footer), keep the existing cache footer
+      // visible instead of clearing it. On session start (no footer yet
       // after reload/fresh start), restore the exact last actual routed model
       // for this session when available; fall back to older best-effort
       // heuristics only when no exact metadata exists.
@@ -1569,10 +1543,10 @@ export default function (pi: ExtensionAPI) {
         cacheStatsProcessByModel,
       );
       if (realEntry) {
-        const statsText = formatCacheStats(realEntry.adapter, realEntry.stats);
+        const statsText = formatCacheStats(realEntry.adapter, realEntry.stats, recentSamplesFor(realEntry.model));
         statusText = runtimeOptimizerEnabled
           ? statsText
-          : `Cache Optimizer disabled · ${statsText}`;
+          : `缓存优化已关闭 · ${statsText}`;
       }
     }
 
@@ -1583,24 +1557,18 @@ export default function (pi: ExtensionAPI) {
       const stats = displayModel
         ? selectFooterStatsForModel(mode, sessionHash, cacheStatsByModel, cacheStatsTotalsByModel, displayModel, cacheStatsProcessByModel)
         : undefined;
-      const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats());
-      statusText = runtimeOptimizerEnabled ? statsText : `Cache Optimizer disabled · ${statsText}`;
+      const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats(), displayModel ? recentSamplesFor(displayModel) : []);
+      statusText = runtimeOptimizerEnabled ? statsText : `缓存优化已关闭 · ${statsText}`;
     }
 
-    // ⚠️ compat footer marker: if the active model has adapter-specific
-    // missing compat (DeepSeek reasoning/cache compat, or a non-official
-    // openai-completions model missing cache/session-affinity flags), append
-    // the marker to indicate that compat configuration is incomplete.
-    // Re-evaluated on every status update so the marker persists through stats
-    // changes and day rollovers. Redundant setStatus calls are blocked by the
-    // `lastStatusText` early return above.
+    // ⚠️ compat footer marker: only safe-fixable missing compat keys trigger
+    // it. Optional/advisory-only flags (e.g. supportsLongPromptCacheRetention
+    // on third-party Responses endpoints) do NOT; doctor/compat still mention
+    // them. Re-evaluated on every status update so the marker persists through
+    // stats changes and day rollovers.
     if (runtimeOptimizerEnabled && statusText !== undefined && displayModel) {
-      // Only show ⚠️ compat when there are safe-fixable missing compat keys.
-      // Optional/advisory-only flags (e.g. supportsLongCacheRetention on generic
-      // OpenAI-compatible proxies) do NOT trigger the marker — the doctor/compat
-      // commands still mention them as optional guidance.
       if (buildFixSuggestion(displayModel) !== undefined) {
-        statusText = statusText + " ⚠️ compat";
+        statusText = statusText + " ⚠️ 配置";
       }
     }
 
@@ -1614,68 +1582,47 @@ export default function (pi: ExtensionAPI) {
   ensureRoutingRegistry();
 
   /**
-   * Check whether a model has an EXPLICIT supportsLongCacheRetention: true
-   * opt-in in models.json. Precedence mirrors Pi's effective model config:
-   * modelOverrides[model.id].compat, then models[].compat, then provider.compat.
-   *
-   * Returns true ONLY when the user explicitly opted in. Returns false for:
-   *   - Explicit false (opt-out)
-   *   - In models.json but field absent (Pi defaults to true — unsafe)
-   *   - Not in models.json at all (API-logged-in providers)
-   *   - File missing/unreadable
-   *
-   * The caller strips prompt_cache_retention when this returns false.
+   * OMP only emits `prompt_cache_retention` on `api: openai-responses` when the
+   * resolved compat says the host accepts it (official OpenAI by detection, or
+   * an explicit models.yml `supportsLongPromptCacheRetention: true`). That
+   * resolved value is OMP's own decision, so it counts as the opt-in; the gate
+   * below only undoes the field after the provider explicitly rejected it.
    */
   function hasExplicitLongRetentionOptIn(model: PiModel): boolean {
-    // Pi's built-in catalog only ever sets supportsLongCacheRetention: false, so
-    // an explicit true on the runtime model (provider extension or merged
-    // models.json) is as deliberate as one read from models.json directly.
-    // A value resolved from models.json (modelOverrides > model > provider)
-    // still wins, so an explicit false there is never overridden.
-    const configured = resolveExplicitCompatValue(
-      readEffectiveCompatConfig(),
-      model.provider,
-      model.id,
-      "supportsLongCacheRetention",
-    );
-    if (configured !== undefined) return configured.value === true;
-    return asRecord(model.compat)?.supportsLongCacheRetention === true;
+    return getCompat(model).supportsLongPromptCacheRetention === true;
   }
+
+  /** Subagent sessions (task tool, eval agent(), /tan clones) run their own extension instance. */
+  function isSubagentContext(ctx: unknown): boolean {
+    return asRecord(asRecord(ctx)?.agent)?.kind === "sub";
+  }
+
+  /** This instance serves the top-level session: it owns process-wide state (env, hints, legacy global). */
+  let isMainSessionInstance = false;
+  /** Last model key the footer/compat warning was published for (OMP has no model_select event). */
+  let lastModelKeyForStatus: string | undefined;
 
   /**
-   * Request treatment that before_provider_request derives from a model's
-   * identity. A native virtual request whose dispatched id matches several
-   * credentialed providers is resolved only when this key agrees for all of
-   * them, so no provider-specific decision is applied on a guess.
+   * Begin stats for the session ctx now points at. OMP emits session_start once
+   * per extension instance and then reuses the same instance for /new,
+   * /resume, /fork and branch transitions (session_switch / session_branch),
+   * so every later call retires the shard holding the previous session.
    */
-  function requestPolicyKey(model: PiModel): string {
-    const key = modelKey(model);
-    return JSON.stringify([
-      model.api ?? "",
-      isOfficialOpenAIBaseUrl(model),
-      hasExplicitLongRetentionOptIn(model),
-      promptCacheRetention400Models.has(key),
-      anthropicTtlOrderErrorModels.has(key),
-      isPromptCacheKeyOmittedForModel(model),
-    ]);
-  }
-
-  pi.on("session_start", async (event, ctx) => {
+  function startSessionStats(ctx: ExtensionContext, reason: string): void {
     if (runtimeOptimizerEnabled) requestLongCacheRetention();
-    // Do not block Pi's startup on historical stats (issue #28). The
+    // Do not block OMP's startup on historical stats (issue #28). The
     // restore runs in the background (chained after any earlier restore so
     // two never interleave) and the footer is published when it finishes.
-    // A newer session_start supersedes an older restore, which then must not
+    // A newer start supersedes an older restore, which then must not
     // publish a stale footer. Handlers that read or persist stats await
     // waitForStatsRestore() first.
     const generation = ++statsRestoreGeneration;
-    // The same extension instance lives on across session switches
-    // (shutdown, then start): reopen what the shutdown closed.
     refreshScheduler.open();
     latestStatsCtx = ctx;
-    const tui = ctx.mode === "tui";
+    const tui = ctx.mode === "tui" && !isSubagentContext(ctx);
     if (sessionStartsHandled++ > 0) retireShardForSessionStart();
-    resetStatsForSessionStart(event.reason, ctx);
+    resetStatsForSessionStart(reason, ctx);
+    lastModelKeyForStatus = undefined;
     const previousRestore = statsRestorePromise;
     statsRestorePromise = previousRestore
       // A restore superseded before it started is skipped entirely: the newer
@@ -1688,9 +1635,7 @@ export default function (pi: ExtensionAPI) {
         console.warn(`${LOG_PREFIX}: failed to restore cache stats`, error);
       })
       .then(() => {
-        // TUI only, and only after the restore created the directory (2.9.3
-        // watched it on the startup path and stayed without a watcher for
-        // the whole process when it did not exist yet).
+        // TUI only, and only after the restore created the directory.
         if (tui && generation === statsRestoreGeneration && !refreshScheduler.isClosed) {
           shardWatcherWanted = true;
           shardWatcherRetryAt = 0;
@@ -1698,30 +1643,90 @@ export default function (pi: ExtensionAPI) {
         }
       });
     latestStatsRestoreForTests = statsRestorePromise;
+  }
+
+  /** Persist the outgoing session's counters before the instance moves on. */
+  async function flushOutgoingSession(ctx: ExtensionContext): Promise<void> {
+    // message_end is fire-and-forget in OMP: let handlers that already
+    // started (an abort can emit one last message_end) finish recording
+    // under the outgoing session first.
+    await drainPendingMessageEnds();
+    await waitForStatsRestore();
+    try {
+      await flushPersistCacheStats(ctx);
+    } catch (error) {
+      console.warn(`${LOG_PREFIX}: failed to persist cache stats before a session switch`, error);
+    }
+  }
+
+  async function switchSessionStats(ctx: ExtensionContext, reason: string): Promise<void> {
+    await flushOutgoingSession(ctx);
+    latestCacheHint = undefined;
+    providerRequestStates.length = 0;
+    startSessionStats(ctx, reason);
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (!isSubagentContext(ctx)) {
+      isMainSessionInstance = true;
+      uninstallCacheHintsService ??= installCacheHintsService(cacheHintsService, { discardPrevious: isOptimizerOwnedCacheHintsService });
+    }
+    startSessionStats(ctx, "startup");
+  });
+
+  pi.on("session_before_switch", async (_event, ctx) => {
+    await flushOutgoingSession(ctx);
+  });
+
+  pi.on("session_switch", async (event, ctx) => {
+    await switchSessionStats(ctx, asRecord(event)?.reason === "new" ? "new" : "resume");
+  });
+
+  pi.on("session_branch", async (_event, ctx) => {
+    // A branch that keeps the session id keeps its counters.
+    if (!currentSessionHashSet || ctx.sessionManager.getSessionId() === currentSessionId) return;
+    await switchSessionStats(ctx, "branch");
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    // Safety net for a session change this instance saw no event for: move
+    // the counters before anything is recorded under the new session.
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (currentSessionHashSet && sessionId && sessionId !== currentSessionId) {
+      await switchSessionStats(ctx, "resume");
+    }
+    // OMP has no model_select event: publish the footer and compat warning
+    // once per model change, on the first turn that uses the new model.
+    const model = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    const key = model ? modelKey(model) : undefined;
+    if (key === lastModelKeyForStatus) return;
+    lastModelKeyForStatus = key;
+    if (runtimeOptimizerEnabled && model && !isSubagentContext(ctx)) notifyCacheCompatIfNeeded(model, ctx, warnedModels);
+    await waitForStatsRestore();
+    await refreshShardAggregate({ full: false });
+    await publishStatus(ctx, ctx.model);
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
-    // Pi 0.99+ codemode scripts run nested tool calls in parallel; the calling
-    // tool's own end event follows them, so one refresh covers the batch.
+    // Nested tool calls end before their parent; one refresh covers the batch.
     if (isNonEmptyString((event as { parentToolCallId?: unknown } | undefined)?.parentToolCallId)) return;
-    // Pi awaits this handler before the next turn: refresh in the background.
+    // Refresh in the background; never hold up the next turn.
     refreshAndPublishInBackground(ctx);
   });
 
-  // Pi 0.86+ native prompt-cache warming: keep it running for models whose
-  // prices are unknown (all-zero cost), where Pi would otherwise stop with
-  // "cache economics unavailable". Older hosts never emit this event.
+  // OMP native prompt-cache warming: keep it running for models whose prices
+  // are unknown (all-zero cost), where OMP would otherwise stop with "cache
+  // economics unavailable".
   pi.on("cache_warming_decision", (event, ctx) => {
     if (!isZeroPriceWarmingEnabled()) return undefined;
     const action = decideZeroPriceWarming(event, ctx.model);
     return action ? { action } : undefined;
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
-    // No provider request can still be in flight once the agent has settled.
-    // Drop leftover lifecycle records (a request whose message never ended, or
-    // a record consumed out of order) so they cannot be correlated with the
-    // next run's messages.
+  pi.on("agent_end", async (_event, ctx) => {
+    // No provider request of this run is still in flight. Drop leftover
+    // lifecycle records (a request whose message never ended, or a record
+    // consumed out of order) so they cannot be correlated with the next run.
     providerRequestStates.length = 0;
     refreshAndPublishInBackground(ctx);
   });
@@ -1732,6 +1737,7 @@ export default function (pi: ExtensionAPI) {
       // scan-triggered publish), then let what is in flight finish, then
       // flush. The flush's own refreshes are awaited and still run.
       closeStatsRefreshGate();
+      await drainPendingMessageEnds();
       await waitForStatsRestore();
       await drainStatsRefresh();
       try {
@@ -1744,153 +1750,80 @@ export default function (pi: ExtensionAPI) {
       closeStatsRefreshGate();
       latestCacheHint = undefined;
       providerRequestStates.length = 0;
-      delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
-      uninstallCacheHintsService();
-      restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV);
+      // A finishing subagent must not undo process-wide state the
+      // top-level session (and its other subagents) still rely on.
+      if (isMainSessionInstance) {
+        delete getProtocolGlobal().__ompCacheOptimizerCacheKey__;
+        uninstallCacheHintsService?.();
+        uninstallCacheHintsService = undefined;
+        restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV);
+      }
     }
   });
 
-  pi.on("model_select", async (event, ctx) => {
-    if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(event.model, ctx) ?? event.model, ctx, warnedModels);
-    await waitForStatsRestore();
-    await refreshShardAggregate({ full: false });
-    await publishStatus(ctx, event.model);
-  });
-
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     latestCacheHint = undefined;
-    // Clear the legacy global before any bypass/disable early return. A valid
-    // rewrite path republishes the current session key below; otherwise callers
-    // must not observe a stale key from the previously selected model/route.
-    delete getProtocolGlobal().__piCacheOptimizerCacheKey__;
-    const routeSnapshot = resolveActiveRouteSnapshot(_ctx.model, _ctx);
+    // Clear the legacy global before any disable early return. A valid path
+    // republishes the current session key below; otherwise callers must not
+    // observe a stale key from the previously selected model/route.
+    if (isMainSessionInstance) delete getProtocolGlobal().__ompCacheOptimizerCacheKey__;
+    const routeSnapshot = resolveActiveRouteSnapshot(ctx.model, ctx);
     const routedModel = routeSnapshot
-      ? findModelInRegistry(_ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model)
+      ? findModelInRegistry(ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, ctx.model)
       : undefined;
+    const model = routedModel ?? ctx.model;
 
-    // The edits below are in-place: Pi's section order is never changed. Pi >= 0.86
-    // already assembles sections from stable to variable (preamble, tools, rules,
-    // docs, project context, skills, cwd), so lifting content to the front would
-    // only produce empty section shells and move the identity text away from the
-    // start; measured prefix stability was identical with and without it.
-    const model = routedModel ?? _ctx.model;
-    // Pi 0.99+ native virtual selections pick the physical model per request,
-    // after this system prompt is built, so the API cannot be decided here.
-    // Keep Pi's prompt byte-for-byte unless the route is explicitly known safe.
-    const visibleSkills = (event.systemPromptOptions?.skills ?? []).filter((skill) => !skill.disableModelInvocation).length;
-    const skipSkills = (reason: string) => recordSkillCompressionOutcome({ applied: false, reason, visibleSkills, at: Date.now() });
-    if (isNativeVirtualModel(_ctx.model) && !canRewriteNativeVirtualPrompt(_ctx.model, _ctx)) {
-      skipSkills("native virtual model: the prompt is kept unchanged unless virtual-rewrite is enabled for a known-safe route");
-      return {};
-    }
-
+    // OMP hands the system prompt as ordered blocks (string[]). The rewrite is
+    // block-local and in place: block order and skill text stay byte-for-byte,
+    // only <session-overview> churn is stripped, and only when explicitly enabled.
+    const originalBlocks = normalizeSystemPromptBlocks(asRecord(event)?.systemPrompt);
+    let finalBlocks = originalBlocks;
+    const recordOutcome = (applied: boolean, reason?: string) =>
+      recordPromptRewriteOutcome({ applied, ...(reason ? { reason } : {}), blocks: originalBlocks.length, at: Date.now() });
     if (!runtimeOptimizerEnabled) {
-      skipSkills("the optimizer is disabled for this process (/cache-optimizer disable)");
-      return {};
-    }
-
-    // Global opt-out: PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 bypasses all
-    // prompt mutations below (session-overview churn strip and skill
-    // compression). Footer stats and the OpenAI prompt_cache_key fallback
-    // remain active.
-    if (!featureEnabled("promptRewrite", NO_PROMPT_REWRITE_ENV, true)) {
-      skipSkills("prompt rewrite is turned off");
-      return {};
-    }
-
-    // OpenAI Codex/Responses is unusually sensitive to skill-index shape: real
-    // TourStory task benchmarks showed the compressed Markdown index could
-    // lengthen the Pi tool trajectory enough to increase total task cost even
-    // though each request became shorter. Keep Pi's native skill block for the
-    // Codex transport; other providers retain the compression optimization.
-    const codexSkillCompressionBypass = model?.api === "openai-codex-responses";
-
-    // Skill compression first, as a section edit when Pi supports it (see
-    // compressSkillsViaSection); the string path below is the fallback.
-    const skillsViaSection = codexSkillCompressionBypass ? false : compressSkillsViaSection(event);
-
-    // Strip per-turn churn from <session-overview>.
-    // Removing RECENT COMMITS, Working directory status, and
-    // Journal line count makes more of the session-overview stable
-    // across turns, which DeepSeek's prefix cache can then retain.
-    // This edit has no section to target, so a changed prompt is returned
-    // as a forced prompt.
-    const strippedPrompt = stripSessionOverviewChurn(event.systemPrompt);
-
-    // Fallback skill compression: substitute the verbose block in the string
-    // (Pi < 0.86, or a forced prompt from an earlier handler). Deterministic from the same `event.systemPromptOptions.skills`,
-    // so cache stability is unchanged. No-op if opted out, below
-    // SKILL_COMPRESSION_MIN_COUNT, or if pi emitted a format we don't recognize.
-    const compressedPrompt = codexSkillCompressionBypass
-      ? strippedPrompt
-      : compressSkillsInSystemPrompt(
-          strippedPrompt,
-          event.systemPromptOptions,
-        );
-    // With a section edit and nothing to strip, Pi renders the compressed prompt
-    // itself and no forced prompt is returned.
-    recordSkillCompressionOutcome(
-      codexSkillCompressionBypass
-        ? { applied: false, reason: "OpenAI Codex uses Pi's native skill index to preserve task trajectory", visibleSkills, at: Date.now() }
-        : skillsViaSection
-        ? { applied: "section", visibleSkills, at: Date.now() }
-        : compressedPrompt !== strippedPrompt
-          ? { applied: "string", visibleSkills, at: Date.now() }
-          : { applied: false, reason: explainSkillCompressionSkip(strippedPrompt, event.systemPromptOptions), visibleSkills, at: Date.now() },
-    );
-    const changed = compressedPrompt !== event.systemPrompt && compressedPrompt.trim().length > 0;
-    const finalPrompt = changed ? compressedPrompt : event.systemPrompt;
-
-    // Responses family (codex-responses, responses, azure-responses): Pi owns the
-    // prompt_cache_key there and no cache hint is published for router consumers.
-    if (model && isResponsesPromptRewriteBypassApi(model.api)) {
-      return changed ? { systemPrompt: finalPrompt } : {};
-    }
-
-    const promptCacheKey = getSessionPromptCacheKey(_ctx);
-    const cacheRetention = process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
-    latestCacheHint = {
-      sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
-      virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
-      virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
-      upstreamProvider: routeSnapshot?.provider ?? model?.provider,
-      upstreamModelId: routeSnapshot?.modelId ?? model?.id,
-      api: model?.api,
-      systemPrompt: finalPrompt,
-      promptCacheKey,
-      cacheRetention,
-      timestamp: Date.now(),
-    };
-    const globals = getProtocolGlobal();
-    if (promptCacheKey) {
-      globals.__piCacheOptimizerCacheKey__ = promptCacheKey;
+      recordOutcome(false, "本进程已关闭优化器（/cache-optimizer disable）");
+    } else if (!isPromptRewriteEnabled()) {
+      recordOutcome(false, `prompt 重写未开启（默认关闭；用 ${PROMPT_REWRITE_ENV}=1 或 /cache-optimizer config prompt-rewrite on 开启）`);
+    } else if (originalBlocks.length === 0) {
+      recordOutcome(false, "OMP 没有提供 system prompt 块");
     } else {
-      delete globals.__piCacheOptimizerCacheKey__;
+      finalBlocks = mapSystemPromptBlocks(originalBlocks, stripSessionOverviewChurn);
+      const changed = !systemPromptBlocksEqual(finalBlocks, originalBlocks);
+      recordOutcome(changed, changed ? undefined : "没有可清理的 <session-overview> 易变字段");
     }
-    return changed ? { systemPrompt: finalPrompt } : {};
-  });
 
-  pi.on("before_provider_headers", (event, ctx) => {
-    // Pi transforms headers before the payload exists and passes no model, so a
-    // native virtual request's physical model is unknown here. Fail closed; Pi
-    // core still sends the physical model's own configured affinity headers.
-    if (isNativeVirtualModel(ctx.model)) return;
-    const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    addEffectiveSessionAffinityHeaders(
-      event.headers,
-      requestModel,
-      ctx.sessionManager.getSessionId(),
-    );
+    if (originalBlocks.length > 0) {
+      const sessionKey = model && isOpenAICompatibleApi(model.api)
+        ? resolvePromptCacheKey(ctx, model, promptCacheKeyOptionsForApi(model.api))?.key
+        : undefined;
+      const promptCacheKey = sessionKey ?? getSessionPromptCacheKey(ctx);
+      latestCacheHint = {
+        sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(ctx),
+        virtualProvider: routeSnapshot?.virtualProvider ?? ctx.model?.provider,
+        virtualModelId: routeSnapshot?.virtualModelId ?? ctx.model?.id,
+        upstreamProvider: routeSnapshot?.provider ?? model?.provider,
+        upstreamModelId: routeSnapshot?.modelId ?? model?.id,
+        api: model?.api,
+        systemPrompt: joinSystemPromptBlocks(finalBlocks),
+        promptCacheKey,
+        cacheRetention: readCacheRetentionValue(process.env) === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined,
+        timestamp: Date.now(),
+      };
+      if (isMainSessionInstance) {
+        const globals = getProtocolGlobal();
+        if (promptCacheKey) {
+          globals.__ompCacheOptimizerCacheKey__ = promptCacheKey;
+        } else {
+          delete globals.__ompCacheOptimizerCacheKey__;
+        }
+      }
+    }
+
+    return systemPromptBlocksEqual(finalBlocks, originalBlocks) ? {} : { systemPrompt: finalBlocks };
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    // A native virtual selection keeps ctx.model virtual; resolve the physical
-    // model from the dispatched payload. Unresolved requests keep the virtual
-    // model, which fails every identity-dependent mutation closed.
-    const nativeVirtualRequest = resolveNativeVirtualRequestModel(ctx.model, event.payload, ctx, requestPolicyKey);
-    const requestModel = isNativeVirtualModel(ctx.model)
-      ? (nativeVirtualRequest?.model ?? ctx.model)
-      : (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
+    const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
     // Request-local identity is also needed by the always-on Anthropic TTL
     // validity repair, so retain the credential-blind snapshot even while the
     // optional runtime optimizer features are disabled.
@@ -1902,7 +1835,6 @@ export default function (pi: ExtensionAPI) {
         virtualSelection: isVirtualRoutingModel(ctx.model, ctx),
         responseReceived: false,
         correlationAmbiguous: false,
-        identityAmbiguous: isNativeVirtualModel(ctx.model) && (!nativeVirtualRequest || nativeVirtualRequest.identityAmbiguous),
       });
       pruneProviderRequestStates(providerRequestStates);
     }
@@ -1915,14 +1847,13 @@ export default function (pi: ExtensionAPI) {
       toolOrderChanged = normalized.changed;
     }
 
-    // Every mutation below works on a copy and is returned explicitly: Pi's
-    // event.payload is never modified in place, so the hook does not depend on
-    // the host honouring in-place edits.
+    // Every mutation below works on a copy and is returned explicitly: OMP's
+    // event.payload is never modified in place.
     let payloadChanged = toolOrderChanged;
 
     // Anthropic rejects mixed cache breakpoints when a 1h block appears after
     // a 5m/default block in wire order (tools → system → messages). Repair any
-    // conflict visible in Pi's final payload immediately. Some proxies inject
+    // conflict visible in the final payload immediately. Some proxies inject
     // hidden short breakpoints after this hook; only models that have actually
     // returned the explicit TTL-order error receive the process-local 5m fallback.
     if (requestModel && isAnthropicMessagesApi(requestModel.api)) {
@@ -1933,19 +1864,34 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // prompt_cache_retention gate. This extension sets PI_CACHE_RETENTION=long,
-    // which makes Pi emit prompt_cache_retention: "24h" for every endpoint whose
-    // detected compat does not explicitly disable it, including third-party
-    // proxies that reject unknown fields with HTTP 400. The gate undoes only that
-    // side effect; see decidePromptCacheRetention for the order and reasons.
-    if (runtimeOptimizerEnabled && typeof asRecord(requestPayload)?.prompt_cache_retention === "string") {
+    // Prompt rewrite safety net: requests built without a before_agent_start
+    // pass (or after another extension replaced the prompt) still get the
+    // same block-local session-overview strip.
+    if (requestModel && isPromptRewriteEnabled() && extractSystemPrompt(requestPayload)?.includes("<session-overview>")) {
+      const stripped = mapSystemPromptText(requestPayload, stripSessionOverviewChurn);
+      if (stripped !== undefined) {
+        requestPayload = stripped;
+        payloadChanged = true;
+      }
+    }
+
+    // prompt_cache_retention gate. This extension requests long retention,
+    // which OMP turns into `prompt_cache_retention: "24h"` where the resolved
+    // compat allows it. The gate removes it only for an endpoint that already
+    // rejected it, or where the field appears without OMP's own opt-in.
+    if (
+      runtimeOptimizerEnabled &&
+      requestModel &&
+      isOpenAICompatibleApi(requestModel.api) &&
+      typeof asRecord(requestPayload)?.prompt_cache_retention === "string"
+    ) {
       const decision = decidePromptCacheRetention({
-        providerRejected: !!requestModel && promptCacheRetention400Models.has(modelKey(requestModel)),
-        officialOpenAI: !!requestModel && isOfficialOpenAIBaseUrl(requestModel),
-        explicitOptIn: !!requestModel && hasExplicitLongRetentionOptIn(requestModel),
+        providerRejected: promptCacheRetention400Models.has(modelKey(requestModel)),
+        officialOpenAI: isOfficialOpenAIBaseUrl(requestModel),
+        explicitOptIn: hasExplicitLongRetentionOptIn(requestModel),
         userRequestedLong: userRequestedLongCacheRetention(),
       });
-      recordPromptCacheRetentionDecision(requestModel ? modelKey(requestModel) : undefined, decision);
+      recordPromptCacheRetentionDecision(modelKey(requestModel), decision);
       if (!decision.keep) {
         const stripped = withoutPromptCacheRetention(requestPayload);
         if (stripped !== undefined) {
@@ -1955,17 +1901,43 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // prompt_cache_key: an explicit per-model omit wins; otherwise resolve the
+    // fork's key (header key > project key for Responses-family APIs > hashed
+    // session key for Chat Completions). Only a missing or session-default key
+    // is replaced; a custom key is always kept.
+    let resolvedPromptCacheKey: ReturnType<typeof resolvePromptCacheKey>;
     if (isPromptCacheKeyOmittedForModel(requestModel)) {
       const omitted = omitOpenAIPromptCacheKeys(requestPayload);
-      return omitted ?? (payloadChanged ? requestPayload : undefined);
+      if (omitted !== undefined) {
+        requestPayload = omitted;
+        payloadChanged = true;
+      }
+    } else if (requestModel && shouldInjectOpenAIPromptCacheKey() && shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) {
+      resolvedPromptCacheKey = resolvePromptCacheKey(ctx, requestModel, promptCacheKeyOptionsForApi(requestModel.api));
+      const sessionId = ctx.sessionManager.getSessionId();
+      const withCacheKey = applyPromptCacheKeyToPayload(
+        requestPayload,
+        resolvedPromptCacheKey?.key,
+        (key) => isSessionScopedPromptCacheKey(key, sessionId),
+      );
+      if (withCacheKey !== undefined) {
+        requestPayload = withCacheKey;
+        payloadChanged = true;
+      }
     }
 
-    if (!shouldInjectOpenAIPromptCacheKey() || !shouldInjectOpenAIPromptCacheKeyForModel(requestModel)) {
-      return payloadChanged ? requestPayload : undefined;
+    // Request-level prompt diagnostics (memory only, never paired with usage):
+    // a truncated hash of the final system prompt and where its cache key came from.
+    if (requestModel) {
+      const diagnosticsSessionHash = sessionHashFromContext(ctx) ?? (currentSessionHash || "_nosession");
+      recordPromptDiagnosticSample(makeSessionModelKey(diagnosticsSessionHash, requestModel.provider, requestModel.id), {
+        promptRewriteEnabled: isPromptRewriteEnabled(),
+        systemPromptFingerprint: fingerprintPrompt(extractSystemPrompt(requestPayload)),
+        promptCacheKeySource: getPromptCacheKeySource(requestPayload, requestModel.api, resolvedPromptCacheKey),
+      });
     }
 
-    const withCacheKey = addOpenAIPromptCacheKey(requestPayload, getSessionPromptCacheKey(ctx));
-    return withCacheKey ?? (payloadChanged ? requestPayload : undefined);
+    return payloadChanged ? requestPayload : undefined;
   });
 
   pi.on("after_provider_response", async (event, ctx) => {
@@ -1979,7 +1951,7 @@ export default function (pi: ExtensionAPI) {
         // Identity is still exact when concurrent requests use the same model.
         responseState = pendingStates[0];
       } else {
-        // Pi supplies no request id here, so out-of-order concurrent responses
+        // OMP supplies no request id here, so out-of-order concurrent responses
         // cannot be assigned safely. Preserve the lifecycle records for a
         // message-local identity, but never turn ambiguous headers into a
         // model-scoped persistent-fix suggestion.
@@ -1987,13 +1959,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (responseState) responseState.responseReceived = true;
-    // A native virtual request whose physical provider could not be pinned
-    // records no model-scoped header evidence; finalized assistant messages
-    // still carry exact provider/model identity.
     const model = responseState
-      ? (responseState.identityAmbiguous ? undefined : responseState.model)
-      : (pendingStates.length === 0 && !isNativeVirtualModel(ctx.model) ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
+      ? responseState.model
+      : (pendingStates.length === 0 ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
     if (!runtimeOptimizerEnabled || !model) return;
+    const headers = asRecord(event.headers) as Record<string, string> | undefined;
 
     // Keep only the category, never the provider's complete error text. This
     // is evidence for a later, model-scoped `/fix`; it never edits config from
@@ -2001,7 +1971,7 @@ export default function (pi: ExtensionAPI) {
     if (
       isReasoningProtocolRejectionSignalApplicable(model) &&
       event.status === 400 &&
-      hasReasoningProtocolRejectionSignal(event.headers)
+      hasReasoningProtocolRejectionSignal(headers)
     ) {
       await notifyReasoningProtocolObservation(
         model,
@@ -2012,82 +1982,66 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── 400: prompt_cache_key unsupported ──
-    if (event.status === 400 && isPromptCacheKeyUnsupportedApplicable(model) && hasPromptCacheKeyUnsupportedSignal(event.headers)) {
-      const key = modelKey(model);
-      promptCacheKeyRejectedModels.add(key);
-      if (!warnedPromptCacheKeyRejectedModels.has(key)) {
-        warnedPromptCacheKeyRejectedModels.add(key);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
-          "warning",
-        );
-      }
+    if (event.status === 400 && isPromptCacheKeyUnsupportedApplicable(model) && hasPromptCacheKeyUnsupportedSignal(headers)) {
+      notePromptCacheKeyRejected(model, ctx);
     }
 
     // ── 400: prompt_cache_retention unsupported ──
     if (
       event.status === 400 &&
       isPromptCacheRetention400Applicable(model) &&
-      hasPromptCacheRetentionUnsupportedSignal(event.headers)
+      hasPromptCacheRetentionUnsupportedSignal(headers)
     ) {
-      const key = modelKey(model);
-      promptCacheRetention400Models.add(key);
-      if (!warnedPromptCacheRetention400Models.has(key)) {
-        warnedPromptCacheRetention400Models.add(key);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
-          getPromptCacheRetentionUnsupportedHint() +
-          ` Run /cache-optimizer doctor for the exact edit location.`,
-          "warning",
-        );
-      }
+      notePromptCacheRetentionRejected(model, ctx);
     }
 
-    // ── 403: proxy/CDN/WAF blocking ──
-    if (event.status === 403) {
+    // ── 403: proxy/CDN/WAF blocking the OpenAI SDK request fingerprint ──
+    // Provider-specific; never auto-fixed by writing a User-Agent because the
+    // right value depends on the endpoint.
+    if (event.status === 403 && isOpenAISdkHeader403Applicable(model)) {
       const key403 = modelKey(model);
-
-      // Case 1: Pi's custom session-affinity headers are enabled. Offer the
-      // existing safe compat fix (`sendSessionAffinityHeaders: false`).
-      if (isSessionAffinity403Applicable(model)) {
-        sendSessionAffinityHeaders403Models.add(key403);
-        if (warnedSendSessionAffinityHeaders403Models.has(key403)) return;
-        warnedSendSessionAffinityHeaders403Models.add(key403);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 while sendSessionAffinityHeaders is enabled. ` +
-          `The proxy/CDN may be blocking Pi's custom session-affinity headers (session_id, x-client-request-id, x-session-affinity). ` +
-          `Run /cache-optimizer doctor for details and /cache-optimizer fix to set sendSessionAffinityHeaders: false.`,
-          "warning",
-        );
-        return;
-      }
-
-      // Case 2: session-affinity headers are already absent/disabled, but the
-      // provider still returns 403. Some CDNs/WAFs block the OpenAI JS SDK
-      // default request fingerprint (User-Agent: OpenAI/JS ... or
-      // X-Stainless-* headers). This is provider-specific; do NOT auto-fix by
-      // writing a User-Agent because the right value depends on the endpoint.
-      if (isOpenAISdkHeader403Applicable(model)) {
-        openAISdkHeader403Models.add(key403);
-        if (warnedOpenAISdkHeader403Models.has(key403)) return;
-        warnedOpenAISdkHeader403Models.add(key403);
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: ${key403} returned HTTP 403 even though sendSessionAffinityHeaders is not enabled. ` +
-          `The proxy/CDN may be blocking the OpenAI JS SDK User-Agent / X-Stainless-* headers. ` +
-          `Run /cache-optimizer doctor for manual diagnostic guidance; /cache-optimizer fix will not auto-write User-Agent headers.`,
-          "warning",
-        );
-        return;
-      }
+      openAISdkHeader403Models.add(key403);
+      if (warnedOpenAISdkHeader403Models.has(key403)) return;
+      warnedOpenAISdkHeader403Models.add(key403);
+      ctx.ui.notify(
+        `⚠️ ${LOG_PREFIX}：${key403} 返回了 HTTP 403。` +
+        `代理/CDN 可能在拦截 OpenAI JS SDK 的 User-Agent / X-Stainless-* header。` +
+        `运行 /cache-optimizer doctor 查看手动排查建议；/cache-optimizer fix 不会自动写 User-Agent header。`,
+        "warning",
+      );
     }
   });
 
-  pi.on("message_end", async (event, ctx) => {
+  function notePromptCacheKeyRejected(model: PiModel, ctx: ExtensionContext): void {
+    const key = modelKey(model);
+    promptCacheKeyRejectedModels.add(key);
+    if (warnedPromptCacheKeyRejectedModels.has(key)) return;
+    warnedPromptCacheKeyRejectedModels.add(key);
+    ctx.ui.notify(
+      `⚠️ ${LOG_PREFIX}：${key} 拒绝了 prompt_cache_key。运行 /cache-optimizer fix 查看只对该模型生效的关闭方案。未自动修改任何配置。`,
+      "warning",
+    );
+  }
+
+  function notePromptCacheRetentionRejected(model: PiModel, ctx: ExtensionContext): void {
+    const key = modelKey(model);
+    promptCacheRetention400Models.add(key);
+    if (warnedPromptCacheRetention400Models.has(key)) return;
+    warnedPromptCacheRetention400Models.add(key);
+    ctx.ui.notify(
+      `⚠️ ${LOG_PREFIX}：${key} 拒绝了 prompt_cache_retention，本进程后续请求会自动去掉该字段。` +
+      getPromptCacheRetentionUnsupportedHint() +
+      " 运行 /cache-optimizer doctor 查看具体编辑位置。",
+      "warning",
+    );
+  }
+
+  async function recordMessageEnd(message: unknown, ctx: ExtensionContext): Promise<void> {
     syncSessionHash(ctx);
-    const msgRecord = asRecord(event.message);
+    const msgRecord = asRecord(message);
     const requestCorrelationForMessage = msgRecord?.role === "assistant"
       ? (() => {
-        const explicitModel = modelFromAssistantMessage(event.message, undefined, true);
+        const explicitModel = modelFromAssistantMessage(message, undefined, true);
         const explicitIndex = explicitModel
           ? providerRequestStates.findIndex((state) => modelKey(state.model) === modelKey(explicitModel))
           : -1;
@@ -2099,7 +2053,7 @@ export default function (pi: ExtensionAPI) {
         // before response headers arrive, different outstanding models make
         // that fallback ambiguous; keep the message's own identity instead.
         const ambiguous = explicitIndex < 0 && (
-          state.correlationAmbiguous || state.identityAmbiguous === true ||
+          state.correlationAmbiguous ||
           providerRequestStates.some((other) => modelKey(other.model) !== modelKey(state.model))
         );
         return {
@@ -2114,18 +2068,21 @@ export default function (pi: ExtensionAPI) {
     const contextualFallbackForMessage = requestCorrelationForMessage.ambiguous
       ? undefined
       : (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
-
-    // Some providers expose an HTTP 400 error body only through the finalized
-    // assistant error message; after_provider_response may contain the status
-    // and no diagnostic response headers. Record only the model-scoped
-    // reasoning-protocol category from that authoritative message identity.
-    if (runtimeOptimizerEnabled && hasReasoningProtocolRejectionErrorMessage(event.message)) {
+    const errorModelFor = (): PiModel | undefined => {
       const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
-      const errorModel = messageModel
+      const messageModel = modelFromAssistantMessage(message, fallbackModel) ?? fallbackModel;
+      return messageModel
         ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
         : undefined;
-      if (errorModel && isReasoningProtocolRejectionForModel(event.message, errorModel)) {
+    };
+
+    // Some providers expose an HTTP 400 error body only through the finalized
+    // assistant error message; after_provider_response may carry the status
+    // without diagnostic headers (or not fire at all for a failed request).
+    // Record only the model-scoped category from that authoritative identity.
+    if (runtimeOptimizerEnabled && hasReasoningProtocolRejectionErrorMessage(message)) {
+      const errorModel = errorModelFor();
+      if (errorModel && isReasoningProtocolRejectionForModel(message, errorModel)) {
         await notifyReasoningProtocolObservation(
           errorModel,
           ctx,
@@ -2134,85 +2091,42 @@ export default function (pi: ExtensionAPI) {
         );
       }
     }
-    if (runtimeOptimizerEnabled && hasPromptCacheKeyUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
-      const errorModel = messageModel
-        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
-        : undefined;
-      if (errorModel && isPromptCacheKeyUnsupportedApplicable(errorModel)) {
-        const key = modelKey(errorModel);
-        promptCacheKeyRejectedModels.add(key);
-        if (!warnedPromptCacheKeyRejectedModels.has(key)) {
-          warnedPromptCacheKeyRejectedModels.add(key);
-          ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_key. Run /cache-optimizer fix to review a precise model-scoped repair. No configuration was changed automatically.`,
-            "warning",
-          );
-        }
-      }
+    if (runtimeOptimizerEnabled && hasPromptCacheKeyUnsupportedErrorMessage(message)) {
+      const errorModel = errorModelFor();
+      if (errorModel && isPromptCacheKeyUnsupportedApplicable(errorModel)) notePromptCacheKeyRejected(errorModel, ctx);
     }
-    if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(event.message)) {
-      const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const messageModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
-      const errorModel = messageModel
-        ? findModelInRegistry(ctx.modelRegistry, messageModel.provider, messageModel.id) ?? messageModel
-        : undefined;
-      if (errorModel && isExplicitPromptCacheRetentionUnsupportedApplicable(errorModel)) {
-        const key = modelKey(errorModel);
-        promptCacheRetention400Models.add(key);
-        if (!warnedPromptCacheRetention400Models.has(key)) {
-          warnedPromptCacheRetention400Models.add(key);
-          ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} rejected prompt_cache_retention. ` +
-            getPromptCacheRetentionUnsupportedHint() +
-            ` Run /cache-optimizer doctor for the exact edit location.`,
-            "warning",
-          );
-        }
-      }
+    if (runtimeOptimizerEnabled && hasPromptCacheRetentionUnsupportedErrorMessage(message)) {
+      const errorModel = errorModelFor();
+      if (errorModel && isExplicitPromptCacheRetentionUnsupportedApplicable(errorModel)) notePromptCacheRetentionRejected(errorModel, ctx);
     }
 
-    // Record only Anthropic's explicit mixed-TTL ordering error. This is a
-    // non-retryable 400 in Pi 0.82.1, so the fallback applies to the next
-    // subsequent request (and to a retry only if another layer initiates one).
-    if (hasAnthropicCacheTtlOrderError(event.message)) {
+    // Record only Anthropic's explicit mixed-TTL ordering error. The fallback
+    // applies to the next request (and to a retry only if another layer
+    // initiates one).
+    if (hasAnthropicCacheTtlOrderError(message)) {
       const fallbackModel = requestModelForMessage ?? contextualFallbackForMessage;
-      const errorModel = modelFromAssistantMessage(event.message, fallbackModel) ?? fallbackModel;
+      const errorModel = modelFromAssistantMessage(message, fallbackModel) ?? fallbackModel;
       if (errorModel && isAnthropicMessagesApi(errorModel.api)) {
         const key = modelKey(errorModel);
         anthropicTtlOrderErrorModels.add(key);
         if (!warnedAnthropicTtlOrderErrorModels.has(key)) {
           warnedAnthropicTtlOrderErrorModels.add(key);
           ctx.ui.notify(
-            `⚠️ ${LOG_PREFIX}: ${key} returned an Anthropic cache-control TTL ordering error. ` +
-            `The next request will fall back to the default 5-minute cache TTL. ` +
-            `Run /cache-optimizer fix to set model-level supportsLongCacheRetention: false persistently.`,
+            `⚠️ ${LOG_PREFIX}：${key} 返回了 Anthropic cache-control TTL 顺序错误。` +
+            `下一次请求会回退到默认 5 分钟缓存 TTL。` +
+            `运行 /cache-optimizer fix 查看持久设置模型级 supportsLongCacheRetention: false 的片段。`,
             "warning",
           );
         }
       }
     }
 
-    // A native virtual selection keeps ctx.model virtual, while the finalized
-    // message names the physical catalog model Pi dispatched. Resolve that
-    // model from the registry so adapter tokens, the stats key, and the footer
-    // compat marker use the same physical identity as the pre-request UX.
-    const nativeVirtualDispatch = isNativeVirtualModel(ctx.model)
-      ? nativeVirtualDispatchFromMessage(event.message)
-      : undefined;
-    const nativeVirtualMessageModel = nativeVirtualDispatch
-      ? nativeVirtualDispatchToModel(nativeVirtualDispatch, ctx)
-      : undefined;
-
     const currentSelectionIsVirtual = isVirtualRoutingModel(ctx.model, ctx);
     const requestSelectionIsVirtual = requestCorrelationForMessage.virtualSelection ?? currentSelectionIsVirtual;
     const directSelection = !requestSelectionIsVirtual;
     const statsFallback = requestModelForMessage ?? ctx.model;
-    let statsModel = modelFromAssistantMessage(event.message, statsFallback, directSelection) ?? statsFallback;
-    if (nativeVirtualMessageModel) {
-      statsModel = nativeVirtualMessageModel;
-    } else if (directSelection && statsModel) {
+    let statsModel = modelFromAssistantMessage(message, statsFallback, directSelection) ?? statsFallback;
+    if (directSelection && statsModel) {
       // Catalog identity wins over an echoed response alias. Older/custom
       // transports can still echo an unknown id; consolidate those only with
       // the request-local snapshot, never a newly selected same-family model.
@@ -2221,21 +2135,20 @@ export default function (pi: ExtensionAPI) {
         ? catalogModel
         : consolidateDirectProviderStatsModel(statsModel, requestModelForMessage, ctx);
     }
-    const adapter = selectAdapterForModel(statsModel) ?? selectAdapterForAssistantMessage(event.message, statsModel);
+    const adapter = selectAdapterForModel(statsModel) ?? selectAdapterForAssistantMessage(message, statsModel);
     if (!adapter) return;
 
-    // Skip stats for error/aborted messages (network retries, user aborts).
-    // Pi's auto-retry emits message_end for the failed attempt before
-    // removing it and retrying. The error message carries zero-usage fields
-    // ({ input: 0, cacheRead: 0, cacheWrite: 0 }) that normalizeUsage
-    // returns as a valid (non-undefined) snapshot, which would inflate
-    // totalRequests and skew cache hit-rate accuracy. The final successful
-    // response is emitted as a separate message_end with real usage data.
-    if (msgRecord?.stopReason === "error" || msgRecord?.stopReason === "aborted") {
+    const usage = adapter.normalizeUsage(message);
+
+    // A failed or aborted attempt that carries no usage (network retry,
+    // user abort before the provider answered) is not a request the provider
+    // served: counting it would inflate totalRequests and skew the hit rate.
+    // An aborted response that already reported usage did read/write the
+    // cache, so it still counts.
+    const stopReason = msgRecord?.stopReason;
+    if ((stopReason === "error" || stopReason === "aborted") && (usage?.totalInput ?? 0) <= 0) {
       return;
     }
-
-    const usage = adapter.normalizeUsage(event.message);
 
     let routedModelChanged = false;
     if (requestSelectionIsVirtual && statsModel && !isVirtualRoutingModel(statsModel, ctx)) {
@@ -2260,7 +2173,7 @@ export default function (pi: ExtensionAPI) {
       const sk = sessionModelKey(statsModel);
       const missingFields = usage === undefined || (usage.cacheRead === 0 && usage.cacheWrite === 0 && usage.totalInput === 0)
         ? true
-        : hasMissingUsageFields(event.message, adapter);
+        : hasMissingUsageFields(message, adapter);
       recordRecentSample(sk, usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 }, missingFields);
     }
 
@@ -2272,7 +2185,7 @@ export default function (pi: ExtensionAPI) {
     await rollOverStatsIfNeeded(ctx);
 
     // Update session, process-local, and cumulative buckets for the actual
-    // routed model. The process bucket is intentionally never persisted.
+    // routed model.
     if (statsModel) {
       const key = modelKey(statsModel);
       // Fresh reads, numbered like every footer epoch read: a refresh that
@@ -2305,7 +2218,7 @@ export default function (pi: ExtensionAPI) {
 
     schedulePersistCacheStats(ctx);
     // The counters above are already updated in memory; the refresh and the
-    // footer update run in the background (Pi awaits message_end).
+    // footer update run in the background.
     refreshAndPublishInBackground(ctx, () => {
       // A late response from an older selection must not replace the active
       // footer. Only a routed response that still belongs to the currently
@@ -2316,6 +2229,17 @@ export default function (pi: ExtensionAPI) {
         requestCorrelationForMessage.selectionModelKey === modelKey(ctx.model);
       return requestSelectionIsVirtual && responseBelongsToCurrentSelection ? statsModel : ctx.model;
     });
+  }
+
+  pi.on("message_end", (event, ctx) => {
+    // OMP does not wait for message_end; track the handler so a session
+    // switch or shutdown can drain it before the counters move on.
+    const operation = recordMessageEnd(event.message, ctx).catch((error) => {
+      console.warn(`${LOG_PREFIX}: failed to record cache stats for a message`, error);
+    });
+    pendingMessageEndOperations.add(operation);
+    void operation.finally(() => pendingMessageEndOperations.delete(operation));
+    return operation;
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -2328,8 +2252,9 @@ export default function (pi: ExtensionAPI) {
   //   stats   — show detailed current-session models; `stats all` shows all local shards
   //   compat  — show compat suggestion with file path
   //   config footer-mode total|session|process — persist footer mode override
-  //   fix     — auto-fix compat issues (writes models.json or extension config, requires UI)
-  //   rollback — undo the latest confirmed fix for the active model
+  //   config <feature> on|off — persist a feature switch
+  //   fix     — show models.yml compat snippets; `fix prompt-cache-key` writes extension config (UI)
+  //   rollback — undo the latest confirmed prompt-cache-key opt-out
   //   reset   — reset current provider/model footer stats bucket (local only)
   //   (no args) — interactive menu (with UI) or help summary
   // ────────────────────────────────────────────────────────────────
@@ -2342,6 +2267,7 @@ export default function (pi: ExtensionAPI) {
     refreshShardAggregate,
     sessionModelKey,
     getRecentSamples,
+    getRecentPromptDiagnostics,
     promptCacheKeyFixApplies,
     buildCommandFixSuggestion,
     buildPromptCacheKeyConfigPreview,
@@ -2349,18 +2275,17 @@ export default function (pi: ExtensionAPI) {
     promptCacheRetention400Models,
     promptCacheKeyRejectedModels,
     anthropicTtlOrderErrorModels,
-    sendSessionAffinityHeaders403Models,
     openAISdkHeader403Models,
     getCacheStatsTotalsByModel: () => cacheStatsTotalsByModel,
     getCurrentSessionHashSet: () => currentSessionHashSet,
     getCurrentSessionHash: () => currentSessionHash,
     getLastStatusText: () => lastStatusText,
     clearLastStatusText: () => { lastStatusText = undefined; },
-    getCacheWarmingMode: () => readCacheWarmingMode(typeof pi.getSettings === "function" ? () => pi.getSettings() : undefined),
+    getCacheWarmingMode: () => readCacheWarmingMode(),
   });
 
   pi.registerCommand("cache-optimizer", {
-    description: "Configure and diagnose Pi cache behavior",
+    description: "诊断与配置 OMP 缓存优化",
     getArgumentCompletions: getCacheOptimizerArgumentCompletions,
     handler: async (args: string, cmdCtx: Parameters<typeof handleCacheOptimizerCommand>[1]) => {
       // Commands read and reset aggregated stats; let a background restore

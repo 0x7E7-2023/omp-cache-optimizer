@@ -297,7 +297,7 @@ export class TieredShardIndex {
   }
 
   /**
-   * Opt-in field check of the identity cache (PI_CACHE_OPTIMIZER_STATS_VERIFY):
+   * Opt-in field check of the identity cache (OMP_CACHE_OPTIMIZER_STATS_VERIFY):
    * re-read every cached shard whose identity, lstat-ed before and after the
    * read, still equals the cached one, and compare the contents. A
    * difference means the filesystem reports an unchanged identity for

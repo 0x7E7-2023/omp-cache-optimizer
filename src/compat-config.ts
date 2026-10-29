@@ -1,52 +1,43 @@
 import { type PiModel, type UnknownRecord, asRecord } from "./common.ts";
 
+/**
+ * OMP compat 中本扩展读取的子集（字段名以 OMP 18 的 @oh-my-pi/pi-catalog 为准）。
+ *
+ * 与上游 Pi 字段的对应：
+ * - Pi `supportsLongCacheRetention`（OpenAI 侧）→ OMP `supportsLongPromptCacheRetention`（仅 Responses API）
+ * - Pi `supportsLongCacheRetention`（Anthropic 侧）→ OMP 同名 `supportsLongCacheRetention`
+ * - Pi `requiresReasoningContentOnAssistantMessages` → OMP `requiresReasoningContentForToolCalls`
+ * - Pi `sendSessionAffinityHeaders` / `sendSessionIdHeader` / `sessionAffinityFormat` → OMP 无（多凭据 + agent.db 会话亲和）
+ * - Pi `forceAdaptiveThinking` → OMP 无（目录自动设置 disableAdaptiveThinking）
+ */
 export type CacheCompat = {
   supportsStore?: boolean;
   supportsDeveloperRole?: boolean;
   supportsReasoningEffort?: boolean;
   supportsUsageInStreaming?: boolean;
   supportsStrictMode?: boolean;
-  maxTokensField?: "max_completion_tokens" | "max_tokens";
-  sendSessionAffinityHeaders?: boolean;
-  sessionAffinityFormat?: "openai" | "openai-nosession" | "openrouter";
+  /** openai-responses：是否接受 `prompt_cache_retention: "24h"`。 */
+  supportsLongPromptCacheRetention?: boolean;
+  /** anthropic-messages：是否接受 1h cache_control ttl。 */
   supportsLongCacheRetention?: boolean;
+  /** openai-completions（解析后）：是否发送顶层 `prompt_cache_key`。 */
+  supportsPromptCacheKey?: boolean;
   thinkingFormat?: string;
-  requiresReasoningContentOnAssistantMessages?: boolean;
+  requiresReasoningContentForToolCalls?: boolean;
   cacheControlFormat?: string;
-  forceAdaptiveThinking?: boolean;
-  allowEmptySignature?: boolean;
+  isOpenRouterHost?: boolean;
+  officialEndpoint?: boolean;
   openRouterRouting?: UnknownRecord;
   vercelGatewayRouting?: UnknownRecord;
-  chatTemplateKwargs?: UnknownRecord;
-  chatTemplateArgs?: UnknownRecord;
+  extraBody?: UnknownRecord;
 };
 
-/**
- * Get effective compat for a model by merging provider-level and model-level compat.
- * Model-level compat takes precedence over provider-level compat for overlapping keys.
- * This matches Pi's model-registry.js mergeCompat behavior.
- */
+/** Nested compat records that merge key-by-key instead of being replaced. */
 export const NESTED_COMPAT_KEYS = [
   "openRouterRouting",
   "vercelGatewayRouting",
-  "chatTemplateKwargs",
-  "chatTemplateArgs",
+  "extraBody",
 ] as const;
-
-export function findLastExactModelDefinition(
-  models: unknown[] | undefined,
-  modelId: string,
-): UnknownRecord | undefined {
-  if (!models) return undefined;
-  // Pi's provider composer processes definitions in array order. If a malformed
-  // or hand-edited config repeats an id, the last definition replaces earlier
-  // definitions, so effective resolution must use the same deterministic rule.
-  for (let index = models.length - 1; index >= 0; index--) {
-    const candidate = asRecord(models[index]);
-    if (candidate?.id === modelId) return candidate;
-  }
-  return undefined;
-}
 
 export function mergeCacheCompat(...sources: Array<UnknownRecord | undefined>): CacheCompat {
   const merged: CacheCompat = {};
@@ -67,33 +58,29 @@ export function mergeCacheCompat(...sources: Array<UnknownRecord | undefined>): 
   return merged;
 }
 
-export function getEffectiveCompatSources(model: PiModel, config: unknown): Array<{ source: "provider" | "model" | "runtime" | "modelOverride"; compat: UnknownRecord }> {
-  const root = asRecord(config);
-  const providers = asRecord(root?.providers);
-  const provider = asRecord(providers?.[model.provider]);
-  const providerCompat = asRecord(provider?.compat);
-  const customModel = findLastExactModelDefinition(
-    Array.isArray(provider?.models) ? provider.models : undefined,
-    model.id,
-  );
-  const customModelCompat = asRecord(asRecord(customModel)?.compat);
+/**
+ * OMP 的 Model 同时携带两层 compat：
+ * - `compatConfig`：models.yml / modelOverrides / 运行时注册里用户写下的稀疏原文（用户意图）；
+ * - `compat`：`buildModel` 物化后的完整解析结果（宿主实际使用的值）。
+ * 上游 Pi 需要重读 models.json 才能区分"显式配置"和"默认值"，OMP 直接提供了这两层。
+ */
+export function getEffectiveCompatSources(model: PiModel): Array<{ source: "config" | "runtime"; compat: UnknownRecord }> {
+  const record = model as PiModel & { compatConfig?: unknown };
+  const configCompat = asRecord(record.compatConfig);
   const runtimeCompat = asRecord(model.compat);
-  const modelOverride = asRecord(asRecord(provider?.modelOverrides)?.[model.id]);
-  const modelOverrideCompat = asRecord(modelOverride?.compat);
-
   return [
-    ...(providerCompat ? [{ source: "provider" as const, compat: providerCompat }] : []),
-    ...(customModelCompat ? [{ source: "model" as const, compat: customModelCompat }] : []),
+    ...(configCompat ? [{ source: "config" as const, compat: configCompat }] : []),
     ...(runtimeCompat ? [{ source: "runtime" as const, compat: runtimeCompat }] : []),
-    ...(modelOverrideCompat ? [{ source: "modelOverride" as const, compat: modelOverrideCompat }] : []),
   ];
 }
 
-export function resolveEffectiveCompatFromConfig(model: PiModel, config: unknown): CacheCompat {
-  // Pi's effective precedence is provider → models[] → runtime model →
-  // modelOverrides. The runtime layer is intentionally included between the
-  // config model and modelOverride: extension providers can replace the model
-  // object after lower config layers were applied, while the override remains
-  // Pi's highest-precedence user layer.
-  return mergeCacheCompat(...getEffectiveCompatSources(model, config).map(({ compat }) => compat));
+/** 合并后的生效 compat：解析结果优先于用户原文（宿主实际以解析结果发请求）。 */
+export function resolveEffectiveCompat(model: PiModel): CacheCompat {
+  return mergeCacheCompat(...getEffectiveCompatSources(model).map(({ compat }) => compat));
+}
+
+/** 用户在 models.yml 等配置里显式写下的 compat（不含宿主自动探测的默认值）。 */
+export function resolveExplicitCompat(model: PiModel): CacheCompat {
+  const record = model as PiModel & { compatConfig?: unknown };
+  return mergeCacheCompat(asRecord(record.compatConfig));
 }
