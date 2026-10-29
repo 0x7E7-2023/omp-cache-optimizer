@@ -244,10 +244,14 @@ export async function applyPromptCacheKeyConfigFixUnderLock(
   } catch (error) {
     await unlink(tempPath).catch(() => {});
     try {
+      // Guard against changes since the commit with the mode observed right
+      // after it: a platform without POSIX modes (Windows) reports 0o666 for a
+      // file created with 0o600, so the requested mode would never match.
+      const committedMode = committedInfo ? Number(committedInfo.mode) & 0o7777 : mode;
       if (targetExistedBefore && committedInfo) {
-        await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode });
+        await atomicRestoreFileFromBackup(backupPath, configPath, mode, { identity: committedInfo, hash: afterHash, mode: committedMode });
       } else if (!targetExistedBefore && committedInfo) {
-        await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode });
+        await validateAtomicTarget(configPath, { identity: committedInfo, hash: afterHash, mode: committedMode });
         await unlink(configPath);
       }
     } catch (compensationError) {
